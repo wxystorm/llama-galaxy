@@ -38,3 +38,29 @@ Expected: GALAXY_TP_SELFTEST PASS.
 Next, compile PC and Phone, test local phone GGUF loads, verify that
 [GALAXY_TP_SPLIT] logs match intended assignment and compare numerical
 outputs with single-device inference before any performance claim.
+
+## Phase 1A: ReduceScatter + AllGather standalone test
+
+Implemented in ggml/src/ggml-backend-galaxy-collectives.h as standalone C++17
+backend operations. These are NOT yet wired to model execution; pure TP
+continues to use its original AllReduce. Inputs are GGML contiguous
+[hidden, tokens] F32/F16. Each rank starts with its own partial contribution;
+reduce_scatter sums the two contributions but retains only the rank-assigned
+token slice. all_gather copies both reduced slices to both ranks.
+Uneven splits are supported without padding. The host-staging implementation
+uses backend tensor get/set (CPU, CUDA, RPC) and does not claim optimal
+communication. A token tile bounds scratch space; Decode with a single token
+should stay on the existing TP path.
+
+Build on Windows:
+  cmake --build build-galaxy --config Release --target galaxy-collectives-selftest -j 8
+  .\build-galaxy\bin\Release\galaxy-collectives-selftest.exe
+
+Expected: six GALAXY_COLLECTIVES_CASE PASS lines and a final
+GALAXY_COLLECTIVES_SELFTEST PASS.
+
+Optional phone RPC test (phone Galaxy ggml-rpc-server must be running):
+  .\build-galaxy\bin\Release\galaxy-collectives-selftest.exe --pc CUDA0 --rpc 10.39.52.114:50052
+
+The RPC test uses only synthetic tensors; the GGUF is not needed for this
+test. Phase 1B will integrate these collectives into Qwen3 TP/SP graphs.
