@@ -145,11 +145,14 @@ int main(int argc, char ** argv) {
         require_test(pc != nullptr, "PC backend unavailable");
         ggml_backend_t second = nullptr;
 #if defined(GALAXY_COLLECTIVES_HAVE_RPC)
-        if (!rpc_endpoint.empty()) second = ggml_backend_rpc_init(rpc_endpoint.c_str(), 0);
+        if (!rpc_endpoint.empty()) {
+            second = ggml_backend_rpc_init(rpc_endpoint.c_str(), 0);
+            require_test(second != nullptr, "phone RPC backend unavailable: cannot substitute local CPU");
+        }
 #else
         require_test(rpc_endpoint.empty(), "rebuild with GGML_RPC=ON for RPC tests");
 #endif
-        if (!second) second = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        if (rpc_endpoint.empty()) second = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         require_test(second != nullptr, "second backend unavailable");
 
         try {
