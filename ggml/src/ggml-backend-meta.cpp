@@ -5,6 +5,7 @@
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
 #include "ggml-rpc.h"
+#include "ggml-backend-galaxy-collectives.h"
 
 #include <algorithm>
 #include <cassert>
@@ -25,6 +26,33 @@ struct ggml_backend_meta_device;
 struct ggml_backend_meta_buffer_type;
 struct ggml_backend_meta_buffer;
 struct ggml_backend_meta;
+
+// These DUP tensors are graph-only layout transition markers. They are
+// interpreted by the Meta backend, not dispatched to CPU/CUDA/RPC kernels.
+// Inference creates them only when LLAMA_GALAXY_SP=1 and n_tokens > 1.
+enum class galaxy_sp_transition {
+    none,
+    reduce_scatter,
+    scatter_mirrored,
+    all_gather,
+};
+
+static galaxy_sp_transition galaxy_sp_get_transition(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->op != GGML_OP_DUP) {
+        return galaxy_sp_transition::none;
+    }
+    const char * name = tensor->name;
+    if (strncmp(name, "GALAXY_RS_", 10) == 0) {
+        return galaxy_sp_transition::reduce_scatter;
+    }
+    if (strncmp(name, "GALAXY_SCATTER_", 15) == 0) {
+        return galaxy_sp_transition::scatter_mirrored;
+    }
+    if (strncmp(name, "GALAXY_AG_", 10) == 0) {
+        return galaxy_sp_transition::all_gather;
+    }
+    return galaxy_sp_transition::none;
+}
 
 const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis split_axis) {
     switch (split_axis) {
@@ -821,6 +849,24 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 GGML_ASSERT(ne_sum == tensor->ne[ret.axis]);
             }
             return ret;
+        }
+
+        // A transition is represented by a GGML_OP_DUP only in the host
+        // dependency graph; Meta physically materializes the changed layout.
+        // Do not run the ordinary DUP split inference, which would inherit
+        // the original layout and make the SP residual shape incorrect.
+        const galaxy_sp_transition transition = galaxy_sp_get_transition(tensor);
+        if (transition != galaxy_sp_transition::none) {
+            GGML_ASSERT(n_bufs == 2);
+            GGML_ASSERT(tensor->src[0] != nullptr);
+            GGML_ASSERT(tensor->ne[0] > 0 && tensor->ne[1] >= 2);
+            GGML_ASSERT(tensor->ne[2] == 1 && tensor->ne[3] == 1);
+            GGML_ASSERT(tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_F16);
+            if (transition == galaxy_sp_transition::all_gather) {
+                return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+            }
+            const int64_t pc_tokens = (tensor->ne[1] + 1)/2;
+            return {GGML_BACKEND_SPLIT_AXIS_1, {pc_tokens, tensor->ne[1] - pc_tokens}, {1}, 1};
         }
 
         std::vector<ggml_backend_meta_split_state> src_ss(GGML_MAX_SRC, {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1});
