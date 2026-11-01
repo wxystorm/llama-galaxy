@@ -345,6 +345,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     if (galaxy.active && ud->model->arch != LLM_ARCH_QWEN3 && ud->model->arch != LLM_ARCH_LLAMA) {
         throw std::invalid_argument("Galaxy TP phase 1 supports dense Qwen3 and Llama only");
     }
+    if (llama_galaxy_tp::sp_enabled() && ud->model->arch != LLM_ARCH_QWEN3) {
+        throw std::invalid_argument("Galaxy SP graph transitions currently support Qwen3 only");
+    }
     //GGML_LOG_INFO("已经调用 llama_meta_device_get_split_state, tensor_name: %s\n", tensor_name.c_str());
     //如果是q,k,v权重，打印切分信息
     
