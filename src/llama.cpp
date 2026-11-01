@@ -9,6 +9,7 @@
 #include "llama-model-loader.h"
 #include "llama-model-saver.h"
 #include "llama-model.h"
+#include "llama-galaxy-tp.h"
 
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -123,6 +124,30 @@ int64_t llama_time_us(void) {
 
 // returns true on success
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
+    if (llama_galaxy_tp::enabled()) {
+        if (params.split_mode != LLAMA_SPLIT_MODE_TENSOR || params.devices == nullptr) {
+            LLAMA_LOG_ERROR("[GALAXY_TP] requires --split-mode tensor and explicit --device PC,RPC0\n");
+            return false;
+        }
+        size_t n = 0;
+        while (params.devices[n] != nullptr) {
+            ++n;
+        }
+        if (n != 2) {
+            LLAMA_LOG_ERROR("[GALAXY_TP] requires exactly two devices (PC,Phone), got %zu\n", n);
+            return false;
+        }
+        const auto is_rpc = [](ggml_backend_dev_t dev) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            return reg != nullptr && std::strcmp(ggml_backend_reg_name(reg), "RPC") == 0;
+        };
+        if (is_rpc(params.devices[0]) || !is_rpc(params.devices[1])) {
+            LLAMA_LOG_ERROR("[GALAXY_TP] device order must be local PC first, phone RPC second\n");
+            return false;
+        }
+        LLAMA_LOG_INFO("[GALAXY_TP] static mapping PC=%s Phone=%s; no Planner/Chunk pipeline\n",
+                ggml_backend_dev_name(params.devices[0]), ggml_backend_dev_name(params.devices[1]));
+    }
     // create list of devices to use with this model
     if (params.devices) {
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {

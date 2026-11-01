@@ -33,6 +33,7 @@ else()
     if (GGML_RPC)
         add_subdirectory(rpc)
     endif()
+    add_subdirectory(galaxy)
     if (NOT GGML_BACKEND_DL AND GGML_CPU)
         # these tools use backends directly (no dynamic loading) and depend on CPU backend symbols
         add_subdirectory(cvector-generator)

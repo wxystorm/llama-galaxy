@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-galaxy-tp.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -338,6 +339,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
     const std::string tensor_name = tensor->name;
+    // Galaxy-LM's heads and FFN features are static per rank across layers.
+    // Strictly opt-in; existing llama.cpp meta behavior is unchanged otherwise.
+    const llama_galaxy_tp::policy galaxy = llama_galaxy_tp::from_environment(ud->n_devices);
+    if (galaxy.active && ud->model->arch != LLM_ARCH_QWEN3 && ud->model->arch != LLM_ARCH_LLAMA) {
+        throw std::invalid_argument("Galaxy TP phase 1 supports dense Qwen3 and Llama only");
+    }
     //GGML_LOG_INFO("已经调用 llama_meta_device_get_split_state, tensor_name: %s\n", tensor_name.c_str());
     //如果是q,k,v权重，打印切分信息
     
@@ -651,14 +658,45 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     ggml_backend_meta_split_state split_state;
     memset(&split_state, 0, sizeof(split_state));
     tensor_config tc = get_tensor_config();
+    if (galaxy.active) {
+        tc.rotation = 0; // fixed Galaxy rank ownership; no per-layer rotation
+    }
+    const bool galaxy_attention = galaxy.active && (
+            std::regex_match(tensor_name, pattern_q_weight) ||
+            std::regex_match(tensor_name, pattern_kv_weight) ||
+            std::regex_match(tensor_name, pattern_q_bias) ||
+            std::regex_match(tensor_name, pattern_kv_bias) ||
+            std::regex_match(tensor_name, pattern_qkv_weight) ||
+            std::regex_match(tensor_name, pattern_qkv_bias) ||
+            std::regex_match(tensor_name, pattern_attn_out_weight) ||
+            std::regex_match(tensor_name, pattern_kv_cache) ||
+            std::regex_match(tensor_name, pattern_attn_sinks));
+    const bool galaxy_ffn = galaxy.active && (
+            std::regex_match(tensor_name, pattern_ffn_up_gate_weight) ||
+            std::regex_match(tensor_name, pattern_ffn_up_gate_bias) ||
+            std::regex_match(tensor_name, pattern_ffn_gate_up_weight) ||
+            std::regex_match(tensor_name, pattern_ffn_down_weight));
+    // The two source-defined partitions have independent fixed counts.
+    const std::vector<int64_t> * galaxy_counts =
+            galaxy_attention ? &galaxy.heads : (galaxy_ffn ? &galaxy.ffn : nullptr);
     split_state.axis = tc.axis;
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
         const float * tensor_split = ud->model->tensor_split();
+        if (galaxy_counts != nullptr) {
+            // Each rank must own complete GQA groups and quantized FFN blocks.
+            const int64_t total = galaxy_attention ? hparams.n_head(tc.il) : hparams.n_ff(tc.il);
+            const int64_t quantum = galaxy_attention ? hparams.n_gqa(tc.il) : std::lcm(blck_size, int64_t(128));
+            llama_galaxy_tp::validate_counts(*galaxy_counts, total, quantum,
+                    galaxy_attention ? "attention heads" : "FFN units");
+        }
         std::vector<float> tensor_split_scan;
         tensor_split_scan.reserve(ud->n_devices);
         for (size_t j = 0; j < ud->n_devices; j++) {
-            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f : tensor_split[(j + tc.rotation) % ud->n_devices]);
+            const float weight = galaxy_counts != nullptr
+                    ? static_cast<float>((*galaxy_counts)[j])
+                    : (tensor_split == nullptr ? 0.0f : tensor_split[(j + tc.rotation) % ud->n_devices]);
+            tensor_split_scan.push_back(weight);
             if (j > 0) {
                 tensor_split_scan[j] += tensor_split_scan[j - 1];
             }
@@ -674,6 +712,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             for (; j < ud->n_devices - 1; j++) {
                 int64_t high = tensor_split_scan.back() == 0.0f ?
                     ne_s * (j+1)/ud->n_devices : ne_s * tensor_split_scan[j]/tensor_split_scan.back();
+                if (galaxy_counts != nullptr && high % g_s != 0) {
+                    throw std::invalid_argument("Galaxy TP exact split violates tensor granularity: " + tensor_name);
+                }
                 if (high % g_s != 0) {
                     high -= high % g_s;
                 }
@@ -684,6 +725,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             split_state.nr[is] = nr_s;
         }
         split_state.n_segments = segments.size();
+        if (galaxy_counts != nullptr &&
+                (std::regex_match(tensor_name, pattern_q_weight) ||
+                 std::regex_match(tensor_name, pattern_ffn_up_gate_weight))) {
+            GGML_LOG_INFO("[GALAXY_TP_SPLIT] tensor=%s axis=%d pc_units=%lld phone_units=%lld pc_dim=%lld phone_dim=%lld\n",
+                    tensor_name.c_str(), (int) split_state.axis,
+                    (long long) (*galaxy_counts)[0], (long long) (*galaxy_counts)[1],
+                    (long long) split_state.ne[0], (long long) split_state.ne[1]);
+        }
     } else {
         memset(split_state.ne, 0, sizeof(split_state.ne));
         split_state.nr[0] = 1;
