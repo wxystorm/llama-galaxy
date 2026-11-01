@@ -117,11 +117,23 @@ static void run_case(devices_t devices, ggml_type type,
     check_equals(unpack(rank0.complete), expected, "AG rank0");
     check_equals(unpack(rank1.complete), expected, "AG rank1");
 
+    // The independently gathered complete activation is the canonical
+    // residual input; splitting it must return exactly the old intervals.
+    const input_t mirrored = {rank0.complete, rank1.complete};
+    scatter_mirrored(devices, mirrored, slices, counts, tile);
+    check_equals(unpack(rank0.slice),
+                 std::vector<float>(expected.begin(), expected.begin()+edge),
+                 "SP residual rank0");
+    check_equals(unpack(rank1.slice),
+                 std::vector<float>(expected.begin()+edge, expected.end()),
+                 "SP residual rank1");
+
     expect_reject([&] { reduce_scatter(devices, partial, slices, {counts[0]+1,counts[1]}); }, "sum");
     expect_reject([&] { all_gather(devices, shards, full, {0,total}); }, "zero rank");
     expect_reject([&] { reduce_scatter(devices, partial, slices, counts, 0); }, "zero tile");
     expect_reject([&] { all_gather(devices, shards, full, counts, 0); }, "zero gather tile");
     expect_reject([&] { reduce_scatter(devices, partial, {rank0.partial,rank1.slice}, counts); }, "in-place");
+    expect_reject([&] { scatter_mirrored(devices, mirrored, slices, counts, 0); }, "zero scatter tile");
 
     std::cout << "[GALAXY_COLLECTIVES_CASE] tokens=" << total
               << " hidden=" << hidden << " seq=" << counts[0] << "," << counts[1]
