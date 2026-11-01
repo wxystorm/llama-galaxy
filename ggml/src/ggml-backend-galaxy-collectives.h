@@ -178,4 +178,33 @@ inline void all_gather(const devices_t & devices, const input_t & shard,
     }
 }
 
+// Copy the sequence interval owned by each rank out of an already mirrored
+// full activation. This is needed for the residual path before an SP addition.
+// Rank 0's mirror is the canonical source. No arithmetic takes place.
+// For the initial implementation, host staging is used for both backends.
+inline void scatter_mirrored(const devices_t & devices, const input_t & full,
+                            const output_t & shard, counts_t counts, size_t tile_tokens = 32) {
+    detail::validate(devices, full, shard, counts, tile_tokens, true);
+    const size_t row = detail::multiply(full[0]->ne[0], detail::element_bytes(full[0]->type));
+
+    ggml_backend_synchronize(devices[0]);
+    ggml_backend_synchronize(devices[1]);
+
+    int64_t global_start = 0;
+    for (int rank = 0; rank < 2; ++rank) {
+        for (int64_t done = 0; done < counts[rank]; ) {
+            const int64_t n = std::min<int64_t>(counts[rank]-done, static_cast<int64_t>(tile_tokens));
+            const size_t bytes = detail::multiply(n, row);
+            const size_t src_offset = detail::multiply(global_start+done, row);
+            const size_t dst_offset = detail::multiply(done, row);
+            std::vector<uint8_t> data(bytes);
+            ggml_backend_tensor_get(full[0], data.data(), src_offset, bytes);
+            ggml_backend_tensor_set(shard[rank], data.data(), dst_offset, bytes);
+            ggml_backend_synchronize(devices[rank]);
+            done += n;
+        }
+        global_start += counts[rank];
+    }
+}
+
 } // namespace ggml_galaxy_collectives
