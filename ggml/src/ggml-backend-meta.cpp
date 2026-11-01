@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <exception>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -2561,6 +2562,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
+    size_t galaxy_rs_count = 0;
+    size_t galaxy_ag_count = 0;
+    size_t galaxy_scatter_count = 0;
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         const size_t i_start = backend_ctx->backend_configs[0].cgraphs[i].offset;
         const size_t i_stop = i + 1 < backend_ctx->n_subgraphs
@@ -2583,6 +2587,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         const galaxy_sp_transition transition = galaxy_sp_get_transition(original_last);
         if (transition != galaxy_sp_transition::none) {
+            const auto input_state = ggml_backend_meta_get_split_state(original_last->src[0], false);
+            const bool transition_valid =
+                    (transition == galaxy_sp_transition::reduce_scatter &&
+                         input_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) ||
+                    (transition == galaxy_sp_transition::scatter_mirrored &&
+                         input_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) ||
+                    (transition == galaxy_sp_transition::all_gather &&
+                         input_state.axis == GGML_BACKEND_SPLIT_AXIS_1);
+            if (!transition_valid) {
+                GGML_LOG_ERROR("[GALAXY_SP] unexpected source layout for %s: %s\n",
+                        original_last->name, ggml_backend_meta_split_axis_name(input_state.axis));
+                return GGML_STATUS_FAILED;
+            }
             // src[0] is the source activation, the marker itself is the
             // destination. Both are Meta tensors with distinct per-rank
             // backend allocations. Synchronization is inside the primitive.
@@ -2612,12 +2629,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 switch (transition) {
                     case galaxy_sp_transition::reduce_scatter:
                         ggml_galaxy_collectives::reduce_scatter(devs, in, out, counts);
+                        galaxy_rs_count++;
                         break;
                     case galaxy_sp_transition::scatter_mirrored:
                         ggml_galaxy_collectives::scatter_mirrored(devs, in, out, counts);
+                        galaxy_scatter_count++;
                         break;
                     case galaxy_sp_transition::all_gather:
                         ggml_galaxy_collectives::all_gather(devs, in, out, counts);
+                        galaxy_ag_count++;
                         break;
                     case galaxy_sp_transition::none:
                         break;
@@ -2641,6 +2661,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (i_stop < size_t(cgraph->n_nodes) &&
                         galaxy_sp_get_transition(cgraph->nodes[i_stop]) ==
                                 galaxy_sp_transition::reduce_scatter) {
+                    if (cgraph->nodes[i_stop]->src[0] != original_last) {
+                        GGML_LOG_ERROR("[GALAXY_SP] a ReduceScatter marker must immediately consume the PARTIAL output\n");
+                        return GGML_STATUS_FAILED;
+                    }
                     continue;
                 }
             }
@@ -2663,6 +2687,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
         }
+    }
+    if (has_galaxy_markers) {
+        GGML_LOG_INFO("[GALAXY_SP_SUM] reduced_scatter=%zu residual_scatter=%zu all_gather=%zu phase=PREFILL\n",
+                galaxy_rs_count, galaxy_scatter_count, galaxy_ag_count);
     }
     return GGML_STATUS_SUCCESS;
 }
