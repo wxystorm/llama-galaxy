@@ -124,6 +124,10 @@ int64_t llama_time_us(void) {
 
 // returns true on success
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
+    if (llama_galaxy_tp::sp_enabled() && !llama_galaxy_tp::enabled()) {
+        LLAMA_LOG_ERROR("[GALAXY_SP] requires LLAMA_GALAXY_TP=1; cannot use SP without tensor-parallel weights\n");
+        return false;
+    }
     if (llama_galaxy_tp::enabled()) {
         if (params.split_mode != LLAMA_SPLIT_MODE_TENSOR || params.devices == nullptr) {
             LLAMA_LOG_ERROR("[GALAXY_TP] requires --split-mode tensor and explicit --device PC,RPC0\n");
