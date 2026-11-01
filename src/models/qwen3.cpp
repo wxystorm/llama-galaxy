@@ -1,4 +1,5 @@
 #include "models.h"
+#include "../llama-galaxy-tp.h"
 
 void llama_model_qwen3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -52,6 +53,11 @@ std::unique_ptr<llm_graph_context> llama_model_qwen3::build_arch_graph(const llm
 
 llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
+
+    // Phase 1B: experimental TP->SP only for multi-token forward graphs.
+    // Keep the final layer pure TP because it may select a single output
+    // token via inp_out_ids; decode (n_tokens == 1) stays entirely pure TP.
+    const bool galaxy_sp = llama_galaxy_tp::sp_enabled() && n_tokens > 1;
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
     GGML_ASSERT(n_embd_head == n_rot);
@@ -111,11 +117,24 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
         }
+        const bool galaxy_sp_layer = galaxy_sp && il + 1 < n_layer;
+        if (galaxy_sp_layer) {
+            // Attention output is TP_PARTIAL; let the Meta backend perform
+            // ReduceScatter instead of its usual AllReduce.
+            cur = ggml_dup(ctx0, cur);
+            ggml_format_name(cur, "GALAXY_RS_ATT_%d", il);
+        }
         if (il == n_layer - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
-        ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+        ggml_tensor * residual_attn = inpSA;
+        if (galaxy_sp_layer) {
+            // The skip/residual path needs the same token ownership as RS.
+            residual_attn = ggml_dup(ctx0, inpSA);
+            ggml_format_name(residual_attn, "GALAXY_SCATTER_RESID_%d", il);
+        }
+        ggml_tensor * ffn_inp = ggml_add(ctx0, cur, residual_attn);
         cb(ffn_inp, "ffn_inp", il);
 
         // feed-forward network
@@ -123,6 +142,12 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
                 model.layers[il].ffn_norm, NULL,
                 LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
+
+        if (galaxy_sp_layer) {
+            // SP -> TP before FFN: AllGather complete hidden states.
+            cur = ggml_dup(ctx0, cur);
+            ggml_format_name(cur, "GALAXY_AG_ATT_%d", il);
+        }
 
         cur = build_ffn(cur,
                 model.layers[il].ffn_up,   NULL, model.layers[il].ffn_up_s,
@@ -132,7 +157,16 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
                 LLM_FFN_SILU, LLM_FFN_PAR, il);
         cb(cur, "ffn_out", il);
 
+        if (galaxy_sp_layer) {
+            cur = ggml_dup(ctx0, cur);
+            ggml_format_name(cur, "GALAXY_RS_FFN_%d", il);
+        }
         cur = ggml_add(ctx0, cur, ffn_inp);
+        if (galaxy_sp_layer) {
+            // Restore TP_MIRRORED layout for the next layer's attention.
+            cur = ggml_dup(ctx0, cur);
+            ggml_format_name(cur, "GALAXY_AG_FFN_%d", il);
+        }
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
