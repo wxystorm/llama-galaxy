@@ -2117,6 +2117,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
 
+    bool has_galaxy_markers = false;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        has_galaxy_markers |= galaxy_sp_get_transition(cgraph->nodes[i]) != galaxy_sp_transition::none;
+    }
+    if (has_galaxy_markers && n_backends != 2) {
+        GGML_LOG_ERROR("[GALAXY_SP] graph transitions need exactly two Meta backends\n");
+        return GGML_STATUS_FAILED;
+    }
+
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
     const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
 
@@ -2175,6 +2184,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         {
             // For MoE models it may make sense to delay the AllReduce in order to reduce I/O:
             auto get_i_delayed = [&](const int i) -> int {
+                // A Galaxy layout transition must immediately follow the
+                // original PARTIAL output. Delaying the AllReduce would
+                // incorrectly consume/overwrite one of its partial inputs.
+                if (has_galaxy_markers) {
+                    return i;
+                }
                 int id = i; // i_delayed
                 int idr = i; // i_delayed return, last safe return value
 
@@ -2284,7 +2299,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                     max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
                 }
-                const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+                const bool new_subgraph = i + 1 == cgraph->n_nodes ||
+                        split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL ||
+                        galaxy_sp_get_transition(node) != galaxy_sp_transition::none;
                 if (!new_subgraph) {
                     continue;
                 }
@@ -2366,11 +2383,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 ggml_cgraph * cgraph_ij = bcj.cgraphs[i_graph].cgraph_main;
                 const size_t i_node_start = bcj.cgraphs[i_graph].offset;
                 const size_t i_node_stop = i_graph + 1 < n_subgraphs ? bcj.cgraphs[i_graph + 1].offset : cgraph->n_nodes;
-                cgraph_ij->n_nodes = i_node_stop - i_node_start;
+                cgraph_ij->n_nodes = 0;
                 ggml_hash_set_reset(&cgraph_ij->visited_hash_set);
                 for (size_t i_node = i_node_start; i_node < i_node_stop; i_node++) {
+                    // The marker is allocated as a real ggml tensor but Meta
+                    // fills it with the appropriate collective. Running the
+                    // DUP op would copy a full tensor into a sequence shard.
+                    if (galaxy_sp_get_transition(cgraph->nodes[i_node]) != galaxy_sp_transition::none) {
+                        continue;
+                    }
                     ggml_tensor * node_ij = bcj.nodes[i_node];
-                    cgraph_ij->nodes[i_node - i_node_start] = node_ij;
+                    cgraph_ij->nodes[cgraph_ij->n_nodes++] = node_ij;
                     const size_t hash_pos_orig = ggml_hash_find(&cgraph->visited_hash_set, cgraph->nodes[i_node]);
                     const size_t hash_pos_ij = ggml_hash_insert(&cgraph_ij->visited_hash_set, node_ij);
                     cgraph_ij->use_counts[hash_pos_ij] = cgraph->use_counts[hash_pos_orig];
@@ -2539,15 +2562,88 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+        const size_t i_start = backend_ctx->backend_configs[0].cgraphs[i].offset;
+        const size_t i_stop = i + 1 < backend_ctx->n_subgraphs
+                ? backend_ctx->backend_configs[0].cgraphs[i + 1].offset
+                : size_t(cgraph->n_nodes);
+        GGML_ASSERT(i_stop > i_start);
+        ggml_tensor * original_last = cgraph->nodes[i_stop - 1];
+
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
-            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+            ggml_cgraph * simple_graph = bcj.cgraphs[i].cgraph_main;
+            if (simple_graph->n_nodes == 0) {
+                continue;  // graph-only Galaxy collective marker
+            }
+            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, simple_graph);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
         }
 
+        const galaxy_sp_transition transition = galaxy_sp_get_transition(original_last);
+        if (transition != galaxy_sp_transition::none) {
+            // src[0] is the source activation, the marker itself is the
+            // destination. Both are Meta tensors with distinct per-rank
+            // backend allocations. Synchronization is inside the primitive.
+            if (original_last->src[0] == nullptr ||
+                    !ggml_backend_buffer_is_meta(original_last->src[0]->buffer) ||
+                    !ggml_backend_buffer_is_meta(original_last->buffer)) {
+                GGML_LOG_ERROR("[GALAXY_SP] marker source/destination must use Meta backend: %s\n",
+                        original_last->name);
+                return GGML_STATUS_FAILED;
+            }
+            const ggml_galaxy_collectives::devices_t devs = {
+                backend_ctx->backend_configs[0].backend,
+                backend_ctx->backend_configs[1].backend,
+            };
+            const ggml_galaxy_collectives::input_t in = {
+                ggml_backend_meta_buffer_simple_tensor(original_last->src[0], 0),
+                ggml_backend_meta_buffer_simple_tensor(original_last->src[0], 1),
+            };
+            const ggml_galaxy_collectives::output_t out = {
+                ggml_backend_meta_buffer_simple_tensor(original_last, 0),
+                ggml_backend_meta_buffer_simple_tensor(original_last, 1),
+            };
+            const ggml_galaxy_collectives::counts_t counts = transition == galaxy_sp_transition::all_gather
+                    ? ggml_galaxy_collectives::counts_t{in[0]->ne[1], in[1]->ne[1]}
+                    : ggml_galaxy_collectives::counts_t{out[0]->ne[1], out[1]->ne[1]};
+            try {
+                switch (transition) {
+                    case galaxy_sp_transition::reduce_scatter:
+                        ggml_galaxy_collectives::reduce_scatter(devs, in, out, counts);
+                        break;
+                    case galaxy_sp_transition::scatter_mirrored:
+                        ggml_galaxy_collectives::scatter_mirrored(devs, in, out, counts);
+                        break;
+                    case galaxy_sp_transition::all_gather:
+                        ggml_galaxy_collectives::all_gather(devs, in, out, counts);
+                        break;
+                    case galaxy_sp_transition::none:
+                        break;
+                }
+            } catch (const std::exception & e) {
+                GGML_LOG_ERROR("[GALAXY_SP] %s failed: %s\n", original_last->name, e.what());
+                return GGML_STATUS_FAILED;
+            }
+            continue; // marker has already finished its collective
+        }
+
         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+            if (has_galaxy_markers) {
+                // Only an actual PARTIAL terminal needs AllReduce. When the
+                // next node is GALAXY_RS, skip the old AllReduce entirely;
+                // ReduceScatter will consume both unreduced rank outputs.
+                const auto state = ggml_backend_meta_get_split_state(original_last, false);
+                if (state.axis != GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+                    continue;
+                }
+                if (i_stop < size_t(cgraph->n_nodes) &&
+                        galaxy_sp_get_transition(cgraph->nodes[i_stop]) ==
+                                galaxy_sp_transition::reduce_scatter) {
+                    continue;
+                }
+            }
             bool backend_allreduce_success = false;
             if (backend_ctx->comm_ctx) {
                 std::vector<ggml_tensor *> nodes;
