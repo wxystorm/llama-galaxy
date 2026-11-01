@@ -58,7 +58,7 @@ try {
     $proc = Start-Process -FilePath (Resolve-Path -LiteralPath $Exe).Path -ArgumentList $arguments -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
     Write-Host "[GALAXY_SP_SMOKE] exit=$($proc.ExitCode) logs=$dir"
 
-    $hits = @(Select-String -Path $stderr, $stdout -Pattern "GALAXY_SP_SUM","GALAXY_SP]","GALAXY_TP]","prompt eval time","eval time","ERROR","failed" -ErrorAction SilentlyContinue)
+    $hits = @(Select-String -Path $stderr, $stdout -Pattern "GALAXY_SP_LAYOUT_FAIL","GALAXY_SP_LAYOUT_SRC","GALAXY_SP_SUM","GALAXY_SP]","GALAXY_TP]","prompt eval time","eval time","ERROR","failed" -ErrorAction SilentlyContinue)
     foreach ($hit in $hits) { Write-Host $hit.Line.Trim() }
 
     if ($proc.ExitCode -ne 0) { throw "Smoke run failed; examine $stderr and $stdout" }
