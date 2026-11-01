@@ -24,6 +24,12 @@ inline bool enabled() {
     return value != nullptr && std::string(value) == "1";
 }
 
+// Experimental TP -> SP graph transitions, disabled by default.
+inline bool sp_enabled() {
+    const char * value = std::getenv("LLAMA_GALAXY_SP");
+    return value != nullptr && std::string(value) == "1";
+}
+
 inline std::vector<int64_t> parse_counts(const char * text, const char * key, size_t n_devices) {
     if (text == nullptr || text[0] == '\0') {
         throw std::invalid_argument(std::string(key) + " is required in Galaxy TP mode");
