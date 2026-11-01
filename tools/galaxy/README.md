@@ -64,3 +64,39 @@ Optional phone RPC test (phone Galaxy ggml-rpc-server must be running):
 
 The RPC test uses only synthetic tensors; the GGUF is not needed for this
 test. Phase 1B will integrate these collectives into Qwen3 TP/SP graphs.
+
+## Phase 1B: experimental Qwen3 TP/SP graph integration
+
+Runtime markers are now emitted only for multi-token Qwen3 inference
+when LLAMA_GALAXY_SP=1 AND LLAMA_GALAXY_TP=1. Default pure TP is unchanged.
+Last layer and single-token Decode remain on pure TP.
+
+Dataflow per intermediate layer:
+  ATT TP_PARTIAL -> ReduceScatter -> Residual Sequence Scatter
+  -> SP residual add / RMSNorm -> AllGather -> FFN TP_PARTIAL
+  -> ReduceScatter -> SP residual add -> AllGather -> next layer.
+
+Meta skips marker DUP kernels, materializes proper per-rank token shapes,
+performs the three host-staged collective operations, and skips the old
+AllReduce only when followed immediately by a ReduceScatter marker.
+PC receives ceil(T/2) tokens and Phone floor(T/2), without a Planner.
+
+THIS STAGE IS EXPERIMENTAL AND NOT YET VERIFIED BY REAL QWEN3 INFERENCE.
+The standalone F32/F16 collective tests do not prove graph-level correctness.
+
+Build the updated Windows targets:
+  git pull --ff-only origin feat/galaxy-baseline
+  cmake --build build-galaxy --config Release --target galaxy-collectives-selftest llama-cli -j 8
+  .\build-galaxy\bin\Release\galaxy-collectives-selftest.exe
+
+Then run the new script from the repo root (PowerShell one-line example):
+  .\tools\galaxy\run_galaxy_sp_smoke.ps1 -Model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" -Rpc "10.39.52.114:50052" -PromptFile "E:\llama\llama-tensor-v2\single-prompt\prompt_64.txt"
+
+Compare against the same command with -PureTP. Both modes use greedy temp=0.
+The script saves separate stdout.log and stderr.log under galaxy-sp-results.
+A successful SP run emits [GALAXY_SP_SUM] with transition counts. For the
+40-layer Qwen3-14B model, the intended 39 SP layers imply per complete
+graph: RS=78, ResidualScatter=39, AG=78. Verify rather than assume counts.
+
+Only after numerical correctness has been established should speed or
+communication costs be evaluated. The current collectives use host staging.
