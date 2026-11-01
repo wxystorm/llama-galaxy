@@ -580,6 +580,26 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (scalar_only && ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
             ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
         }
+        if (ret.axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
+            // This branch is cold: never log for successful tensor-layout
+            // inference. A print of the *actual* node and source states is
+            // essential because both incompatible split inputs and a
+            // scalar_only restriction lead to the same assertion here.
+            GGML_LOG_ERROR("[GALAXY_SP_LAYOUT_FAIL] node=%s op=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] scalar_only=%d n_backends=%zu\n",
+                    tensor->name, ggml_op_name(tensor->op),
+                    tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3], (int) scalar_only, n_bufs);
+            for (size_t i = 0; i < GGML_MAX_SRC; ++i) {
+                const ggml_tensor * src = tensor->src[i];
+                if (src == nullptr || src == tensor) {
+                    continue;
+                }
+                const ggml_backend_meta_split_state & state = src_ss[i];
+                GGML_LOG_ERROR("[GALAXY_SP_LAYOUT_SRC] index=%zu name=%s op=%s axis=%s ne=[%" PRId64 ",%" PRId64 "] split=[%" PRId64 ",%" PRId64 "] segments=%u\n",
+                        i, src->name, ggml_op_name(src->op),
+                        ggml_backend_meta_split_axis_name(state.axis),
+                        src->ne[0], src->ne[1], state.ne[0], state.ne[1], state.n_segments);
+            }
+        }
         GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
         return ret;
     };
