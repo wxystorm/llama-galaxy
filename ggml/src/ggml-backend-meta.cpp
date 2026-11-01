@@ -2587,6 +2587,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         const galaxy_sp_transition transition = galaxy_sp_get_transition(original_last);
         if (transition != galaxy_sp_transition::none) {
+            if (original_last->src[0] == nullptr ||
+                    !ggml_backend_buffer_is_meta(original_last->buffer) ||
+                    !ggml_backend_buffer_is_meta(original_last->src[0]->buffer)) {
+                GGML_LOG_ERROR("[GALAXY_SP] marker requires Meta source/destination: %s\n", original_last->name);
+                return GGML_STATUS_FAILED;
+            }
             const auto input_state = ggml_backend_meta_get_split_state(original_last->src[0], false);
             const bool transition_valid =
                     (transition == galaxy_sp_transition::reduce_scatter &&
@@ -2603,13 +2609,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             // src[0] is the source activation, the marker itself is the
             // destination. Both are Meta tensors with distinct per-rank
             // backend allocations. Synchronization is inside the primitive.
-            if (original_last->src[0] == nullptr ||
-                    !ggml_backend_buffer_is_meta(original_last->src[0]->buffer) ||
-                    !ggml_backend_buffer_is_meta(original_last->buffer)) {
-                GGML_LOG_ERROR("[GALAXY_SP] marker source/destination must use Meta backend: %s\n",
-                        original_last->name);
-                return GGML_STATUS_FAILED;
-            }
             const ggml_galaxy_collectives::devices_t devs = {
                 backend_ctx->backend_configs[0].backend,
                 backend_ctx->backend_configs[1].backend,
