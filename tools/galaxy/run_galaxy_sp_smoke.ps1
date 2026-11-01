@@ -13,6 +13,8 @@ param(
     [string]$FfnSplit = "8704,8704",
     [string]$OutputDir = ".\galaxy-sp-results",
     [switch]$PureTP,
+    [switch]$Trace,
+    [int]$TimeoutSec = 0,
     [int]$NPredict = 1,
     [int]$Ctx = 256,
     [int]$Batch = 256,
@@ -29,7 +31,7 @@ if ($Ctx -le 0 -or $Batch -le 0 -or $UBatch -le 0 -or $Threads -le 0 -or $NPredi
     throw "Context, batch, ubatch, threads and predict must be positive"
 }
 
-$keys = @("LLAMA_GALAXY_TP", "LLAMA_GALAXY_TP_HEADS", "LLAMA_GALAXY_TP_FFN", "LLAMA_GALAXY_SP")
+$keys = @("LLAMA_GALAXY_TP", "LLAMA_GALAXY_TP_HEADS", "LLAMA_GALAXY_TP_FFN", "LLAMA_GALAXY_SP", "LLAMA_GALAXY_SP_TRACE")
 $old = @{}
 foreach ($key in $keys) { $old[$key] = [Environment]::GetEnvironmentVariable($key, "Process") }
 
@@ -38,6 +40,7 @@ try {
     $env:LLAMA_GALAXY_TP_HEADS = $HeadSplit
     $env:LLAMA_GALAXY_TP_FFN   = $FfnSplit
     $env:LLAMA_GALAXY_SP       = if ($PureTP) { "0" } else { "1" }
+    $env:LLAMA_GALAXY_SP_TRACE = if ($Trace) { "1" } else { "0" }
 
     $mode = if ($PureTP) { "tp" } else { "sp" }
     $dir = Join-Path $OutputDir "$mode-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
@@ -55,10 +58,19 @@ try {
         "-n", $NPredict.ToString(), "--temp", "0", "-f", $promptArg
     )
     Write-Host "[GALAXY_SP_SMOKE] mode=$mode devices=$Devices rpc=$Rpc"
-    $proc = Start-Process -FilePath (Resolve-Path -LiteralPath $Exe).Path -ArgumentList $arguments -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    $proc = Start-Process -FilePath (Resolve-Path -LiteralPath $Exe).Path -ArgumentList $arguments -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    if ($TimeoutSec -gt 0) {
+        if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+            try { $proc.Kill() } catch {}
+            $proc.WaitForExit()
+            throw "Galaxy $mode run timed out after $TimeoutSec seconds; logs=$dir"
+        }
+    } else {
+        $proc.WaitForExit()
+    }
     Write-Host "[GALAXY_SP_SMOKE] exit=$($proc.ExitCode) logs=$dir"
 
-    $hits = @(Select-String -Path $stderr, $stdout -Pattern "GALAXY_SP_LAYOUT_FAIL","GALAXY_SP_LAYOUT_SRC","GALAXY_SP_SUM","GALAXY_SP]","GALAXY_TP]","prompt eval time","eval time","ERROR","failed" -ErrorAction SilentlyContinue)
+    $hits = @(Select-String -Path $stderr, $stdout -Pattern "GALAXY_META_TRACE","GALAXY_SP_LAYOUT_FAIL","GALAXY_SP_LAYOUT_SRC","GALAXY_SP_SUM","GALAXY_SP]","GALAXY_TP]","prompt eval time","eval time","ERROR","failed" -ErrorAction SilentlyContinue)
     foreach ($hit in $hits) { Write-Host $hit.Line.Trim() }
 
     if ($proc.ExitCode -ne 0) { throw "Smoke run failed; examine $stderr and $stdout" }

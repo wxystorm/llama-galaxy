@@ -112,3 +112,20 @@ causing ordinary DUP split inference to reject a sequence-sharded input.
 `galaxy-collectives-selftest` also checks that all three kinds survive
 renaming, and that a normal DUP named `GALAXY_AG_FFN_0` does not accidentally
 become a collective.
+
+
+### Debugging a suspected hang after l_out-38
+
+PC-only tracing is now opt-in. It logs GRAPH_BEGIN, SUBGRAPH_BEGIN,
+DISPATCH_BEGIN/RETURN for each rank, COLLECTIVE_BEGIN/END,
+ALLREDUCE_BEGIN/END and GRAPH_END. Note: RPC DISPATCH_RETURN means that the
+RPC compute command was queued, not that phone computation has completed.
+If the PC stops between COLLECTIVE_BEGIN and COLLECTIVE_END, the collective
+is waiting for a backend get/set; if it stops at ALLREDUCE_BEGIN, the
+Meta fallback reduction or its backend copy is waiting.
+
+Run the usual smoke script with `-Trace -TimeoutSec 300` (or a longer
+explicit limit for slow phone CPU). This saves stdout.log and stderr.log;
+check the final 30-60 `[GALAXY_META_TRACE]` lines from stderr.log. The
+tracing flag does not change tensor layouts, weights, or scheduling.
+The phone RPC server does not need to be rebuilt.

@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -2124,6 +2125,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         has_galaxy_markers |= galaxy_sp_get_transition(cgraph->nodes[i]) != galaxy_sp_transition::none;
     }
+    // Debug only: capture the exact Meta subgraph or collective where PC
+    // waits. Enable explicitly with LLAMA_GALAXY_SP_TRACE=1. Also trace
+    // the final decode graph (which contains no SP markers).
+    const char * trace_value = std::getenv("LLAMA_GALAXY_SP_TRACE");
+    const bool trace = trace_value != nullptr && trace_value[0] == '1' && trace_value[1] == '\0';
+    if (trace) {
+        GGML_LOG_INFO("[GALAXY_META_TRACE] event=GRAPH_BEGIN nodes=%d backends=%zu sp=%d uid=%" PRIu64 "\n",
+                cgraph->n_nodes, n_backends, int(has_galaxy_markers), cgraph->uid);
+    }
     if (has_galaxy_markers && n_backends != 2) {
         GGML_LOG_ERROR("[GALAXY_SP] graph transitions need exactly two Meta backends\n");
         return GGML_STATUS_FAILED;
@@ -2575,13 +2585,27 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         GGML_ASSERT(i_stop > i_start);
         ggml_tensor * original_last = cgraph->nodes[i_stop - 1];
 
+        if (trace) {
+            GGML_LOG_INFO("[GALAXY_META_TRACE] event=SUBGRAPH_BEGIN idx=%zu total=%zu range=%zu..%zu last=%s op=%s transition=%d\n",
+                    i, backend_ctx->n_subgraphs, i_start, i_stop,
+                    original_last->name, ggml_op_name(original_last->op),
+                    int(galaxy_sp_get_transition(original_last)));
+        }
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             ggml_cgraph * simple_graph = bcj.cgraphs[i].cgraph_main;
             if (simple_graph->n_nodes == 0) {
                 continue;  // graph-only Galaxy collective marker
             }
+            if (trace) {
+                GGML_LOG_INFO("[GALAXY_META_TRACE] event=DISPATCH_BEGIN idx=%zu rank=%zu backend=%s nodes=%d\n",
+                        i, j, ggml_backend_name(bcj.backend), simple_graph->n_nodes);
+            }
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, simple_graph);
+            if (trace) {
+                GGML_LOG_INFO("[GALAXY_META_TRACE] event=DISPATCH_RETURN idx=%zu rank=%zu status=%d\n",
+                        i, j, int(status));
+            }
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
@@ -2626,6 +2650,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             const ggml_galaxy_collectives::counts_t counts = transition == galaxy_sp_transition::all_gather
                     ? ggml_galaxy_collectives::counts_t{in[0]->ne[1], in[1]->ne[1]}
                     : ggml_galaxy_collectives::counts_t{out[0]->ne[1], out[1]->ne[1]};
+            if (trace) {
+                GGML_LOG_INFO("[GALAXY_META_TRACE] event=COLLECTIVE_BEGIN idx=%zu kind=%d tensor=%s tokens=%" PRId64 "+%" PRId64 "\n",
+                        i, int(transition), original_last->name, counts[0], counts[1]);
+            }
             try {
                 switch (transition) {
                     case galaxy_sp_transition::reduce_scatter:
@@ -2646,6 +2674,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             } catch (const std::exception & e) {
                 GGML_LOG_ERROR("[GALAXY_SP] %s failed: %s\n", original_last->name, e.what());
                 return GGML_STATUS_FAILED;
+            }
+            if (trace) {
+                GGML_LOG_INFO("[GALAXY_META_TRACE] event=COLLECTIVE_END idx=%zu kind=%d tensor=%s\n",
+                        i, int(transition), original_last->name);
             }
             continue; // marker has already finished its collective
         }
@@ -2669,6 +2701,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     continue;
                 }
             }
+            if (trace) {
+                GGML_LOG_INFO("[GALAXY_META_TRACE] event=ALLREDUCE_BEGIN idx=%zu tensor=%s\n",
+                        i, original_last->name);
+            }
             bool backend_allreduce_success = false;
             if (backend_ctx->comm_ctx) {
                 std::vector<ggml_tensor *> nodes;
@@ -2687,7 +2723,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     return status;
                 }
             }
+            if (trace) {
+                GGML_LOG_INFO("[GALAXY_META_TRACE] event=ALLREDUCE_END idx=%zu tensor=%s native=%d\n",
+                        i, original_last->name, int(backend_allreduce_success));
+            }
         }
+    }
+    if (trace) {
+        GGML_LOG_INFO("[GALAXY_META_TRACE] event=GRAPH_END subgraphs=%zu sp=%d\n",
+                backend_ctx->n_subgraphs, int(has_galaxy_markers));
     }
     if (has_galaxy_markers) {
         GGML_LOG_INFO("[GALAXY_SP_SUM] reduced_scatter=%zu residual_scatter=%zu all_gather=%zu phase=PREFILL\n",
