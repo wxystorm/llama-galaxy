@@ -6,6 +6,7 @@
 #include "ggml-cpp.h"
 #include "ggml-rpc.h"
 #include "ggml-backend-galaxy-collectives.h"
+#include "ggml-backend-galaxy-markers.h"
 
 #include <algorithm>
 #include <cassert>
@@ -28,31 +29,12 @@ struct ggml_backend_meta_buffer_type;
 struct ggml_backend_meta_buffer;
 struct ggml_backend_meta;
 
-// These DUP tensors are graph-only layout transition markers. They are
-// interpreted by the Meta backend, not dispatched to CPU/CUDA/RPC kernels.
-// Inference creates them only when LLAMA_GALAXY_SP=1 and n_tokens > 1.
-enum class galaxy_sp_transition {
-    none,
-    reduce_scatter,
-    scatter_mirrored,
-    all_gather,
-};
+// Named DUP tensors are graph-only transitions. Their identity is encoded
+// in op_params, not the name: llama callbacks can rename a tensor in place.
+using galaxy_sp_transition = ggml_galaxy::sp_transition;
 
 static galaxy_sp_transition galaxy_sp_get_transition(const ggml_tensor * tensor) {
-    if (tensor == nullptr || tensor->op != GGML_OP_DUP) {
-        return galaxy_sp_transition::none;
-    }
-    const char * name = tensor->name;
-    if (strncmp(name, "GALAXY_RS_", 10) == 0) {
-        return galaxy_sp_transition::reduce_scatter;
-    }
-    if (strncmp(name, "GALAXY_SCATTER_", 15) == 0) {
-        return galaxy_sp_transition::scatter_mirrored;
-    }
-    if (strncmp(name, "GALAXY_AG_", 10) == 0) {
-        return galaxy_sp_transition::all_gather;
-    }
-    return galaxy_sp_transition::none;
+    return ggml_galaxy::get_transition(tensor);
 }
 
 const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis split_axis) {

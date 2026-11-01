@@ -100,3 +100,15 @@ graph: RS=78, ResidualScatter=39, AG=78. Verify rather than assume counts.
 
 Only after numerical correctness has been established should speed or
 communication costs be evaluated. The current collectives use host staging.
+
+### Fix: callback rename should not hide a Galaxy transition
+
+The Qwen3 graph builder tags each layout transition in its GGML DUP
+`op_params` with a magic value and explicit operation kind. Meta reads this
+metadata instead of inferring transitions from tensor names. This fixes
+the case where `graph_get_cb()` relabels `GALAXY_AG_FFN_0` to `l_out-0`,
+causing ordinary DUP split inference to reject a sequence-sharded input.
+
+`galaxy-collectives-selftest` also checks that all three kinds survive
+renaming, and that a normal DUP named `GALAXY_AG_FFN_0` does not accidentally
+become a collective.

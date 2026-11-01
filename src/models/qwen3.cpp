@@ -1,5 +1,6 @@
 #include "models.h"
 #include "../llama-galaxy-tp.h"
+#include "ggml-backend-galaxy-markers.h"
 
 void llama_model_qwen3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -122,6 +123,7 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
             // Attention output is TP_PARTIAL; let the Meta backend perform
             // ReduceScatter instead of its usual AllReduce.
             cur = ggml_dup(ctx0, cur);
+            ggml_galaxy::mark_transition(cur, ggml_galaxy::sp_transition::reduce_scatter);
             ggml_format_name(cur, "GALAXY_RS_ATT_%d", il);
         }
         if (il == n_layer - 1 && inp_out_ids) {
@@ -132,6 +134,7 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
         if (galaxy_sp_layer) {
             // The skip/residual path needs the same token ownership as RS.
             residual_attn = ggml_dup(ctx0, inpSA);
+            ggml_galaxy::mark_transition(residual_attn, ggml_galaxy::sp_transition::scatter_mirrored);
             ggml_format_name(residual_attn, "GALAXY_SCATTER_RESID_%d", il);
         }
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, residual_attn);
@@ -146,6 +149,7 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
         if (galaxy_sp_layer) {
             // SP -> TP before FFN: AllGather complete hidden states.
             cur = ggml_dup(ctx0, cur);
+            ggml_galaxy::mark_transition(cur, ggml_galaxy::sp_transition::all_gather);
             ggml_format_name(cur, "GALAXY_AG_ATT_%d", il);
         }
 
@@ -159,12 +163,14 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
 
         if (galaxy_sp_layer) {
             cur = ggml_dup(ctx0, cur);
+            ggml_galaxy::mark_transition(cur, ggml_galaxy::sp_transition::reduce_scatter);
             ggml_format_name(cur, "GALAXY_RS_FFN_%d", il);
         }
         cur = ggml_add(ctx0, cur, ffn_inp);
         if (galaxy_sp_layer) {
             // Restore TP_MIRRORED layout for the next layer's attention.
             cur = ggml_dup(ctx0, cur);
+            ggml_galaxy::mark_transition(cur, ggml_galaxy::sp_transition::all_gather);
             ggml_format_name(cur, "GALAXY_AG_FFN_%d", il);
         }
 

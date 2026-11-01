@@ -1,6 +1,7 @@
 #include "../../ggml/src/ggml-backend-galaxy-collectives.h"
 
 #include "ggml-alloc.h"
+#include "ggml-backend-galaxy-markers.h"
 
 #if defined(GALAXY_COLLECTIVES_HAVE_RPC)
 #include "ggml-rpc.h"
@@ -25,6 +26,43 @@ static void expect_reject(const std::function<void()> & fn, const char * label) 
     bool caught = false;
     try { fn(); } catch (const std::invalid_argument &) { caught = true; }
     require_test(caught, std::string("expected rejection for ") + label);
+}
+
+static void verify_marker_identity_survives_callback_rename() {
+    const ggml_init_params params = {1024*1024, nullptr, true};
+    ggml_context * ctx = ggml_init(params);
+    require_test(ctx != nullptr, "could not initialize marker test context");
+    ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 2);
+    // Names alone are not evidence of a layout transition.
+    ggml_tensor * plain = ggml_dup(ctx, src);
+    ggml_set_name(plain, "GALAXY_AG_FFN_0");
+    require_test(ggml_galaxy::get_transition(plain) == ggml_galaxy::sp_transition::none,
+                 "ordinary DUP must not become an AllGather based on its name");
+
+    ggml_tensor * allgather = ggml_dup(ctx, src);
+    ggml_galaxy::mark_transition(allgather, ggml_galaxy::sp_transition::all_gather);
+    ggml_format_name(allgather, "GALAXY_AG_FFN_%d", 0);
+    ggml_format_name(allgather, "l_out-%d", 0); // matches graph_get_cb()
+    require_test(ggml_galaxy::get_transition(allgather) == ggml_galaxy::sp_transition::all_gather,
+                 "renaming the layer output must not erase an AllGather marker");
+
+    ggml_tensor * rs = ggml_dup(ctx, src);
+    ggml_galaxy::mark_transition(rs, ggml_galaxy::sp_transition::reduce_scatter);
+    ggml_set_name(rs, "renamed-rs");
+    require_test(ggml_galaxy::get_transition(rs) == ggml_galaxy::sp_transition::reduce_scatter,
+                 "renaming must preserve ReduceScatter");
+
+    ggml_tensor * scatter = ggml_dup(ctx, src);
+    ggml_galaxy::mark_transition(scatter, ggml_galaxy::sp_transition::scatter_mirrored);
+    ggml_set_name(scatter, "renamed-residual");
+    require_test(ggml_galaxy::get_transition(scatter) == ggml_galaxy::sp_transition::scatter_mirrored,
+                 "renaming must preserve Residual Scatter");
+
+    expect_reject([&] {
+        ggml_galaxy::mark_transition(src, ggml_galaxy::sp_transition::all_gather);
+    }, "cannot tag a non-DUP tensor");
+    ggml_free(ctx);
+    std::cout << "GALAXY_SP_MARKER_SELFTEST PASS\n";
 }
 
 static std::vector<uint8_t> pack(ggml_type type, const std::vector<float> & data) {
@@ -150,6 +188,7 @@ int main(int argc, char ** argv) {
             else if (flag == "--pc" && i+1 < argc) pc_name = argv[++i];
             else throw std::invalid_argument("usage: galaxy-collectives-selftest [--pc CUDA0] [--rpc IP:50052]");
         }
+        verify_marker_identity_survives_callback_rename();
         ggml_backend_load_all();
         ggml_backend_t pc = pc_name.empty()
                 ? ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr)
