@@ -14,6 +14,7 @@ param(
     [string]$OutputDir = ".\galaxy-sp-results",
     [switch]$PureTP,
     [switch]$Trace,
+    [switch]$DumpLogits,
     [int]$TimeoutSec = 0,
     [int]$NPredict = 1,
     [int]$Ctx = 256,
@@ -31,7 +32,7 @@ if ($Ctx -le 0 -or $Batch -le 0 -or $UBatch -le 0 -or $Threads -le 0 -or $NPredi
     throw "Context, batch, ubatch, threads and predict must be positive"
 }
 
-$keys = @("LLAMA_GALAXY_TP", "LLAMA_GALAXY_TP_HEADS", "LLAMA_GALAXY_TP_FFN", "LLAMA_GALAXY_SP", "LLAMA_GALAXY_SP_TRACE")
+$keys = @("LLAMA_GALAXY_TP", "LLAMA_GALAXY_TP_HEADS", "LLAMA_GALAXY_TP_FFN", "LLAMA_GALAXY_SP", "LLAMA_GALAXY_SP_TRACE", "LLAMA_GALAXY_FIRST_LOGITS_PATH")
 $old = @{}
 foreach ($key in $keys) { $old[$key] = [Environment]::GetEnvironmentVariable($key, "Process") }
 
@@ -47,6 +48,8 @@ try {
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     $stdout = Join-Path $dir "stdout.log"
     $stderr = Join-Path $dir "stderr.log"
+    $dumpPath = Join-Path (Resolve-Path -LiteralPath $dir).Path "first_logits.f32"
+    $env:LLAMA_GALAXY_FIRST_LOGITS_PATH = if ($DumpLogits) { $dumpPath } else { $null }
 
     $modelArg = '"' + (Resolve-Path -LiteralPath $Model).Path + '"'
     $promptArg = '"' + (Resolve-Path -LiteralPath $PromptFile).Path + '"'
@@ -84,6 +87,10 @@ try {
     foreach ($hit in $displayHits) { Write-Host $hit.Line.Trim() }
 
     if ($proc.ExitCode -ne 0) { throw "Smoke run failed; examine $stderr and $stdout" }
+    if ($DumpLogits -and ((-not (Test-Path -LiteralPath $dumpPath)) -or
+            (Get-Item -LiteralPath $dumpPath).Length -le 8)) {
+        throw "Missing or incomplete first-token full logits: $dumpPath"
+    }
     if (-not $PureTP -and -not ($hits | Where-Object { $_.Line -match 'GALAXY_SP_SUM' })) {
         throw "No GALAXY_SP_SUM found: verify multi-token prompt and Meta execution"
     }
