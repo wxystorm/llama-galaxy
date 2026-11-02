@@ -94,6 +94,16 @@ foreach ($mode in @("sp", "galaxy2")) {
     Get-Content -LiteralPath $logPath | ForEach-Object { Write-Host $_ }
     if ($outcome.ExitCode -ne 0) { $bad += $mode }
 }
+$witness = @{}
+foreach ($mode in @("sp", "galaxy2")) {
+    $f = Join-Path $results[$mode].dir "stderr.log"
+    $lines = @(Select-String -LiteralPath $f -Pattern '\[GALAXY_SP_SUM\]\s+reduced_scatter=(\d+)\s+residual_scatter=(\d+)\s+all_gather=(\d+)' -ErrorAction SilentlyContinue)
+    $witness[$mode] = @($lines | ForEach-Object { $_.Line.Trim() })
+    foreach ($line in $witness[$mode]) { Write-Host "[GALAXY_THREE_MODE] $mode $line" }
+}
+if (-not $witness["sp"] -or -not $witness["galaxy2"]) {
+    Write-Warning "Missing actual SP collective counts; numeric parity alone does not prove Galaxy2 execution"
+}
 $manifest = @{
     model = (Resolve-Path -LiteralPath $Model).Path
     prompt = (Resolve-Path -LiteralPath $PromptFile).Path
@@ -101,6 +111,12 @@ $manifest = @{
     rpc = $Rpc
     heads = $HeadSplit
     ffn = $FfnSplit
+    ctx = $Ctx
+    batch = $Batch
+    ubatch = $UBatch
+    threads = $Threads
+    n_predict = $NPredict
+    collective_witness = $witness
     galaxy2_sp_ffn_layers = $Galaxy2FfnSpLayers
     galaxy2_scope = if ($Galaxy2FfnSpLayers -eq "all") { "full" } else { "partial_hybrid" }
     profile_forced_sync = $Profile
