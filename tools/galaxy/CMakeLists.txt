@@ -8,3 +8,7 @@ target_compile_features(galaxy-collectives-selftest PRIVATE cxx_std_17)
 if (GGML_RPC)
     target_compile_definitions(galaxy-collectives-selftest PRIVATE GALAXY_COLLECTIVES_HAVE_RPC=1)
 endif()
+
+# Full-vocabulary numerical comparison: standalone C++17 executable.
+add_executable(galaxy-logits-compare galaxy-logits-compare.cpp)
+target_compile_features(galaxy-logits-compare PRIVATE cxx_std_17)
