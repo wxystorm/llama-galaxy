@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <utility>
 #include <fstream>
+#include <cstdlib>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -3744,6 +3745,27 @@ private:
 
                 const int32_t n_vocab =
                     llama_vocab_n_tokens(vocab);
+
+                // Opt-in correctness comparison of the COMPLETE first-token
+                // logit vector (not just the printed top-10). Host F32 binary:
+                // magic "GLG1", int32 vocab count, then n_vocab floats.
+                // A single-turn CLI run uses one completion and one file.
+                const char * logits_path = std::getenv("LLAMA_GALAXY_FIRST_LOGITS_PATH");
+                if (logits_path != nullptr && logits_path[0] != '\0') {
+                    std::ofstream dump(logits_path, std::ios::binary | std::ios::trunc);
+                    const int32_t count = n_vocab;
+                    if (dump.is_open()) {
+                        dump.write("GLG1", 4);
+                        dump.write(reinterpret_cast<const char *>(&count), sizeof(count));
+                        dump.write(reinterpret_cast<const char *>(logits),
+                                   size_t(n_vocab) * sizeof(float));
+                        dump.flush();
+                    }
+                    const bool ok = dump.is_open() && dump.good();
+                    fprintf(stderr, "[GALAXY_LOGITS_DUMP] status=%s vocab=%d bytes=%zu path=%s\n",
+                            ok ? "PASS" : "FAIL", n_vocab,
+                            size_t(n_vocab) * sizeof(float) + 8, logits_path);
+                }
 
                 std::vector<int32_t> ids(n_vocab);
                 std::iota(ids.begin(), ids.end(), 0);
