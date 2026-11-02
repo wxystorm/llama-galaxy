@@ -214,3 +214,25 @@ handling with the native Windows \`cmd.exe\`; expected output:
 \`GALAXY_PROCESS_SELFTEST PASS exit0=0 exit7=7 timeout=1\`.
 Run the test alone if debugging process handling. These changes are
 PowerShell-only and require no PC/Phone recompilation.
+
+### Correctness summary logging under -lv 3
+
+The common CLI maps `GGML_LOG_LEVEL_INFO` to internal TRACE verbosity 4,
+not 3. Previously `[GALAXY_SP_SUM]` was written as `GGML_LOG_INFO`, so
+a completed SP inference under the standard smoke runner (`-lv 3`) could
+miss the summary and cause a false script failure. The Meta Device now
+writes the short post-execution `[GALAXY_SP_SUM]` witness directly to stderr
+and flushes it without relying on a verbosity level. Detailed
+`[GALAXY_META_TRACE]` remains optional (`-Trace` uses `-lv 4`).
+
+The smoke script no longer blocks an otherwise successful numerical
+comparison when the witness is missing: it marks SP execution
+`UNVERIFIED` and continues. The paired comparison records
+`sp_collectives_confirmed` and the witness lines in its manifest.
+A numerical match with no witness is reported as
+`NUMERICAL_PASS sp_collectives=UNVERIFIED`, **not** as fully verified
+Galaxy mixed TP/SP execution.
+
+For runs completed with the older binary, compare already-exported
+`tp-*/first_logits.f32` and `sp-*/first_logits.f32` directly with
+`galaxy-logits-compare` without reloading the model.

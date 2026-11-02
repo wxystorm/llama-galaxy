@@ -95,6 +95,12 @@ Get-Content -LiteralPath $stdout | ForEach-Object { Write-Host $_ }
 if ((Get-Item -LiteralPath $stderr).Length -gt 0) {
     Get-Content -LiteralPath $stderr | ForEach-Object { Write-Host $_ }
 }
+# Check evidence of actual completed ReduceScatter calls, not just the
+# chosen environment flag. A valid full-logits comparison can be computed
+# without this evidence, but we must not call it confirmed TP/SP parity.
+$spWitnessMatches = @(Select-String -LiteralPath (Join-Path $spDir.FullName "stderr.log"), (Join-Path $spDir.FullName "stdout.log") `
+    -Pattern '\[GALAXY_SP_SUM\]\s+reduced_scatter=[1-9][0-9]*' -ErrorAction SilentlyContinue)
+$spCollectivesConfirmed = $spWitnessMatches.Count -gt 0
 $manifest = @{
     model = (Resolve-Path -LiteralPath $Model).Path
     prompt = (Resolve-Path -LiteralPath $PromptFile).Path
@@ -107,6 +113,8 @@ $manifest = @{
     sp_dir = $spDir.FullName
     logits_summary = $json
     comparator_exit_code = $compareExitCode
+    sp_collectives_confirmed = $spCollectivesConfirmed
+    sp_witness_lines = @($spWitnessMatches | ForEach-Object { $_.Line.Trim() })
     max_abs_threshold = $MaxAbs
     rmse_threshold = $MaxRmse
     note = "FP32 first-token logits comparison; not a speed benchmark"
@@ -115,4 +123,9 @@ $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $root 
 if ($compareExitCode -ne 0) {
     throw "Galaxy TP/SP numerical parity failed: $root (exit=$compareExitCode)"
 }
-Write-Host "[GALAXY_PARITY] PASS summary=$json"
+if (-not $spCollectivesConfirmed) {
+    Write-Warning "Full-vocabulary numerical comparison passed, but there is no runtime SP collective evidence. Marking execution UNVERIFIED."
+    Write-Host "[GALAXY_PARITY] NUMERICAL_PASS sp_collectives=UNVERIFIED summary=$json"
+} else {
+    Write-Host "[GALAXY_PARITY] PASS numeric=PASS sp_collectives=CONFIRMED summary=$json"
+}

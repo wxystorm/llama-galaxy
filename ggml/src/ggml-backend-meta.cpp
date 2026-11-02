@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -2734,8 +2735,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 backend_ctx->n_subgraphs, int(has_galaxy_markers));
     }
     if (has_galaxy_markers) {
-        GGML_LOG_INFO("[GALAXY_SP_SUM] reduced_scatter=%zu residual_scatter=%zu all_gather=%zu phase=PREFILL\n",
+        // A required correctness witness, not a verbose debug message.
+        // The common CLI logger maps GGML_LOG_INFO to verbosity 4 (TRACE),
+        // so it silently disappears under the normal -lv 3 smoke runner.
+        // Emit exactly once per executed multi-token Meta graph, regardless
+        // of the user's verbosity filter; the counts are POST-execution.
+        std::fprintf(stderr,
+                "[GALAXY_SP_SUM] reduced_scatter=%zu residual_scatter=%zu all_gather=%zu phase=PREFILL\n",
                 galaxy_rs_count, galaxy_scatter_count, galaxy_ag_count);
+        std::fflush(stderr);
     }
     return GGML_STATUS_SUCCESS;
 }
