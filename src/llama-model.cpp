@@ -345,7 +345,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     if (galaxy.active && ud->model->arch != LLM_ARCH_QWEN3 && ud->model->arch != LLM_ARCH_LLAMA) {
         throw std::invalid_argument("Galaxy TP phase 1 supports dense Qwen3 and Llama only");
     }
-    if (llama_galaxy_tp::sp_enabled() && ud->model->arch != LLM_ARCH_QWEN3) {
+    if ((llama_galaxy_tp::sp_enabled() || llama_galaxy_tp::galaxy2_enabled()) && ud->model->arch != LLM_ARCH_QWEN3) {
         throw std::invalid_argument("Galaxy SP graph transitions currently support Qwen3 only");
     }
     //GGML_LOG_INFO("已经调用 llama_meta_device_get_split_state, tensor_name: %s\n", tensor_name.c_str());
@@ -679,6 +679,16 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             std::regex_match(tensor_name, pattern_ffn_up_gate_bias) ||
             std::regex_match(tensor_name, pattern_ffn_gate_up_weight) ||
             std::regex_match(tensor_name, pattern_ffn_down_weight));
+    if (galaxy_ffn && llama_galaxy_tp::galaxy2_ffn_is_sp(tc.il, hparams.n_layer())) {
+        // Full FFN weights are required on *both* ranks when the activation
+        // is split across tokens. Splitting FFN features here would silently
+        // produce a partial local output rather than the complete FFN result.
+        // This is intentionally handled as a weight placement decision, not
+        // as an extra AllReduce after FFN.
+        GGML_LOG_INFO("[GALAXY2_MIRROR_FFN] layer=%u weight=%s bytes_per_rank=%zu\n",
+                tc.il, tensor_name.c_str(), ggml_nbytes(tensor));
+        return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+    }
     // The two source-defined partitions have independent fixed counts.
     const std::vector<int64_t> * galaxy_counts =
             galaxy_attention ? &galaxy.heads : (galaxy_ffn ? &galaxy.ffn : nullptr);
