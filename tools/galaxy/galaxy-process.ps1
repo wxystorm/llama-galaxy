@@ -35,6 +35,7 @@ function Invoke-GalaxyProcess {
     $proc.StartInfo = $info
     $outFile = $null
     $errFile = $null
+    $started = $false
 
     try {
         $outFile = [System.IO.File]::Create($StdoutPath)
@@ -43,6 +44,7 @@ function Invoke-GalaxyProcess {
         if (-not $proc.Start()) {
             throw "Could not start executable: $Executable"
         }
+        $started = $true
 
         # Begin both drains before waiting: a full stderr pipe must not block
         # the child while the parent waits for its exit.
@@ -76,7 +78,7 @@ function Invoke-GalaxyProcess {
         }
     }
     finally {
-        if ($proc -and -not $proc.HasExited) {
+        if ($started -and -not $proc.HasExited) {
             try { $proc.Kill() } catch {}
         }
         if ($outFile) { $outFile.Dispose() }
