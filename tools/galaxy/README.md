@@ -236,3 +236,125 @@ Galaxy mixed TP/SP execution.
 For runs completed with the older binary, compare already-exported
 `tp-*/first_logits.f32` and `sp-*/first_logits.f32` directly with
 `galaxy-logits-compare` without reloading the model.
+
+
+## Phase 2: Galaxy2 full-weight SP FFN + opt-in performance profiling
+
+### What is actually implemented
+
+Galaxy2 keeps the ATTENTION projection in the original fixed head-parallel
+TP layout. After Attention ReduceScatter, both ranks operate on different
+token intervals. For each Galaxy2-enabled FFN layer, the full gate/up/down
+weight matrices are MIRRORED on PC and Phone:
+
+    Attention TP_PARTIAL
+        -> RS
+        -> residual/norm in SP_SEQ
+        -> FFN in SP_SEQ (each rank has complete gate/up/down weights)
+        -> residual add on local sequence
+        -> AG
+        -> next Attention TP
+
+The FFN-side AG and RS are removed ONLY for selected layers; the
+connection output still requires the final AG before the next TP Attention.
+The last Qwen3 layer stays pure TP because of output-token selection;
+single-token decode stays pure TP even when its FFN weights are mirrored.
+Unselected layers retain the original mixed Galaxy FFN TP path.
+
+Activation is explicit on the PC:
+- LLAMA_GALAXY_TP=1
+- LLAMA_GALAXY_SP=1
+- LLAMA_GALAXY2=1
+- LLAMA_GALAXY2_FFN_SP_LAYERS=all (the complete Galaxy2 implementation),
+  or N (the first N non-final layers, as an experimental memory-capped
+  Galaxy+Galaxy2 hybrid).
+
+**IMPORTANT memory constraint:** Galaxy2 full-FFN replication is not just
+a graph substitution. For Qwen3-14B with hidden=5120 and FFN=17408,
+three FFN weight matrices across the 39 eligible layers contain approximately
+10.4 billion parameters (before quantization). In Q4_K_M this means
+several additional GiB of weights on EACH rank relative to split-FFN TP.
+Full Galaxy2 is therefore unlikely to fit a 6 GiB RTX 4050 or the
+phone's available memory at the same time as attention and KV tensors.
+Actual memory depends on GGUF quantization and backend allocations.
+The code does NOT stream these replicated FFN weights; do not interpret
+the "all" mode as an offload/streaming solution.
+
+Use N=1 for first integration testing on 14B; this is a PARTIAL hybrid,
+not the paper's full Galaxy2. Use a smaller GGUF that fits both rank
+memories to exercise "all" end-to-end. Trying "all" with insufficient
+memory may fail model initialization.
+
+### Profiling CSV (PC)
+
+PC profiling is opt-in via LLAMA_GALAXY_PROFILE_DIR. The smoke runner's
+-Profile switch sets that directory to its per-run subfolder.
+Three separate files are generated:
+
+- profile/compute_timeline.csv: graph, subgraph, rank=0/1, backend,
+  last tensor, node count, dispatch_ms, sync_wait_ms, observed_ms.
+- profile/communication_timeline.csv: graph, collective kind (RS, AG,
+  RESIDUAL_SCATTER, ALLREDUCE), tensor, token count, read/write bytes,
+  read_ms, host_reduce_ms, write_ms, sync_wait_ms, wall_ms.
+- profile/summary.csv: graph, mode (TP, GALAXY, GALAXY2_PARTIAL or
+  GALAXY2_FULL), subgraph count, collective counts, graph_wall_ms.
+
+IMPORTANT: For per-rank actual elapsed observations, -Profile dispatches
+both ranks and then synchronizes them at each subgraph; this is invasive.
+The resulting Prefill tok/s and the CSV service times are not the same as
+normal asynchronous inference. Communication get/set timings for Phone
+include RPC/network time; they cannot uniquely isolate phone compute.
+ALLREDUCE wall_ms also includes a forced completion fence, and its internal
+network-byte breakdown is not separately observed here (0 bytes recorded
+in the fields when not measured). Stage times can overlap, so do not sum
+them to infer graph wall time.
+
+### Phone native graph timing (optional; requires new phone build)
+
+The RPC server can independently record its real native graph timings.
+In Termux on the Phone, rebuild ggml-rpc-server from the updated branch,
+then set LLAMA_GALAXY_PHONE_PROFILE_FILE to an absolute writable path
+before launching the server. For example:
+
+    export LLAMA_GALAXY_PHONE_PROFILE_FILE="$HOME/galaxy-phone-profile.csv"
+    ./build-galaxy/bin/ggml-rpc-server -H 0.0.0.0 -p 50052 -m "$HOME/models/Qwen3-14B-Q4_K_M.gguf" -t 8
+
+The file records GRAPH_COMPUTE (graph preparation + native compute) and
+GRAPH_RECOMPUTE (native compute, reused graph) separately, keyed by RPC
+graph UID. PC and Phone timestamps are NOT automatically time-synchronized.
+
+### Three-mode experiment (Windows PC)
+
+Compile the updated inference and comparison tools:
+
+    git pull --ff-only origin feat/galaxy-baseline
+    cmake --build build-galaxy --config Release --target llama-cli galaxy-tp-selftest galaxy-collectives-selftest galaxy-logits-compare -j 8
+    .\build-galaxy\bin\Release\galaxy-tp-selftest.exe
+    .\build-galaxy\bin\Release\galaxy-collectives-selftest.exe
+
+The following command runs exactly one TP, one Galaxy and one
+layer-capped Galaxy2 pass on the same prompt, and compares the complete
+first-token logits against pure TP, saving two comparison JSONs:
+
+    .\tools\galaxy\run_galaxy_three_modes.ps1 -Model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" -Rpc "10.39.52.114:50052" -PromptFile "D:\prima.cpp\prompts\prompt_64.txt" -Galaxy2FfnSpLayers 1 -TimeoutSec 300
+
+Output directory: galaxy-sp-results/three-YYYYMMDD-HHMMSS, including
+tp-*, sp-* and galaxy2-* folders, each with first_logits.f32,
+stdout.log, stderr.log and a profile/ subfolder. The comparisons are
+compare-sp.json and compare-galaxy2.json; manifest.json records
+layer-capped versus full Galaxy2.
+
+Normal (not instrumented) performance runs should use
+run_galaxy_sp_smoke.ps1 with -PureTP, no mode flag, or -Galaxy2
+respectively, without -Profile. Do not interpret a 1-token generation
+speed as a decode throughput measurement.
+
+For the 40-layer Qwen3-14B, a single full multi-token graph with
+39 eligible intermediate SP layers would perform:
+- Pure Galaxy: RS=78, residual scatter=39, AG=78.
+- Galaxy2 with N=1 selected: RS=77, residual scatter=39, AG=77.
+- Full Galaxy2 with N=39: RS=39, residual scatter=39, AG=39.
+
+Verify these numbers from [GALAXY_SP_SUM]; a model with fewer layers or
+additional microbatches will have different counts. Do not claim SP/Galaxy2
+correctness before full-logit parity and the actual collective witness pass.
