@@ -40,15 +40,10 @@ inline bool galaxy2_enabled() {
     return value != nullptr && std::string(value) == "1";
 }
 
-inline int64_t galaxy2_ffn_sp_count(int64_t n_layers) {
-    if (!galaxy2_enabled()) {
-        return 0;
-    }
-    if (n_layers < 1) {
+inline int64_t galaxy2_parse_ffn_layers(const char * raw, int64_t eligible) {
+    if (eligible < 0) {
         throw std::invalid_argument("Galaxy2 requires a positive layer count");
     }
-    const int64_t eligible = n_layers - 1;
-    const char * raw = std::getenv("LLAMA_GALAXY2_FFN_SP_LAYERS");
     if (raw == nullptr || std::string(raw) == "all") {
         return eligible;
     }
@@ -70,6 +65,16 @@ inline int64_t galaxy2_ffn_sp_count(int64_t n_layers) {
         throw std::invalid_argument("Galaxy2 SP FFN count exceeds eligible non-final layers");
     }
     return value;
+}
+
+inline int64_t galaxy2_ffn_sp_count(int64_t n_layers) {
+    if (!galaxy2_enabled()) {
+        return 0;
+    }
+    if (n_layers < 1) {
+        throw std::invalid_argument("Galaxy2 requires a positive layer count");
+    }
+    return galaxy2_parse_ffn_layers(std::getenv("LLAMA_GALAXY2_FFN_SP_LAYERS"), n_layers - 1);
 }
 
 inline bool galaxy2_ffn_is_sp(int64_t il, int64_t n_layers) {
