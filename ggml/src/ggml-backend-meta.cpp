@@ -2693,17 +2693,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         i, int(transition), original_last->name, counts[0], counts[1]);
             }
             try {
+                const size_t tile_tokens = ggml_galaxy_collectives::configured_tile_tokens();
                 switch (transition) {
                     case galaxy_sp_transition::reduce_scatter:
-                        ggml_galaxy_collectives::reduce_scatter(devs, in, out, counts);
+                        ggml_galaxy_collectives::reduce_scatter(devs, in, out, counts, tile_tokens);
                         galaxy_rs_count++;
                         break;
                     case galaxy_sp_transition::scatter_mirrored:
-                        ggml_galaxy_collectives::scatter_mirrored(devs, in, out, counts);
+                        ggml_galaxy_collectives::scatter_mirrored(devs, in, out, counts, tile_tokens);
                         galaxy_scatter_count++;
                         break;
                     case galaxy_sp_transition::all_gather:
-                        ggml_galaxy_collectives::all_gather(devs, in, out, counts);
+                        ggml_galaxy_collectives::all_gather(devs, in, out, counts, tile_tokens);
                         galaxy_ag_count++;
                         break;
                     case galaxy_sp_transition::none:
@@ -2871,8 +2872,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         // Emit exactly once per executed multi-token Meta graph, regardless
         // of the user's verbosity filter; the counts are POST-execution.
         std::fprintf(stderr,
-                "[GALAXY_SP_SUM] reduced_scatter=%zu residual_scatter=%zu all_gather=%zu phase=PREFILL\n",
-                galaxy_rs_count, galaxy_scatter_count, galaxy_ag_count);
+                "[GALAXY_SP_SUM] reduced_scatter=%zu residual_scatter=%zu all_gather=%zu phase=PREFILL tile_tokens=%zu\n",
+                galaxy_rs_count, galaxy_scatter_count, galaxy_ag_count,
+                ggml_galaxy_collectives::configured_tile_tokens());
         std::fflush(stderr);
     }
     return GGML_STATUS_SUCCESS;
