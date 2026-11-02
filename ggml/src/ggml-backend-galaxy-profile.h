@@ -78,16 +78,20 @@ inline void communication(
         const char * kind, const char * tensor, int64_t tokens,
         uint64_t read_bytes, uint64_t write_bytes,
         double read_ms, double reduce_ms, double write_ms,
-        double sync_ms, double wall_ms) {
+        double sync_ms, double wall_ms,
+        uint64_t read_calls = 0, uint64_t write_calls = 0,
+        uint64_t sync_calls = 0, size_t tile_tokens = 0) {
     if (!enabled()) return;
     std::ostringstream row;
     row << std::fixed << std::setprecision(5)
         << current_graph() << ',' << quote(kind) << ',' << quote(tensor) << ','
         << tokens << ',' << read_bytes << ',' << write_bytes << ','
         << read_ms << ',' << reduce_ms << ',' << write_ms << ','
-        << sync_ms << ',' << wall_ms;
+        << sync_ms << ',' << wall_ms << ','
+        << read_calls << ',' << write_calls << ','
+        << sync_calls << ',' << tile_tokens;
     append("communication_timeline.csv",
-            "graph,kind,tensor,tokens,read_bytes,write_bytes,read_ms,host_reduce_ms,write_ms,sync_wait_ms,wall_ms",
+            "graph,kind,tensor,tokens,read_bytes,write_bytes,read_ms,host_reduce_ms,write_ms,sync_wait_ms,wall_ms,read_calls,write_calls,sync_calls,tile_tokens",
             row.str());
 }
 
