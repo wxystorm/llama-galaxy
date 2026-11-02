@@ -65,6 +65,11 @@ try {
         if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
             try { $proc.Kill() } catch {}
             $proc.WaitForExit()
+            Write-Host "[GALAXY_SP_SMOKE] TIMEOUT mode=$mode logs=$dir"
+            @(Select-String -Path $stderr, $stdout `
+                -Pattern "GALAXY_META_TRACE","GALAXY_SP_SUM","GALAXY_SP_LAYOUT_FAIL","GALAXY_SP]","RPC_GRAPH" `
+                -ErrorAction SilentlyContinue | Select-Object -Last 30) |
+                ForEach-Object { Write-Host $_.Line.Trim() }
             throw "Galaxy $mode run timed out after $TimeoutSec seconds; logs=$dir"
         }
     } else {
