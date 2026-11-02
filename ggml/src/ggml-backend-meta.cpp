@@ -2838,7 +2838,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             ggml_backend_synchronize(backend_ctx->backend_configs[0].backend);
             std::vector<uint8_t> raw(ggml_nbytes(source));
             ggml_backend_tensor_get(source, raw.data(), 0, raw.size());
-            std::vector<float> values(size_t(elements));
+            std::vector<float> values(static_cast<size_t>(elements));
             if (source->type == GGML_TYPE_F32) {
                 std::memcpy(values.data(), raw.data(), raw.size());
             } else {
