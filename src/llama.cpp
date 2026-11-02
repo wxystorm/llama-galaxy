@@ -124,6 +124,11 @@ int64_t llama_time_us(void) {
 
 // returns true on success
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
+    if (llama_galaxy_tp::galaxy2_enabled() &&
+            (!llama_galaxy_tp::sp_enabled() || !llama_galaxy_tp::enabled())) {
+        LLAMA_LOG_ERROR("[GALAXY2] requires LLAMA_GALAXY_TP=1 and LLAMA_GALAXY_SP=1\n");
+        return false;
+    }
     if (llama_galaxy_tp::sp_enabled() && !llama_galaxy_tp::enabled()) {
         LLAMA_LOG_ERROR("[GALAXY_SP] requires LLAMA_GALAXY_TP=1; cannot use SP without tensor-parallel weights\n");
         return false;
