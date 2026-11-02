@@ -81,6 +81,34 @@ inline bool galaxy2_ffn_is_sp(int64_t il, int64_t n_layers) {
     return il >= 0 && il < galaxy2_ffn_sp_count(n_layers);
 }
 
+// Opt-in diagnostic only. Comma-delimited layer indices or 'all'.
+// Selected layer outputs are pinned with GGML_TENSOR_FLAG_OUTPUT so that
+// the Meta backend can copy them after graph execution.
+inline bool dump_layer_enabled(int64_t il) {
+    const char * value = std::getenv("LLAMA_GALAXY_LAYER_DUMP");
+    if (value == nullptr || *value == '\0' || il < 0) {
+        return false;
+    }
+    const std::string spec(value);
+    if (spec == "all") {
+        return true;
+    }
+    const std::string needle = std::to_string(il);
+    size_t start = 0;
+    while (start < spec.size()) {
+        const size_t end = spec.find(',', start);
+        const size_t len = end == std::string::npos ? spec.size()-start : end-start;
+        if (spec.substr(start, len) == needle) {
+            return true;
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end+1;
+    }
+    return false;
+}
+
 inline std::vector<int64_t> parse_counts(const char * text, const char * key, size_t n_devices) {
     if (text == nullptr || text[0] == '\0') {
         throw std::invalid_argument(std::string(key) + " is required in Galaxy TP mode");
