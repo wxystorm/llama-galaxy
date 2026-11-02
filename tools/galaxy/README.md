@@ -374,3 +374,98 @@ For the 40-layer Qwen3-14B, a single full multi-token graph with
 Verify these numbers from [GALAXY_SP_SUM]; a model with fewer layers or
 additional microbatches will have different counts. Do not claim SP/Galaxy2
 correctness before full-logit parity and the actual collective witness pass.
+
+
+## Phase 3: Host Staging RPC call reduction (A/B)
+
+This phase intentionally does **not** gate performance development on
+the existing TP-versus-SP full-vocabulary logit deviation. The prior
+72-token experiment completed all modes and confirmed the expected
+collective counts, but strict numerical parity remains an unresolved,
+documented limitation. Do NOT describe it as fully equivalent TP/SP.
+
+### How the communication optimization works
+
+Previously each ReduceScatter, AllGather or Residual Scatter split a
+device's local token interval into 32-token tiles. For a 72-token
+prompt, the rank split is approximately 36+36 tokens, so *each* rank
+required two tiles even though the second tile held only four tokens.
+For longer prompts, the number of small RPC get/set calls grows rapidly.
+
+The new environment variable
+\`LLAMA_GALAXY_COLLECTIVE_TILE_TOKENS\` supports integers 1..1024:
+- unset or 32: original correctness/performance baseline
+- 256: experiment with fewer, larger RPC requests
+- 512 or 1024: larger allocations; test only after 256 is stable
+
+A fixed amount of Host buffer memory is reserved once per collective,
+and reused across the tiles. For ReduceScatter this is three buffers
+(partial rank 0, partial rank 1, reduced result). AllGather and Residual
+Scatter each use one. All operations preserve exactly the same token
+interval ordering, FP16/F32 addition order, and completion fences.
+The corresponding phone RPC server protocol does not change.
+
+For the 72-token / [36,36] case, the expected per-collective backend
+tensor_get/set call counts are:
+
+| Kind | tile=32 reads | tile=32 writes | tile=256 reads | tile=256 writes |
+|------|---------------|----------------|----------------|-----------------|
+| RS | 8 | 4 | 4 | 2 |
+| AG | 4 | 8 | 2 | 4 |
+| Residual Scatter | 4 | 4 | 2 | 2 |
+
+These are *calls into ggml's backend tensor_get/set API*, not
+necessarily distinct network packets. RPC requests on the Phone do
+normally correspond to one network command per call; local CUDA
+tensor reads/writes are counted as well. The number of bytes and the
+arithmetic remain identical. Actual speed benefits require measurement.
+
+The communication_timeline.csv profiler now includes:
+\`read_calls,write_calls,sync_calls,tile_tokens\`, appended after
+\`wall_ms\`. Existing numeric columns retain their meaning; old CSV
+files have the old header and should not be combined without checking
+their schema.
+
+### Reproducible experiments
+
+Update the PC (no phone rebuild needed for tile optimization):
+
+    git pull --ff-only origin feat/galaxy-baseline
+    cmake --build build-galaxy --config Release --target llama-cli galaxy-collectives-selftest galaxy-logits-compare -j 8
+    .\build-galaxy\bin\Release\galaxy-collectives-selftest.exe
+
+For the strongest direct PC/Phone primitive check, use:
+
+    .\build-galaxy\bin\Release\galaxy-collectives-selftest.exe --pc CUDA0 --rpc 10.39.52.114:50052
+
+Compare baseline tile=32 and optimized tile=256 with the SAME Galaxy
+and one-layer Galaxy2 modes. Profiling is OFF by default so the
+Prefill times exclude forced per-subgraph synchronization:
+
+    .\tools\galaxy\run_galaxy_collective_tile_sweep.ps1 -Model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" -PromptFile "D:\prima.cpp\prompts\prompt_64.txt" -Rpc "10.39.52.114:50052" -Galaxy2FfnSpLayers 1 -TimeoutSec 300
+
+The four runs produce:
+- \`galaxy-sp-results/tile-sweep-*/timing.csv\` (Prefill latency and tps)
+- \`tile-parity-sp.json\` and \`tile-parity-galaxy2.json\` comparing
+  *within the same execution mode* (tile=32 against tile=256)
+- \`manifest.json\` with prompt SHA-256, tile parameters, profile flag
+- all four run folders, individual logs and first-token logits.
+
+The tile A/B comparator still requires stable numerical output within
+the same execution mode; this is a stronger requirement than accepting
+the already observed SP-vs-TP deviations. A failed A/B comparator marks
+the optimization as unsafe until investigated.
+
+To inspect RPC call counts instead of unbiased latency, repeat with
+\`-Profile\`. The CSVs then appear in each run's \`profile\` subfolder.
+Profile mode is intentionally intrusive: do not use its tok/s to claim
+end-to-end inference speedups.
+
+Alternatively, select a tile for a single existing smoke or three-mode
+run using \`-CollectiveTileTokens 256\`. The SP summary line now
+includes \`tile_tokens=256\` as an execution witness.
+
+The Galaxy2-FFN layer cap remains independent of the tile size; keep
+\`Galaxy2FfnSpLayers=1\` on Qwen3-14B first. Full Galaxy2 is still
+memory-limited and should be tested with a model small enough for
+replicated FFN weights on both devices.
