@@ -10,7 +10,7 @@ try {
     $okLog = Join-Path $dir "ok.stdout"
     $ok = Invoke-GalaxyProcess -Executable $cmdExe -ArgumentList @("/d", "/c", "echo GALAXY_RUNNER_OK") -StdoutPath $okLog -StderrPath (Join-Path $dir "ok.stderr") -TimeoutSec 10
     if ($ok.TimedOut -or $ok.ExitCode -ne 0 -or
-            -not (Select-String -Path $okLog -SimpleMatch "GALAXY_RUNNER_OK" -Quiet)) {
+            -not (Select-String -Path $okLog -SimpleMatch -Pattern "GALAXY_RUNNER_OK" -Quiet)) {
         throw "Runner did not capture exit code 0 and stdout"
     }
 
