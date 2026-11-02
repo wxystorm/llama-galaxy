@@ -181,6 +181,14 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
+        // Diagnostic snapshots require the allocator to keep this tensor
+        // alive after the graph completes. Without this flag, l_out storage
+        // can be reused long before the Meta backend attempts a snapshot.
+        if (galaxy_sp || llama_galaxy_tp::enabled()) {
+            if (llama_galaxy_tp::dump_layer_enabled(il) && n_tokens > 1) {
+                ggml_set_output(cur);
+            }
+        }
 
         // input for next layer
         inpL = cur;
