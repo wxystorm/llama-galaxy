@@ -118,8 +118,8 @@ become a collective.
 
 PC-only tracing is now opt-in. It logs GRAPH_BEGIN, SUBGRAPH_BEGIN,
 DISPATCH_BEGIN/RETURN for each rank, COLLECTIVE_BEGIN/END,
-ALLREDUCE_BEGIN/END and GRAPH_END. Note: RPC DISPATCH_RETURN means that the
-RPC compute command was queued, not that phone computation has completed.
+ALLREDUCE_BEGIN/END and GRAPH_END. Note: In this fork RPC DISPATCH_RETURN follows the synchronous
+RPC response, so the phone graph has completed on the server.
 If the PC stops between COLLECTIVE_BEGIN and COLLECTIVE_END, the collective
 is waiting for a backend get/set; if it stops at ALLREDUCE_BEGIN, the
 Meta fallback reduction or its backend copy is waiting.
@@ -322,6 +322,18 @@ before launching the server. For example:
 The file records GRAPH_COMPUTE (graph preparation + native compute) and
 GRAPH_RECOMPUTE (native compute, reused graph) separately, keyed by RPC
 graph UID. PC and Phone timestamps are NOT automatically time-synchronized.
+
+IMPORTANT RPC timing detail: ggml_backend_rpc_graph_compute sends a
+GRAPH_COMPUTE RPC and waits for the server response, which the server
+returns only after native backend computation finishes. Thus on PC,
+rank=1 RPC dispatch_ms measures an RPC round trip INCLUDING phone
+computation and server graph work; it is NOT the cheap queuing cost.
+ggml_backend_rpc_synchronize is a no-op in this fork. The phone-side
+compute_ms in galaxy-phone-profile.csv is the separate native compute
+measurement. rank=0 CUDA observed_ms is a launch-to-post-RPC-fence
+completion WINDOW that includes potential overlap with the phone RPC,
+not a kernel-only CUDA time. Do not sum per-rank observed_ms to infer
+graph wall time.
 
 ### Three-mode experiment (Windows PC)
 
