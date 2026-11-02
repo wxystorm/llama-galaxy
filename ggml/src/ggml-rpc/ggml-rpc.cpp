@@ -17,8 +17,31 @@
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
+#include <chrono>
+#include <iomanip>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
+
+// Optional phone-side execution breakdown, enabled independently of PC
+// profiling. File lives on the RPC server device (e.g. Termux home).
+static void galaxy_phone_profile(
+        const char * mode, uint32_t device, uint64_t uid, uint32_t nodes,
+        double prepare_ms, double compute_ms) {
+    const char * path = std::getenv("LLAMA_GALAXY_PHONE_PROFILE_FILE");
+    if (path == nullptr || path[0] == '\0') return;
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    std::ofstream file(path, std::ios::app);
+    if (!file) return;
+    file.seekp(0, std::ios::end);
+    if (file.tellp() == 0) {
+        file << "mode,device,graph_uid,nodes,prepare_ms,compute_ms,wall_ms\n";
+    }
+    file << std::fixed << std::setprecision(5)
+         << mode << ',' << device << ',' << uid << ',' << nodes << ','
+         << prepare_ms << ',' << compute_ms << ','
+         << prepare_ms + compute_ms << '\n';
+}
 
 #define LOG_DBG(...) \
     do { if (RPC_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
@@ -1606,6 +1629,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
 }
 
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+    const auto request_start = std::chrono::steady_clock::now();
     // serialization format:
     // | device (4 bytes) | graph_uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
     if (input.size() < 2*sizeof(uint32_t) + sizeof(uint64_t)) {
@@ -1673,8 +1697,13 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             return false;
         }
     }   //恢复原来的计算图
+    const auto compute_start = std::chrono::steady_clock::now();
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+    const auto compute_end = std::chrono::steady_clock::now();
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    galaxy_phone_profile("GRAPH_COMPUTE", device, graph_uid, n_nodes,
+            std::chrono::duration<double, std::milli>(compute_start - request_start).count(),
+            std::chrono::duration<double, std::milli>(compute_end - compute_start).count());
     graph_entry.graph = graph;
     return true;
 }
@@ -1690,8 +1719,12 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     }
     ggml_cgraph * graph = it->second.graph;
     LOG_DBG("[%s] device: %u, graph_uid: %" PRIu64 "\n", __func__, device, request.graph_uid);
+    const auto start = std::chrono::steady_clock::now();
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+    const auto end = std::chrono::steady_clock::now();
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    galaxy_phone_profile("GRAPH_RECOMPUTE", device, request.graph_uid, graph->n_nodes, 0,
+            std::chrono::duration<double, std::milli>(end - start).count());
     return true;
 }
 
