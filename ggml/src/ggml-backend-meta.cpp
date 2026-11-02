@@ -18,6 +18,9 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <set>
@@ -2794,6 +2797,72 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 galaxy_rs_count, galaxy_scatter_count, galaxy_ag_count,
                 galaxy_ar_count,
                 ggml_galaxy_profile::ms(graph_start, ggml_galaxy_profile::clock::now()));
+    }
+    // Optional per-layer activation snapshots (selected output tensors only).
+    // Read rank 0 after the full Meta graph has finished: TP PARTIAL
+    // terminals have already gone through the normal AllReduce; SP
+    // l_out markers have already been materialized by AllGather.
+    // Identical GLG1/F32 framing to the existing logits comparator allows
+    // the same numerical tool to compare hidden-state vectors.
+    const char * dump_dir = std::getenv("LLAMA_GALAXY_LAYER_DUMP_DIR");
+    if (dump_dir != nullptr && dump_dir[0] != '\0') {
+        const std::filesystem::path folder(dump_dir);
+        std::error_code directory_error;
+        std::filesystem::create_directories(folder, directory_error);
+        for (int node_id = 0; node_id < cgraph->n_nodes; ++node_id) {
+            const ggml_tensor * node = cgraph->nodes[node_id];
+            if (node == nullptr ||
+                    std::strncmp(node->name, "l_out-", 6) != 0 ||
+                    (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 ||
+                    !ggml_backend_buffer_is_meta(node->buffer) ||
+                    (node->type != GGML_TYPE_F16 && node->type != GGML_TYPE_F32) ||
+                    !ggml_is_contiguous(node) || node->ne[1] <= 1) {
+                continue;
+            }
+            const auto state = ggml_backend_meta_get_split_state(node, false);
+            if (state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                    state.axis != GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+                GGML_LOG_ERROR("[GALAXY_LAYER_DUMP] name=%s unexpected_layout=%s\n",
+                        node->name, ggml_backend_meta_split_axis_name(state.axis));
+                continue;
+            }
+            const ggml_tensor * source = ggml_backend_meta_buffer_simple_tensor(node, 0);
+            const int64_t elements = ggml_nelements(node);
+            if (source == nullptr || source->buffer == nullptr ||
+                    source->ne[0] != node->ne[0] || source->ne[1] != node->ne[1] ||
+                    elements <= 0 || elements > std::numeric_limits<int32_t>::max() ||
+                    ggml_nbytes(source) != ggml_nbytes(node)) {
+                GGML_LOG_ERROR("[GALAXY_LAYER_DUMP] name=%s rank0_tensor_not_full\n", node->name);
+                continue;
+            }
+            ggml_backend_synchronize(backend_ctx->backend_configs[0].backend);
+            std::vector<uint8_t> raw(ggml_nbytes(source));
+            ggml_backend_tensor_get(source, raw.data(), 0, raw.size());
+            std::vector<float> values(size_t(elements));
+            if (source->type == GGML_TYPE_F32) {
+                std::memcpy(values.data(), raw.data(), raw.size());
+            } else {
+                for (int64_t e = 0; e < elements; ++e) {
+                    ggml_fp16_t half;
+                    std::memcpy(&half, raw.data() + size_t(e)*sizeof(ggml_fp16_t), sizeof(half));
+                    values[size_t(e)] = ggml_fp16_to_fp32(half);
+                }
+            }
+            const std::filesystem::path outpath = folder / (std::string(node->name) + ".f32");
+            std::ofstream out(outpath, std::ios::binary | std::ios::trunc);
+            if (!out) {
+                GGML_LOG_ERROR("[GALAXY_LAYER_DUMP] name=%s could_not_open_output\n", node->name);
+                continue;
+            }
+            const int32_t n_values = int32_t(elements);
+            out.write("GLG1", 4);
+            out.write(reinterpret_cast<const char *>(&n_values), sizeof(n_values));
+            out.write(reinterpret_cast<const char *>(values.data()), values.size()*sizeof(float));
+            out.flush();
+            std::fprintf(stderr, "[GALAXY_LAYER_DUMP] name=%s elements=%d tokens=%" PRId64 " status=%s\n",
+                    node->name, n_values, node->ne[1], out.good() ? "PASS" : "FAIL");
+        }
+        std::fflush(stderr);
     }
     if (has_galaxy_markers) {
         // A required correctness witness, not a verbose debug message.
