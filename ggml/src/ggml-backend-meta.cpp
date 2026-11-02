@@ -2625,10 +2625,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
         if (profiling) {
-            // Synchronize AFTER dispatching both ranks, so their compute
-            // can overlap. This adds explicit syncs and changes the runtime
-            // schedule; profile numbers must not be used as an unbiased
-            // inference speed benchmark.
+            // Synchronize AFTER dispatching both ranks. CUDA compute can
+            // overlap RPC processing, but RPC graph_compute itself blocks
+            // for server completion and RPC synchronize is a no-op. Thus
+            // rank-1 dispatch_ms includes the entire RPC round trip, and
+            // rank-0 observed_ms is a launch-to-fence window, NOT exclusive
+            // GPU kernel time. The extra CUDA fence changes the schedule.
             for (size_t j = 0; j < n_backends; ++j) {
                 auto & bcj = backend_ctx->backend_configs[j];
                 const ggml_cgraph * simple = bcj.cgraphs[i].cgraph_main;
