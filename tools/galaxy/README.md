@@ -469,3 +469,47 @@ The Galaxy2-FFN layer cap remains independent of the tile size; keep
 \`Galaxy2FfnSpLayers=1\` on Qwen3-14B first. Full Galaxy2 is still
 memory-limited and should be tested with a model small enough for
 replicated FFN weights on both devices.
+
+
+## Phase 4: optional fused ReduceScatter input reads
+
+A successful first A/B run showed Galaxy 16,493.36 -> 15,111.96 ms
+(1.091x) and Galaxy2 one-layer 16,687.60 -> 15,664.37 ms (1.065x)
+when changing the Host Staging tile from 32 to 256 tokens. Both runs
+preserved their mode's full first-token logits exactly (max_abs=0).
+These are single measurements and are not yet confidence intervals.
+
+The next opt-in optimization changes only ReduceScatter's source reads:
+\`LLAMA_GALAXY_RS_FUSED_READ=1\` makes the PC fetch the *entire* partial
+input once from CUDA and once from RPC, then reduce the same byte ranges
+into each rank's existing output shards. Tensor arithmetic, F16 rounding
+and destination writes remain in the original order. The old tiled
+ReduceScatter path is the default and can be restored by setting 0.
+
+Safety: a fused read is used only when EACH source is <=16 MiB.
+It holds two inputs (<=32 MiB combined) plus a bounded tile-sized
+output Host buffer. Larger inputs silently use the old tiled read
+path; whether fused was actually used is recorded as \`rs_fused_read\`
+in each communication_timeline.csv record. With a 72-token prompt
+split 36+36 and tile=256, expected ReduceScatter backend tensor_get
+calls drop from **4 to 2**, while output tensor_set calls remain 2.
+The byte volume is unchanged. \`[GALAXY_SP_SUM]\` now reports
+\`rs_fused_requested=1\`, which only indicates the requested mode;
+the CSV reports whether a particular RS qualified for fused reads.
+
+First verify \`galaxy-collectives-selftest\` (local and PC+Phone RPC).
+Its new F16/F32 byte-for-byte RS parity checks compare fused vs
+unfused reads on identical backend tensor buffers.
+
+To run a single mode (PC only needs a rebuild):
+
+    .\tools\galaxy\run_galaxy_sp_smoke.ps1 -Model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" -PromptFile "D:\prima.cpp\prompts\prompt_64.txt" -Rpc "10.39.52.114:50052" -CollectiveTileTokens 256 -RsFusedRead
+
+To record \`rs_fused_read\`, \`read_calls\`, \`write_calls\` and
+\`read_ms\` at the operation level, add \`-Profile\`. As before this
+introduces forced synchronization, so compare non-profile Prefill
+times separately. The phone server does not require protocol changes.
+
+Accept the previously documented TP-vs-SP numerical deviations for
+performance exploration, but require fused-vs-unfused *within-mode*
+numerical parity before reporting a fused-read speedup.

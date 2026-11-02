@@ -73,12 +73,13 @@ struct measure {
             write_calls++;
         }
     }
-    void finish(const char * kind, const ggml_tensor * tensor, int64_t tokens, size_t tile_tokens) const {
+    void finish(const char * kind, const ggml_tensor * tensor, int64_t tokens,
+                size_t tile_tokens, bool rs_fused_read = false) const {
         if (!on) return;
         ggml_galaxy_profile::communication(kind, tensor ? tensor->name : "", tokens,
                 read_bytes, write_bytes, read_ms, host_ms, write_ms,
                 sync_ms, ggml_galaxy_profile::ms(begin, ggml_galaxy_profile::clock::now()),
-                read_calls, write_calls, sync_calls, tile_tokens);
+                read_calls, write_calls, sync_calls, tile_tokens, rs_fused_read);
     }
 };
 
@@ -190,12 +191,37 @@ inline size_t configured_tile_tokens() {
     return parse_tile_tokens(std::getenv("LLAMA_GALAXY_COLLECTIVE_TILE_TOKENS"));
 }
 
+// Optional 2-read ReduceScatter strategy. Keep the original per-slice
+// tensor_get path as the default for A/B and memory-constrained runs.
+inline bool parse_rs_fused_read(const char * raw) {
+    if (raw == nullptr || raw[0] == '\0' || std::strcmp(raw, "0") == 0) return false;
+    if (std::strcmp(raw, "1") == 0) return true;
+    throw std::invalid_argument("LLAMA_GALAXY_RS_FUSED_READ must be 0 or 1");
+}
+
+inline bool configured_rs_fused_read() {
+    return parse_rs_fused_read(std::getenv("LLAMA_GALAXY_RS_FUSED_READ"));
+}
+
+// Maximum size of EACH full partial input. Fused mode holds two sources
+// (32 MiB in total at this limit), plus at most one output tile.
+// Larger activations transparently use the legacy tiled read path.
+inline constexpr size_t rs_fused_max_input_bytes = size_t(16) * 1024 * 1024;
+
+inline bool rs_fused_read_eligible(counts_t counts, size_t row_bytes) {
+    const int64_t total = detail::total_tokens(counts);
+    return row_bytes > 0 &&
+           static_cast<uint64_t>(total) <= rs_fused_max_input_bytes / row_bytes;
+}
+
 // Input rank tensors each contain a partial contribution for ALL tokens.
 // Output rank tensors contain only the reduced tokens assigned to that rank.
-// This implementation only creates each destination's reduced slice, not an
-// AllReduce(full) intermediate. Host staging is intentionally not optimized.
+// This implementation creates only each destination's reduced slice.
+// Optional fused input read transfers each rank's full Partial once into
+// bounded PC Host memory; reductions and output writes preserve token order.
 inline void reduce_scatter(const devices_t & devices, const input_t & partial,
-                           const output_t & shard, counts_t counts, size_t tile_tokens = 32) {
+                           const output_t & shard, counts_t counts, size_t tile_tokens = 32,
+                           bool request_fused_read = false) {
     detail::validate(devices, partial, shard, counts, tile_tokens, true);
     detail::measure measure;
     const ggml_type type = partial[0]->type;
@@ -211,7 +237,18 @@ inline void reduce_scatter(const devices_t & devices, const input_t & partial,
     const int64_t capacity_tokens = std::min<int64_t>(
             std::max(counts[0], counts[1]), static_cast<int64_t>(tile_tokens));
     const size_t capacity_bytes = detail::multiply(capacity_tokens, row);
-    std::vector<uint8_t> a(capacity_bytes), b(capacity_bytes), reduced(capacity_bytes);
+    const bool fused_read = request_fused_read && rs_fused_read_eligible(counts, row);
+    const size_t source_bytes = fused_read
+            ? detail::multiply(detail::total_tokens(counts), row)
+            : capacity_bytes;
+    std::vector<uint8_t> a(source_bytes), b(source_bytes), reduced(capacity_bytes);
+    if (fused_read) {
+        // The per-rank source tensors each contain the same token count,
+        // but different TP partial contributions. Reading them once avoids
+        // a fresh RPC GET for each destination rank's local sequence.
+        measure.read(partial[0], a.data(), 0, source_bytes);
+        measure.read(partial[1], b.data(), 0, source_bytes);
+    }
 
     int64_t global_start = 0;
     for (int rank = 0; rank < 2; ++rank) {
@@ -220,13 +257,17 @@ inline void reduce_scatter(const devices_t & devices, const input_t & partial,
             const size_t bytes = detail::multiply(n, row);
             const size_t src_offset = detail::multiply(global_start+done, row);
             const size_t dst_offset = detail::multiply(done, row);
-            measure.read(partial[0], a.data(), src_offset, bytes);
-            measure.read(partial[1], b.data(), src_offset, bytes);
+            if (!fused_read) {
+                measure.read(partial[0], a.data(), src_offset, bytes);
+                measure.read(partial[1], b.data(), src_offset, bytes);
+            }
+            const uint8_t * chunk_a = a.data() + (fused_read ? src_offset : 0);
+            const uint8_t * chunk_b = b.data() + (fused_read ? src_offset : 0);
             const auto host_start = ggml_galaxy_profile::clock::now();
             for (size_t k = 0; k < bytes/item; ++k) {
                 detail::write(type, reduced.data()+k*item,
-                        detail::read(type, a.data()+k*item) +
-                        detail::read(type, b.data()+k*item));
+                        detail::read(type, chunk_a+k*item) +
+                        detail::read(type, chunk_b+k*item));
             }
             if (measure.on) {
                 measure.host_ms += ggml_galaxy_profile::ms(host_start, ggml_galaxy_profile::clock::now());
@@ -237,7 +278,7 @@ inline void reduce_scatter(const devices_t & devices, const input_t & partial,
         }
         global_start += counts[rank];
     }
-    measure.finish("RS", shard[0], counts[0] + counts[1], tile_tokens);
+    measure.finish("RS", shard[0], counts[0] + counts[1], tile_tokens, fused_read);
 }
 
 // Input rank tensors each hold their own reduced sequence interval.

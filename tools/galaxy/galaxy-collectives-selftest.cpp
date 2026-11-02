@@ -28,6 +28,23 @@ static void expect_reject(const std::function<void()> & fn, const char * label) 
     require_test(caught, std::string("expected rejection for ") + label);
 }
 
+static std::vector<uint8_t> copy_tensor_bytes(const ggml_tensor * tensor) {
+    std::vector<uint8_t> result(ggml_nbytes(tensor));
+    ggml_backend_tensor_get(tensor, result.data(), 0, result.size());
+    return result;
+}
+
+static void verify_rs_fused_config() {
+    require_test(!parse_rs_fused_read(nullptr), "unset RS prefetch must be off");
+    require_test(!parse_rs_fused_read("0"), "disabled RS prefetch");
+    require_test(parse_rs_fused_read("1"), "enabled RS prefetch");
+    require_test(rs_fused_read_eligible({72,73}, 5120*2), "14B 145-token F16 fits fused cap");
+    require_test(!rs_fused_read_eligible({1024,1024}, 5120*2), "large RS falls back to tiles");
+    expect_reject([] { (void) parse_rs_fused_read("true"); }, "invalid RS prefetch");
+    expect_reject([] { (void) parse_rs_fused_read("2"); }, "invalid RS prefetch mode");
+    std::cout << "GALAXY_RS_FUSED_CONFIG_SELFTEST PASS\n";
+}
+
 static void verify_tile_parser() {
     require_test(parse_tile_tokens(nullptr) == 32, "default tile must preserve baseline");
     require_test(parse_tile_tokens("") == 32, "empty tile must preserve baseline");
@@ -157,6 +174,15 @@ static void run_case(devices_t devices, ggml_type type,
     input_t shards = {rank0.slice, rank1.slice};
     output_t full = {rank0.complete, rank1.complete};
     reduce_scatter(devices, partial, slices, counts, tile);
+    // The fused full-input read must produce byte-for-byte identical
+    // F16/F32 output, independently of the existing TP/SP-vs-TP error.
+    const auto baseline_rank0 = copy_tensor_bytes(rank0.slice);
+    const auto baseline_rank1 = copy_tensor_bytes(rank1.slice);
+    reduce_scatter(devices, partial, slices, counts, tile, true);
+    require_test(copy_tensor_bytes(rank0.slice) == baseline_rank0,
+                 "fused RS differs bitwise on rank 0");
+    require_test(copy_tensor_bytes(rank1.slice) == baseline_rank1,
+                 "fused RS differs bitwise on rank 1");
 
     const size_t edge = static_cast<size_t>(counts[0]*hidden);
     check_equals(unpack(rank0.slice),
@@ -205,6 +231,7 @@ int main(int argc, char ** argv) {
         }
         verify_marker_identity_survives_callback_rename();
         verify_tile_parser();
+        verify_rs_fused_config();
         ggml_backend_load_all();
         ggml_backend_t pc = pc_name.empty()
                 ? ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr)

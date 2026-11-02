@@ -80,7 +80,7 @@ inline void communication(
         double read_ms, double reduce_ms, double write_ms,
         double sync_ms, double wall_ms,
         uint64_t read_calls = 0, uint64_t write_calls = 0,
-        uint64_t sync_calls = 0, size_t tile_tokens = 0) {
+        uint64_t sync_calls = 0, size_t tile_tokens = 0, bool rs_fused_read = false) {
     if (!enabled()) return;
     std::ostringstream row;
     row << std::fixed << std::setprecision(5)
@@ -89,9 +89,9 @@ inline void communication(
         << read_ms << ',' << reduce_ms << ',' << write_ms << ','
         << sync_ms << ',' << wall_ms << ','
         << read_calls << ',' << write_calls << ','
-        << sync_calls << ',' << tile_tokens;
+        << sync_calls << ',' << tile_tokens << ',' << int(rs_fused_read);
     append("communication_timeline.csv",
-            "graph,kind,tensor,tokens,read_bytes,write_bytes,read_ms,host_reduce_ms,write_ms,sync_wait_ms,wall_ms,read_calls,write_calls,sync_calls,tile_tokens",
+            "graph,kind,tensor,tokens,read_bytes,write_bytes,read_ms,host_reduce_ms,write_ms,sync_wait_ms,wall_ms,read_calls,write_calls,sync_calls,tile_tokens,rs_fused_read",
             row.str());
 }
 
