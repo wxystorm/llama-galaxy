@@ -8,6 +8,7 @@
 // Each rank provides its own backend-allocated tensors.
 
 #include "ggml-backend.h"
+#include "ggml-backend-galaxy-profile.h"
 #include "ggml.h"
 
 #include <algorithm>
@@ -28,6 +29,48 @@ using output_t = std::array<ggml_tensor *, 2>;
 using counts_t = std::array<int64_t, 2>;
 
 namespace detail {
+
+// Timers are populated only when LLAMA_GALAXY_PROFILE_DIR is set.
+// Network latency is INCLUDED in backend tensor_get/set for RPC; separate
+// phone-side compute timings require the optional RPC server profiler.
+struct measure {
+    bool on = ggml_galaxy_profile::enabled();
+    ggml_galaxy_profile::instant begin = ggml_galaxy_profile::clock::now();
+    double read_ms = 0;
+    double write_ms = 0;
+    double host_ms = 0;
+    double sync_ms = 0;
+    uint64_t read_bytes = 0;
+    uint64_t write_bytes = 0;
+
+    void sync(ggml_backend_t backend) {
+        const auto t = ggml_galaxy_profile::clock::now();
+        ggml_backend_synchronize(backend);
+        if (on) sync_ms += ggml_galaxy_profile::ms(t, ggml_galaxy_profile::clock::now());
+    }
+    void read(const ggml_tensor * tensor, void * buffer, size_t offset, size_t bytes) {
+        const auto t = ggml_galaxy_profile::clock::now();
+        ggml_backend_tensor_get(tensor, buffer, offset, bytes);
+        if (on) {
+            read_ms += ggml_galaxy_profile::ms(t, ggml_galaxy_profile::clock::now());
+            read_bytes += bytes;
+        }
+    }
+    void write(ggml_tensor * tensor, const void * buffer, size_t offset, size_t bytes) {
+        const auto t = ggml_galaxy_profile::clock::now();
+        ggml_backend_tensor_set(tensor, buffer, offset, bytes);
+        if (on) {
+            write_ms += ggml_galaxy_profile::ms(t, ggml_galaxy_profile::clock::now());
+            write_bytes += bytes;
+        }
+    }
+    void finish(const char * kind, const ggml_tensor * tensor, int64_t tokens) const {
+        if (!on) return;
+        ggml_galaxy_profile::communication(kind, tensor ? tensor->name : "", tokens,
+                read_bytes, write_bytes, read_ms, host_ms, write_ms,
+                sync_ms, ggml_galaxy_profile::ms(begin, ggml_galaxy_profile::clock::now()));
+    }
+};
 
 inline void demand(bool condition, const std::string & text) {
     if (!condition) {
@@ -117,12 +160,13 @@ inline void write(ggml_type type, uint8_t * ptr, float value) {
 inline void reduce_scatter(const devices_t & devices, const input_t & partial,
                            const output_t & shard, counts_t counts, size_t tile_tokens = 32) {
     detail::validate(devices, partial, shard, counts, tile_tokens, true);
+    detail::measure measure;
     const ggml_type type = partial[0]->type;
     const size_t item = detail::element_bytes(type);
     const size_t row = detail::multiply(partial[0]->ne[0], item);
 
-    ggml_backend_synchronize(devices[0]);
-    ggml_backend_synchronize(devices[1]);
+    measure.sync(devices[0]);
+    measure.sync(devices[1]);
 
     int64_t global_start = 0;
     for (int rank = 0; rank < 2; ++rank) {
@@ -132,19 +176,24 @@ inline void reduce_scatter(const devices_t & devices, const input_t & partial,
             const size_t src_offset = detail::multiply(global_start+done, row);
             const size_t dst_offset = detail::multiply(done, row);
             std::vector<uint8_t> a(bytes), b(bytes), reduced(bytes);
-            ggml_backend_tensor_get(partial[0], a.data(), src_offset, bytes);
-            ggml_backend_tensor_get(partial[1], b.data(), src_offset, bytes);
+            measure.read(partial[0], a.data(), src_offset, bytes);
+            measure.read(partial[1], b.data(), src_offset, bytes);
+            const auto host_start = ggml_galaxy_profile::clock::now();
             for (size_t k = 0; k < bytes/item; ++k) {
                 detail::write(type, reduced.data()+k*item,
                         detail::read(type, a.data()+k*item) +
                         detail::read(type, b.data()+k*item));
             }
-            ggml_backend_tensor_set(shard[rank], reduced.data(), dst_offset, bytes);
-            ggml_backend_synchronize(devices[rank]);
+            if (measure.on) {
+                measure.host_ms += ggml_galaxy_profile::ms(host_start, ggml_galaxy_profile::clock::now());
+            }
+            measure.write(shard[rank], reduced.data(), dst_offset, bytes);
+            measure.sync(devices[rank]);
             done += n;
         }
         global_start += counts[rank];
     }
+    measure.finish("RS", shard[0], counts[0] + counts[1]);
 }
 
 // Input rank tensors each hold their own reduced sequence interval.
@@ -153,10 +202,11 @@ inline void reduce_scatter(const devices_t & devices, const input_t & partial,
 inline void all_gather(const devices_t & devices, const input_t & shard,
                        const output_t & replicated, counts_t counts, size_t tile_tokens = 32) {
     detail::validate(devices, shard, replicated, counts, tile_tokens, false);
+    detail::measure measure;
     const size_t row = detail::multiply(shard[0]->ne[0], detail::element_bytes(shard[0]->type));
 
-    ggml_backend_synchronize(devices[0]);
-    ggml_backend_synchronize(devices[1]);
+    measure.sync(devices[0]);
+    measure.sync(devices[1]);
 
     int64_t global_start = 0;
     for (int rank = 0; rank < 2; ++rank) {
@@ -166,16 +216,17 @@ inline void all_gather(const devices_t & devices, const input_t & shard,
             const size_t src_offset = detail::multiply(done, row);
             const size_t dst_offset = detail::multiply(global_start+done, row);
             std::vector<uint8_t> data(bytes);
-            ggml_backend_tensor_get(shard[rank], data.data(), src_offset, bytes);
+            measure.read(shard[rank], data.data(), src_offset, bytes);
             for (int dest = 0; dest < 2; ++dest) {
-                ggml_backend_tensor_set(replicated[dest], data.data(), dst_offset, bytes);
+                measure.write(replicated[dest], data.data(), dst_offset, bytes);
                 // The host buffer is reused after the backend write completes.
-                ggml_backend_synchronize(devices[dest]);
+                measure.sync(devices[dest]);
             }
             done += n;
         }
         global_start += counts[rank];
     }
+    measure.finish("AG", replicated[0], counts[0] + counts[1]);
 }
 
 // Copy the sequence interval owned by each rank out of an already mirrored
@@ -185,10 +236,11 @@ inline void all_gather(const devices_t & devices, const input_t & shard,
 inline void scatter_mirrored(const devices_t & devices, const input_t & full,
                             const output_t & shard, counts_t counts, size_t tile_tokens = 32) {
     detail::validate(devices, full, shard, counts, tile_tokens, true);
+    detail::measure measure;
     const size_t row = detail::multiply(full[0]->ne[0], detail::element_bytes(full[0]->type));
 
-    ggml_backend_synchronize(devices[0]);
-    ggml_backend_synchronize(devices[1]);
+    measure.sync(devices[0]);
+    measure.sync(devices[1]);
 
     int64_t global_start = 0;
     for (int rank = 0; rank < 2; ++rank) {
@@ -198,13 +250,14 @@ inline void scatter_mirrored(const devices_t & devices, const input_t & full,
             const size_t src_offset = detail::multiply(global_start+done, row);
             const size_t dst_offset = detail::multiply(done, row);
             std::vector<uint8_t> data(bytes);
-            ggml_backend_tensor_get(full[0], data.data(), src_offset, bytes);
-            ggml_backend_tensor_set(shard[rank], data.data(), dst_offset, bytes);
-            ggml_backend_synchronize(devices[rank]);
+            measure.read(full[0], data.data(), src_offset, bytes);
+            measure.write(shard[rank], data.data(), dst_offset, bytes);
+            measure.sync(devices[rank]);
             done += n;
         }
         global_start += counts[rank];
     }
+    measure.finish("RESIDUAL_SCATTER", shard[0], counts[0] + counts[1]);
 }
 
 } // namespace ggml_galaxy_collectives
