@@ -129,3 +129,13 @@ explicit limit for slow phone CPU). This saves stdout.log and stderr.log;
 check the final 30-60 `[GALAXY_META_TRACE]` lines from stderr.log. The
 tracing flag does not change tensor layouts, weights, or scheduling.
 The phone RPC server does not need to be rebuilt.
+
+### PC CLI single-turn smoke fix
+
+The smoke script now passes `--single-turn`: the CLI was correctly producing
+logits and a first response, but its interactive prompt `>` kept the process
+alive until the script timeout. `-n 1` only limits tokens, not conversation
+turns. The script also supplies `-lv 3` (INFO) by default so the existing
+`[GALAXY_SP_SUM]` line can be captured, and `-lv 4` (TRACE) with `-Trace`.
+On a genuine timeout, the final matching trace events are printed.
+Both stdout.log and stderr.log continue to be saved under the run directory.
