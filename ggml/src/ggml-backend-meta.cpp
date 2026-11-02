@@ -2781,8 +2781,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     if (profiling) {
         const bool galaxy2 = std::getenv("LLAMA_GALAXY2") &&
                              std::strcmp(std::getenv("LLAMA_GALAXY2"), "1") == 0;
+        const char * galaxy2_limit = std::getenv("LLAMA_GALAXY2_FFN_SP_LAYERS");
+        const bool partial_galaxy2 = galaxy2 && galaxy2_limit != nullptr &&
+                std::strcmp(galaxy2_limit, "all") != 0;
         ggml_galaxy_profile::summary(graph_id,
-                has_galaxy_markers ? (galaxy2 ? "GALAXY2" : "GALAXY") : "TP",
+                has_galaxy_markers
+                    ? (galaxy2 ? (partial_galaxy2 ? "GALAXY2_PARTIAL" : "GALAXY2_FULL") : "GALAXY")
+                    : "TP",
                 cgraph->n_nodes, backend_ctx->n_subgraphs,
                 galaxy_rs_count, galaxy_scatter_count, galaxy_ag_count,
                 galaxy_ar_count,
