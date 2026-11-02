@@ -30,6 +30,52 @@ inline bool sp_enabled() {
     return value != nullptr && std::string(value) == "1";
 }
 
+// Galaxy2: Attention TP -> RS -> SP connection + full-weight SP FFN -> AG.
+// Full FFN replication may not fit on a 6 GiB device. For incremental
+// validation, LLAMA_GALAXY2_FFN_SP_LAYERS can cap the number of leading
+// prefill layers with complete FFN replicas. "all" selects every eligible
+// layer. The last layer is excluded to preserve the output-token path.
+inline bool galaxy2_enabled() {
+    const char * value = std::getenv("LLAMA_GALAXY2");
+    return value != nullptr && std::string(value) == "1";
+}
+
+inline int64_t galaxy2_ffn_sp_count(int64_t n_layers) {
+    if (!galaxy2_enabled()) {
+        return 0;
+    }
+    if (n_layers < 1) {
+        throw std::invalid_argument("Galaxy2 requires a positive layer count");
+    }
+    const int64_t eligible = n_layers - 1;
+    const char * raw = std::getenv("LLAMA_GALAXY2_FFN_SP_LAYERS");
+    if (raw == nullptr || std::string(raw) == "all") {
+        return eligible;
+    }
+    if (raw[0] == '\0') {
+        throw std::invalid_argument("LLAMA_GALAXY2_FFN_SP_LAYERS must be 'all' or a nonnegative integer");
+    }
+    int64_t value = 0;
+    for (const char * p = raw; *p != '\0'; ++p) {
+        if (*p < '0' || *p > '9') {
+            throw std::invalid_argument("LLAMA_GALAXY2_FFN_SP_LAYERS must be 'all' or a nonnegative integer");
+        }
+        const int digit = *p - '0';
+        if (value > (std::numeric_limits<int64_t>::max() - digit) / 10) {
+            throw std::invalid_argument("LLAMA_GALAXY2_FFN_SP_LAYERS overflows int64");
+        }
+        value = value*10 + digit;
+    }
+    if (value > eligible) {
+        throw std::invalid_argument("Galaxy2 SP FFN count exceeds eligible non-final layers");
+    }
+    return value;
+}
+
+inline bool galaxy2_ffn_is_sp(int64_t il, int64_t n_layers) {
+    return il >= 0 && il < galaxy2_ffn_sp_count(n_layers);
+}
+
 inline std::vector<int64_t> parse_counts(const char * text, const char * key, size_t n_devices) {
     if (text == nullptr || text[0] == '\0') {
         throw std::invalid_argument(std::string(key) + " is required in Galaxy TP mode");
