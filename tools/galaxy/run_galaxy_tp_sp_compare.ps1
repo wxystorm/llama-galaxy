@@ -25,6 +25,7 @@ param(
     [int]$Threads = 8
 )
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "galaxy-process.ps1")
 if ($MaxAbs -lt 0 -or $MaxRmse -lt 0) { throw "Error tolerances cannot be negative" }
 if (-not (Test-Path -LiteralPath $Comparator)) { throw "Build galaxy-logits-compare first: $Comparator" }
 & $Comparator --selftest
@@ -84,7 +85,10 @@ $arguments = @(
     "--max-rmse", $maxRmseText,
     "--json", ('"' + $json + '"')
 )
-$proc = Start-Process -FilePath (Resolve-Path -LiteralPath $Comparator).Path -ArgumentList $arguments -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+$compareResult = Invoke-GalaxyProcess `
+    -Executable (Resolve-Path -LiteralPath $Comparator).Path `
+    -ArgumentList $arguments -StdoutPath $stdout -StderrPath $stderr
+$compareExitCode = $compareResult.ExitCode
 Get-Content -LiteralPath $stdout | ForEach-Object { Write-Host $_ }
 if ((Get-Item -LiteralPath $stderr).Length -gt 0) {
     Get-Content -LiteralPath $stderr | ForEach-Object { Write-Host $_ }
@@ -100,13 +104,13 @@ $manifest = @{
     tp_dir = $tpDir.FullName
     sp_dir = $spDir.FullName
     logits_summary = $json
-    comparator_exit_code = $proc.ExitCode
+    comparator_exit_code = $compareExitCode
     max_abs_threshold = $MaxAbs
     rmse_threshold = $MaxRmse
     note = "FP32 first-token logits comparison; not a speed benchmark"
 }
 $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $root "manifest.json") -Encoding UTF8
-if ($proc.ExitCode -ne 0) {
-    throw "Galaxy TP/SP numerical parity failed: $root (exit=$($proc.ExitCode))"
+if ($compareExitCode -ne 0) {
+    throw "Galaxy TP/SP numerical parity failed: $root (exit=$compareExitCode)"
 }
 Write-Host "[GALAXY_PARITY] PASS summary=$json"
