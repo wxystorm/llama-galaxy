@@ -30,6 +30,8 @@ if ($MaxAbs -lt 0 -or $MaxRmse -lt 0) { throw "Error tolerances cannot be negati
 if (-not (Test-Path -LiteralPath $Comparator)) { throw "Build galaxy-logits-compare first: $Comparator" }
 & $Comparator --selftest
 if ($LASTEXITCODE -ne 0) { throw "Galaxy logits comparator selftest failed" }
+# Do not load Qwen3 until the Windows process exit-code regression is checked.
+& (Join-Path $PSScriptRoot "test_galaxy_process.ps1")
 $smoke = Join-Path $PSScriptRoot "run_galaxy_sp_smoke.ps1"
 if (-not (Test-Path -LiteralPath $smoke)) { throw "Missing smoke script: $smoke" }
 $root = Join-Path $OutputDir ("compare-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
