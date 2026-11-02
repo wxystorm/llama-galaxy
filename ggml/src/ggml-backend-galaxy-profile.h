@@ -2,8 +2,10 @@
 
 // Lightweight opt-in CSV profiling for Galaxy TP, Galaxy and Galaxy2.
 // Set LLAMA_GALAXY_PROFILE_DIR to an existing output directory on the PC.
-// Profiles are synchronous observations; dispatch and backend wait are
-// reported separately to avoid claiming an RPC round trip is phone compute.
+// Profiles are synchronized observations. RPC dispatch_ms includes BOTH
+// the network roundtrip and server execution; only phone-side native CSV
+// separates them. CUDA observed_ms is a launch-to-post-RPC-fence window,
+// NOT an isolated GPU kernel time.
 // This file is header-only to keep instrumentation isolated from inference.
 
 #include <atomic>
