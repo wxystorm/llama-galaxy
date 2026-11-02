@@ -6,6 +6,7 @@
 #include "ggml-cpp.h"
 #include "ggml-rpc.h"
 #include "ggml-backend-galaxy-collectives.h"
+#include "ggml-backend-galaxy-profile.h"
 #include "ggml-backend-galaxy-markers.h"
 
 #include <algorithm>
@@ -2122,6 +2123,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
 
+    const bool profiling = ggml_galaxy_profile::enabled();
+    const auto graph_start = ggml_galaxy_profile::clock::now();
+    const uint64_t graph_id = profiling ? ggml_galaxy_profile::new_graph() : 0;
+    ggml_galaxy_profile::current_graph() = graph_id;
     bool has_galaxy_markers = false;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         has_galaxy_markers |= galaxy_sp_get_transition(cgraph->nodes[i]) != galaxy_sp_transition::none;
@@ -2578,6 +2583,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     size_t galaxy_rs_count = 0;
     size_t galaxy_ag_count = 0;
     size_t galaxy_scatter_count = 0;
+    size_t galaxy_ar_count = 0;
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         const size_t i_start = backend_ctx->backend_configs[0].cgraphs[i].offset;
         const size_t i_stop = i + 1 < backend_ctx->n_subgraphs
@@ -2585,6 +2591,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 : size_t(cgraph->n_nodes);
         GGML_ASSERT(i_stop > i_start);
         ggml_tensor * original_last = cgraph->nodes[i_stop - 1];
+        std::vector<double> dispatch_ms(n_backends, 0);
+        std::vector<ggml_galaxy_profile::instant> dispatch_start(n_backends);
 
         if (trace) {
             GGML_LOG_INFO("[GALAXY_META_TRACE] event=SUBGRAPH_BEGIN idx=%zu total=%zu range=%zu..%zu last=%s op=%s transition=%d\n",
@@ -2602,13 +2610,37 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 GGML_LOG_INFO("[GALAXY_META_TRACE] event=DISPATCH_BEGIN idx=%zu rank=%zu backend=%s nodes=%d\n",
                         i, j, ggml_backend_name(bcj.backend), simple_graph->n_nodes);
             }
+            dispatch_start[j] = ggml_galaxy_profile::clock::now();
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, simple_graph);
+            if (profiling) {
+                dispatch_ms[j] = ggml_galaxy_profile::ms(dispatch_start[j],
+                        ggml_galaxy_profile::clock::now());
+            }
             if (trace) {
                 GGML_LOG_INFO("[GALAXY_META_TRACE] event=DISPATCH_RETURN idx=%zu rank=%zu status=%d\n",
                         i, j, int(status));
             }
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
+            }
+        }
+        if (profiling) {
+            // Synchronize AFTER dispatching both ranks, so their compute
+            // can overlap. This adds explicit syncs and changes the runtime
+            // schedule; profile numbers must not be used as an unbiased
+            // inference speed benchmark.
+            for (size_t j = 0; j < n_backends; ++j) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                const ggml_cgraph * simple = bcj.cgraphs[i].cgraph_main;
+                if (simple->n_nodes == 0) continue;
+                const auto sync_start = ggml_galaxy_profile::clock::now();
+                ggml_backend_synchronize(bcj.backend);
+                const auto sync_end = ggml_galaxy_profile::clock::now();
+                ggml_galaxy_profile::compute(graph_id, i, j,
+                        ggml_backend_name(bcj.backend), original_last->name,
+                        simple->n_nodes, dispatch_ms[j],
+                        ggml_galaxy_profile::ms(sync_start, sync_end),
+                        ggml_galaxy_profile::ms(dispatch_start[j], sync_end));
             }
         }
 
@@ -2706,6 +2738,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 GGML_LOG_INFO("[GALAXY_META_TRACE] event=ALLREDUCE_BEGIN idx=%zu tensor=%s\n",
                         i, original_last->name);
             }
+            const auto reduce_start = ggml_galaxy_profile::clock::now();
             bool backend_allreduce_success = false;
             if (backend_ctx->comm_ctx) {
                 std::vector<ggml_tensor *> nodes;
@@ -2724,6 +2757,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     return status;
                 }
             }
+            galaxy_ar_count++;
+            if (profiling) {
+                // The fallback may queue asynchronous copies/ADD operations.
+                // Wait for both ranks before recording the end-to-end time.
+                for (size_t j = 0; j < n_backends; ++j) {
+                    ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+                }
+                ggml_galaxy_profile::communication("ALLREDUCE", original_last->name,
+                        original_last->ne[1], 0, 0, 0, 0, 0, 0,
+                        ggml_galaxy_profile::ms(reduce_start, ggml_galaxy_profile::clock::now()));
+            }
             if (trace) {
                 GGML_LOG_INFO("[GALAXY_META_TRACE] event=ALLREDUCE_END idx=%zu tensor=%s native=%d\n",
                         i, original_last->name, int(backend_allreduce_success));
@@ -2733,6 +2777,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     if (trace) {
         GGML_LOG_INFO("[GALAXY_META_TRACE] event=GRAPH_END subgraphs=%zu sp=%d\n",
                 backend_ctx->n_subgraphs, int(has_galaxy_markers));
+    }
+    if (profiling) {
+        const bool galaxy2 = std::getenv("LLAMA_GALAXY2") &&
+                             std::strcmp(std::getenv("LLAMA_GALAXY2"), "1") == 0;
+        ggml_galaxy_profile::summary(graph_id,
+                has_galaxy_markers ? (galaxy2 ? "GALAXY2" : "GALAXY") : "TP",
+                cgraph->n_nodes, backend_ctx->n_subgraphs,
+                galaxy_rs_count, galaxy_scatter_count, galaxy_ag_count,
+                galaxy_ar_count,
+                ggml_galaxy_profile::ms(graph_start, ggml_galaxy_profile::clock::now()));
     }
     if (has_galaxy_markers) {
         // A required correctness witness, not a verbose debug message.
