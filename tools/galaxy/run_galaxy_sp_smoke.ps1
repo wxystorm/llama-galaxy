@@ -1,6 +1,6 @@
 <#
 Galaxy PC + Phone TP/SP smoke on Windows PowerShell.
-Uses Start-Process to capture stdout/stderr without NativeCommandError.
+Uses System.Diagnostics.Process with separate streaming log files.
 #>
 [CmdletBinding()]
 param(
@@ -24,6 +24,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "galaxy-process.ps1")
 if (-not (Test-Path -LiteralPath $Exe)) { throw "Missing executable: $Exe" }
 if (-not (Test-Path -LiteralPath $Model)) { throw "Missing model: $Model" }
 if (-not (Test-Path -LiteralPath $PromptFile)) { throw "Missing prompt: $PromptFile" }
@@ -63,22 +64,20 @@ try {
         "-n", $NPredict.ToString(), "--temp", "0", "-f", $promptArg
     )
     Write-Host "[GALAXY_SP_SMOKE] mode=$mode devices=$Devices rpc=$Rpc"
-    $proc = Start-Process -FilePath (Resolve-Path -LiteralPath $Exe).Path -ArgumentList $arguments -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-    if ($TimeoutSec -gt 0) {
-        if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
-            try { $proc.Kill() } catch {}
-            $proc.WaitForExit()
-            Write-Host "[GALAXY_SP_SMOKE] TIMEOUT mode=$mode logs=$dir"
-            @(Select-String -Path $stderr, $stdout `
-                -Pattern "GALAXY_META_TRACE","GALAXY_SP_SUM","GALAXY_SP_LAYOUT_FAIL","GALAXY_SP]","RPC_GRAPH" `
-                -ErrorAction SilentlyContinue | Select-Object -Last 30) |
-                ForEach-Object { Write-Host $_.Line.Trim() }
-            throw "Galaxy $mode run timed out after $TimeoutSec seconds; logs=$dir"
-        }
-    } else {
-        $proc.WaitForExit()
+    $result = Invoke-GalaxyProcess `
+        -Executable (Resolve-Path -LiteralPath $Exe).Path `
+        -ArgumentList $arguments -StdoutPath $stdout -StderrPath $stderr `
+        -TimeoutSec $TimeoutSec
+    if ($result.TimedOut) {
+        Write-Host "[GALAXY_SP_SMOKE] TIMEOUT mode=$mode logs=$dir"
+        @(Select-String -Path $stderr, $stdout `
+            -Pattern "GALAXY_META_TRACE","GALAXY_SP_SUM","GALAXY_SP_LAYOUT_FAIL","GALAXY_SP]","RPC_GRAPH" `
+            -ErrorAction SilentlyContinue | Select-Object -Last 30) |
+            ForEach-Object { Write-Host $_.Line.Trim() }
+        throw "Galaxy $mode run timed out after $TimeoutSec seconds; logs=$dir"
     }
-    Write-Host "[GALAXY_SP_SMOKE] exit=$($proc.ExitCode) logs=$dir"
+    $exitCode = $result.ExitCode
+    Write-Host "[GALAXY_SP_SMOKE] exit=$exitCode logs=$dir"
 
     $hits = @(Select-String -Path $stderr, $stdout -Pattern "GALAXY_META_TRACE","GALAXY_SP_LAYOUT_FAIL","GALAXY_SP_LAYOUT_SRC","GALAXY_SP_SUM","GALAXY_SP]","GALAXY_TP]","prompt eval time","eval time","ERROR","failed" -ErrorAction SilentlyContinue)
     # Keep the full trace in stderr.log, but print only the last 80
@@ -86,7 +85,7 @@ try {
     $displayHits = if ($Trace) { @($hits | Select-Object -Last 80) } else { $hits }
     foreach ($hit in $displayHits) { Write-Host $hit.Line.Trim() }
 
-    if ($proc.ExitCode -ne 0) { throw "Smoke run failed; examine $stderr and $stdout" }
+    if ($exitCode -ne 0) { throw "Smoke run failed (exit=$exitCode); examine $stderr and $stdout" }
     if ($DumpLogits -and ((-not (Test-Path -LiteralPath $dumpPath)) -or
             (Get-Item -LiteralPath $dumpPath).Length -le 8)) {
         throw "Missing or incomplete first-token full logits: $dumpPath"
