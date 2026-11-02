@@ -28,6 +28,21 @@ static void expect_reject(const std::function<void()> & fn, const char * label) 
     require_test(caught, std::string("expected rejection for ") + label);
 }
 
+static void verify_tile_parser() {
+    require_test(parse_tile_tokens(nullptr) == 32, "default tile must preserve baseline");
+    require_test(parse_tile_tokens("") == 32, "empty tile must preserve baseline");
+    require_test(parse_tile_tokens("1") == 1, "min tile");
+    require_test(parse_tile_tokens("32") == 32, "legacy tile");
+    require_test(parse_tile_tokens("256") == 256, "optimized tile");
+    require_test(parse_tile_tokens("1024") == 1024, "max tile");
+    expect_reject([] { (void) parse_tile_tokens("0"); }, "zero tile configuration");
+    expect_reject([] { (void) parse_tile_tokens("1025"); }, "oversized tile configuration");
+    expect_reject([] { (void) parse_tile_tokens("-1"); }, "negative tile configuration");
+    expect_reject([] { (void) parse_tile_tokens("32x"); }, "non-numeric tile configuration");
+    expect_reject([] { (void) parse_tile_tokens("18446744073709551615"); }, "overflow tile configuration");
+    std::cout << "GALAXY_COLLECTIVE_TILE_SELFTEST PASS\n";
+}
+
 static void verify_marker_identity_survives_callback_rename() {
     const ggml_init_params params = {1024*1024, nullptr, true};
     ggml_context * ctx = ggml_init(params);
@@ -189,6 +204,7 @@ int main(int argc, char ** argv) {
             else throw std::invalid_argument("usage: galaxy-collectives-selftest [--pc CUDA0] [--rpc IP:50052]");
         }
         verify_marker_identity_survives_callback_rename();
+        verify_tile_parser();
         ggml_backend_load_all();
         ggml_backend_t pc = pc_name.empty()
                 ? ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr)
@@ -214,6 +230,10 @@ int main(int argc, char ** argv) {
             run_case(devices, GGML_TYPE_F32, 128, {64,65}, 32);
             run_case(devices, GGML_TYPE_F16,  32, {7,9}, 3);
             run_case(devices, GGML_TYPE_F16,  64, {31,33}, 16);
+            // Full hidden dimension, unequal local sequence sizes and a
+            // tile larger than either rank's shard: one transfer per slice.
+            run_case(devices, GGML_TYPE_F16, 5120, {72,73}, 256);
+            run_case(devices, GGML_TYPE_F32, 16, {3,5}, 1024);
         } catch (...) {
             ggml_backend_free(second);
             ggml_backend_free(pc);
