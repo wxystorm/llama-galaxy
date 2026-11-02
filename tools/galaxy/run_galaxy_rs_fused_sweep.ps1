@@ -123,6 +123,37 @@ foreach ($mode in @("sp", "galaxy2")) {
     Write-Host ("[GALAXY_RS_FUSED_SUM] mode={0} off_ms={1:N2} on_ms={2:N2} speedup={3:N3}x parity_exit={4}" -f
         $mode, $oldTiming.prefill_ms, $newTiming.prefill_ms, $ratio, $result.ExitCode)
 }
+$profileSummary = @()
+if ($Profile) {
+    foreach ($mode in @("sp", "galaxy2")) {
+        foreach ($state in @("off", "on")) {
+            $profileCsv = Join-Path $folders["$mode/$state"] "profile\communication_timeline.csv"
+            if (-not (Test-Path -LiteralPath $profileCsv)) {
+                throw "Profile was requested but communication CSV is missing: $profileCsv"
+            }
+            $rsRows = @(Import-Csv -LiteralPath $profileCsv | Where-Object { $_.kind -eq "RS" })
+            if ($rsRows.Count -eq 0) { throw "No RS records in $profileCsv" }
+            $reads = 0
+            $writes = 0
+            $usedFused = 0
+            foreach ($item in $rsRows) {
+                $reads += [int]$item.read_calls
+                $writes += [int]$item.write_calls
+                if ($item.rs_fused_read -eq "1") { $usedFused++ }
+            }
+            $profileSummary += [pscustomobject]@{
+                mode = $mode
+                fused_requested = $state
+                rs_operations = $rsRows.Count
+                rs_fused_used = $usedFused
+                rs_backend_read_calls = $reads
+                rs_backend_write_calls = $writes
+            }
+            Write-Host "[GALAXY_RS_FUSED_CALLS] mode=$mode state=$state rs=$($rsRows.Count) fused_used=$usedFused reads=$reads writes=$writes"
+        }
+    }
+    $profileSummary | Export-Csv -LiteralPath (Join-Path $root "rpc_call_counts.csv") -NoTypeInformation -Encoding UTF8
+}
 $manifest = @{
     model = (Resolve-Path -LiteralPath $Model).Path
     prompt = (Resolve-Path -LiteralPath $PromptFile).Path
@@ -134,6 +165,7 @@ $manifest = @{
     galaxy2_sp_ffn_layers = $Galaxy2FfnSpLayers
     collective_tile_tokens = $CollectiveTileTokens
     profile_forced_sync = [bool]$Profile
+    rpc_call_count_summary = $profileSummary
     profiles = $records
     fused_vs_tiled_parity = $comparison
     note = "Compare fused and unfused within the SAME execution mode; TP/SP differences are separate"
