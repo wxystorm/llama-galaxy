@@ -119,6 +119,8 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
         }
         const bool galaxy_sp_layer = galaxy_sp && il + 1 < n_layer;
+        const bool galaxy2_ffn_sp = galaxy_sp_layer &&
+                llama_galaxy_tp::galaxy2_ffn_is_sp(il, n_layer);
         if (galaxy_sp_layer) {
             // Attention output is TP_PARTIAL; let the Meta backend perform
             // ReduceScatter instead of its usual AllReduce.
@@ -146,8 +148,9 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
                 LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
-        if (galaxy_sp_layer) {
-            // SP -> TP before FFN: AllGather complete hidden states.
+        if (galaxy_sp_layer && !galaxy2_ffn_sp) {
+            // Standard Galaxy uses FFN TP, so it must gather before FFN.
+            // Galaxy2 leaves activations token-sharded and uses mirrored FFN weights.
             cur = ggml_dup(ctx0, cur);
             ggml_galaxy::mark_transition(cur, ggml_galaxy::sp_transition::all_gather);
             ggml_format_name(cur, "GALAXY_AG_ATT_%d", il);
@@ -161,7 +164,9 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
                 LLM_FFN_SILU, LLM_FFN_PAR, il);
         cb(cur, "ffn_out", il);
 
-        if (galaxy_sp_layer) {
+        if (galaxy_sp_layer && !galaxy2_ffn_sp) {
+            // Standard Galaxy: FFN TP partial output -> ReduceScatter.
+            // Galaxy2: local FFN is already SP_SEQ, so no reduction occurs.
             cur = ggml_dup(ctx0, cur);
             ggml_galaxy::mark_transition(cur, ggml_galaxy::sp_transition::reduce_scatter);
             ggml_format_name(cur, "GALAXY_RS_FFN_%d", il);
