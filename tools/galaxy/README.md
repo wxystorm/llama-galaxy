@@ -1,16 +1,20 @@
-# Galaxy static tensor parallelism - phase 1
+# Galaxy tensor/sequence parallelism + Galaxy2 (experimental)
 
 Original Galaxy-LM source: https://github.com/ysyisyourbrother/Galaxy-LM
 Reference commit: 7b3dcae9b7dbec8ec173b71bc6460dfedfe8ee36.
 
-This phase implements the static Attention-head and FFN-intermediate-size
-allocation used by the Galaxy-LM source, but on the existing llama.cpp
-Meta Device execution substrate (PC backend + phone RPC backend).
+This fork implements three opt-in Qwen3 inference modes on the llama.cpp
+Meta Device: static Attention+FFN TP; Galaxy mixed TP/SP with
+ReduceScatter and AllGather; and Galaxy2 with replicated FFN weights and
+token-sharded FFN computation. Galaxy2 can be limited to N layers to fit
+a smaller PC/Phone memory budget (this is a partial hybrid, not full Galaxy2).
 
-THIS IS NOT A COMPLETE GALAXY PERFORMANCE BASELINE YET:
-- llama.cpp Meta Device still performs the reductions, not Galaxy-LM Gloo.
-- SP, dynamic planning, tiled overlap and Chunk FIFO are NOT implemented.
-- No validated PC/Phone correctness or timing measurements have been made.
+STATUS: pure TP and earlier mixed TP/SP forward inference have run on PC+Phone;
+the new Galaxy2 and detailed CSV profiling must be compiled and validated.
+The fork still uses Meta/RPC transport, not Galaxy-LM Gloo. It does not
+implement a dynamic Planner, CPU/GPU weight streaming, or Chunk FIFO.
+All initial speed measurements and numerical comparisons need repeatable
+tests on the actual hardware.
 
 Activation on the PC (not on the phone RPC server):
 
