@@ -139,3 +139,56 @@ turns. The script also supplies `-lv 3` (INFO) by default so the existing
 `[GALAXY_SP_SUM]` line can be captured, and `-lv 4` (TRACE) with `-Trace`.
 On a genuine timeout, the final matching trace events are printed.
 Both stdout.log and stderr.log continue to be saved under the run directory.
+
+
+## Phase 1C: verify numerical parity of Qwen3 TP/SP against pure TP
+
+The Qwen3 TP/SP path has produced a complete first-token logits vector
+and a response, but its **numeric parity with pure TP is not certified**
+until both paths are compared on exactly the same model, prompt and runtime
+settings. The smoke CLI now uses \`--single-turn\` and log verbosity 3/4.
+
+### Full-logits correctness experiment
+
+The existing server already prints the first generated token's top-10.
+For a stricter test, the opt-in environment variable
+\`LLAMA_GALAXY_FIRST_LOGITS_PATH\` saves the complete first-token vocabulary
+logits: 4-byte magic \`GLG1\`, int32 vocab size, then contiguous float32
+logits. The variable is scoped by the smoke script and is disabled by
+default. Only the first generated token's logits are dumped; the file
+remains local to the PC.
+
+The model-free \`galaxy-logits-compare\` executable loads two such dumps and
+reports Top-1 equality, Top-10 overlap, max absolute error, mean absolute
+error, RMSE, cosine similarity, and any differing non-finite entries.
+Its numeric thresholds are configurable; the exploratory defaults are
+max-abs 0.10 and RMSE 0.02. A matching Top-1 alone is NOT sufficient to
+declare numerical parity.
+
+Build:
+ 
+    git pull --ff-only origin feat/galaxy-baseline
+    cmake --build build-galaxy --config Release --target llama-cli galaxy-logits-compare -j 8
+    .\build-galaxy\bin\Release\galaxy-logits-compare.exe --selftest
+
+One matched TP/SP pair (PowerShell, from repository root):
+
+    .\tools\galaxy\run_galaxy_tp_sp_compare.ps1 -Model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" -Rpc "10.39.52.114:50052" -PromptFile "D:\prima.cpp\prompts\prompt_64.txt" -TimeoutSec 180
+
+This script runs pure TP first, then TP/SP with the SAME options, and
+captures \`first_logits.f32\` for both. It calls the comparator and stores:
+- \`galaxy-sp-results/compare-*/summary.json\` for metric values and thresholds
+- \`compare.log\`, \`compare.stderr.log\` for comparison output
+- \`manifest.json\` with source paths, prompt SHA-256, split config, RPC endpoint
+- \`tp-*/stdout.log\`, \`tp-*/stderr.log\`, \`tp-*/first_logits.f32\`
+- \`sp-*/stdout.log\`, \`sp-*/stderr.log\`, \`sp-*/first_logits.f32\`
+
+Use \`-Trace\` for detailed Meta execution logs, which increase logging
+overhead. A failed numerical comparison is reported as FAIL and the files
+are retained for diagnosis. If the mismatch is above an exploratory
+threshold, inspect the actual error values and token rankings before
+deciding whether it represents a meaningful correctness bug.
+
+This is a correctness check, NOT a reliable decode or prefill speed
+benchmark; binary file output and verbose logs add overhead. Keep phone
+RPC and model weight configuration unchanged between the two runs.
