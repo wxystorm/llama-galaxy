@@ -27,6 +27,8 @@ param(
 $ErrorActionPreference = "Stop"
 if ($MaxAbs -lt 0 -or $MaxRmse -lt 0) { throw "Error tolerances cannot be negative" }
 if (-not (Test-Path -LiteralPath $Comparator)) { throw "Build galaxy-logits-compare first: $Comparator" }
+& $Comparator --selftest
+if ($LASTEXITCODE -ne 0) { throw "Galaxy logits comparator selftest failed" }
 $smoke = Join-Path $PSScriptRoot "run_galaxy_sp_smoke.ps1"
 if (-not (Test-Path -LiteralPath $smoke)) { throw "Missing smoke script: $smoke" }
 $root = Join-Path $OutputDir ("compare-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
@@ -90,6 +92,7 @@ if ((Get-Item -LiteralPath $stderr).Length -gt 0) {
 $manifest = @{
     model = (Resolve-Path -LiteralPath $Model).Path
     prompt = (Resolve-Path -LiteralPath $PromptFile).Path
+    prompt_sha256 = (Get-FileHash -LiteralPath $PromptFile -Algorithm SHA256).Hash
     rpc = $Rpc
     devices = $Devices
     heads = $HeadSplit
@@ -98,6 +101,8 @@ $manifest = @{
     sp_dir = $spDir.FullName
     logits_summary = $json
     comparator_exit_code = $proc.ExitCode
+    max_abs_threshold = $MaxAbs
+    rmse_threshold = $MaxRmse
     note = "FP32 first-token logits comparison; not a speed benchmark"
 }
 $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $root "manifest.json") -Encoding UTF8
