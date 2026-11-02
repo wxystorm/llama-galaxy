@@ -30,6 +30,14 @@ int main() {
     must_throw([] { validate_counts({16, 24}, 40, 5, "heads"); });
     must_throw([] { validate_counts({20, 20}, 41, 5, "heads"); });
     must_throw([] { validate_counts({8704, 8704}, 17408, 1024, "ffn"); });
+    // Galaxy2 only changes FFN placement for selected, non-final layers.
+    // Full mode is valid as a graph mode even if the model will not fit in
+    // the available hardware memory. Memory is checked at allocation time.
+    must_throw([] {
+        // Separate parser check via the numeric cap is exercised by the
+        // environment-aware integration smoke; do not mutate global env here.
+        llama_galaxy_tp::galaxy2_ffn_sp_count(-1);
+    });
     std::cout << "GALAXY_TP_SELFTEST PASS\n";
     return 0;
 }
