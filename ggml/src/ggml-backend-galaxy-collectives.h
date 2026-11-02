@@ -1,8 +1,8 @@
 #pragma once
 
-// Experimental, correctness-first Galaxy TP/SP communication primitives.
-// Implemented using ggml backend tensor_get/set (CPU/CUDA/RPC compatible).
-// These functions are NOT yet integrated with the Meta Device graph.
+// Galaxy TP/SP collectives integrated with the Meta backend. Tiled Host
+// Staging remains the correctness baseline. Increasing tile size reduces
+// CPU/CUDA/RPC calls without changing arithmetic or output ordering.
 //
 // GGML contiguous 2-D layout: [hidden, tokens], rank 0 first in sequence.
 // Each rank provides its own backend-allocated tensors.
@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -42,11 +43,17 @@ struct measure {
     double sync_ms = 0;
     uint64_t read_bytes = 0;
     uint64_t write_bytes = 0;
+    uint64_t read_calls = 0;
+    uint64_t write_calls = 0;
+    uint64_t sync_calls = 0;
 
     void sync(ggml_backend_t backend) {
         const auto t = ggml_galaxy_profile::clock::now();
         ggml_backend_synchronize(backend);
-        if (on) sync_ms += ggml_galaxy_profile::ms(t, ggml_galaxy_profile::clock::now());
+        if (on) {
+            sync_ms += ggml_galaxy_profile::ms(t, ggml_galaxy_profile::clock::now());
+            sync_calls++;
+        }
     }
     void read(const ggml_tensor * tensor, void * buffer, size_t offset, size_t bytes) {
         const auto t = ggml_galaxy_profile::clock::now();
@@ -54,6 +61,7 @@ struct measure {
         if (on) {
             read_ms += ggml_galaxy_profile::ms(t, ggml_galaxy_profile::clock::now());
             read_bytes += bytes;
+            read_calls++;
         }
     }
     void write(ggml_tensor * tensor, const void * buffer, size_t offset, size_t bytes) {
@@ -62,13 +70,15 @@ struct measure {
         if (on) {
             write_ms += ggml_galaxy_profile::ms(t, ggml_galaxy_profile::clock::now());
             write_bytes += bytes;
+            write_calls++;
         }
     }
-    void finish(const char * kind, const ggml_tensor * tensor, int64_t tokens) const {
+    void finish(const char * kind, const ggml_tensor * tensor, int64_t tokens, size_t tile_tokens) const {
         if (!on) return;
         ggml_galaxy_profile::communication(kind, tensor ? tensor->name : "", tokens,
                 read_bytes, write_bytes, read_ms, host_ms, write_ms,
-                sync_ms, ggml_galaxy_profile::ms(begin, ggml_galaxy_profile::clock::now()));
+                sync_ms, ggml_galaxy_profile::ms(begin, ggml_galaxy_profile::clock::now()),
+                read_calls, write_calls, sync_calls, tile_tokens);
     }
 };
 
@@ -152,6 +162,33 @@ inline void write(ggml_type type, uint8_t * ptr, float value) {
 }
 
 } // namespace detail
+
+// Default 32 matches the previous implementation; larger tiles reduce RPC
+// request count. Limit to 1024 tokens to bound temporary Host allocations.
+inline size_t parse_tile_tokens(const char * raw) {
+    if (raw == nullptr || raw[0] == '\0') {
+        return 32;
+    }
+    size_t value = 0;
+    for (const char * p = raw; *p != '\0'; ++p) {
+        if (*p < '0' || *p > '9') {
+            throw std::invalid_argument("LLAMA_GALAXY_COLLECTIVE_TILE_TOKENS must be 1..1024");
+        }
+        const size_t digit = static_cast<size_t>(*p - '0');
+        if (value > (size_t(1024) - digit)/10) {
+            throw std::invalid_argument("LLAMA_GALAXY_COLLECTIVE_TILE_TOKENS exceeds 1024");
+        }
+        value = value*10 + digit;
+    }
+    if (value == 0 || value > 1024) {
+        throw std::invalid_argument("LLAMA_GALAXY_COLLECTIVE_TILE_TOKENS must be 1..1024");
+    }
+    return value;
+}
+
+inline size_t configured_tile_tokens() {
+    return parse_tile_tokens(std::getenv("LLAMA_GALAXY_COLLECTIVE_TILE_TOKENS"));
+}
 
 // Input rank tensors each contain a partial contribution for ALL tokens.
 // Output rank tensors contain only the reduced tokens assigned to that rank.
