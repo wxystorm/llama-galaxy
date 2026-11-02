@@ -16,6 +16,7 @@ param(
     [switch]$Galaxy2,
     [string]$Galaxy2FfnSpLayers = "1",
     [switch]$Profile,
+    [string]$DumpLayers = "",
     [switch]$Trace,
     [switch]$DumpLogits,
     [int]$TimeoutSec = 0,
@@ -41,7 +42,8 @@ if ($Ctx -le 0 -or $Batch -le 0 -or $UBatch -le 0 -or $Threads -le 0 -or $NPredi
 }
 
 $keys = @("LLAMA_GALAXY_TP", "LLAMA_GALAXY_TP_HEADS", "LLAMA_GALAXY_TP_FFN", "LLAMA_GALAXY_SP", "LLAMA_GALAXY_SP_TRACE", "LLAMA_GALAXY_FIRST_LOGITS_PATH",
-    "LLAMA_GALAXY2", "LLAMA_GALAXY2_FFN_SP_LAYERS", "LLAMA_GALAXY_PROFILE_DIR")
+    "LLAMA_GALAXY2", "LLAMA_GALAXY2_FFN_SP_LAYERS", "LLAMA_GALAXY_PROFILE_DIR",
+    "LLAMA_GALAXY_LAYER_DUMP", "LLAMA_GALAXY_LAYER_DUMP_DIR")
 $old = @{}
 foreach ($key in $keys) { $old[$key] = [Environment]::GetEnvironmentVariable($key, "Process") }
 
@@ -61,6 +63,12 @@ try {
         $profileDir = Join-Path (Resolve-Path -LiteralPath $dir).Path "profile"
         New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
         $profileDir
+    } else { $null }
+    $env:LLAMA_GALAXY_LAYER_DUMP = if ($DumpLayers) { $DumpLayers } else { $null }
+    $env:LLAMA_GALAXY_LAYER_DUMP_DIR = if ($DumpLayers) {
+        $layerDir = Join-Path (Resolve-Path -LiteralPath $dir).Path "layers"
+        New-Item -ItemType Directory -Force -Path $layerDir | Out-Null
+        $layerDir
     } else { $null }
     $stdout = Join-Path $dir "stdout.log"
     $stderr = Join-Path $dir "stderr.log"
@@ -115,6 +123,7 @@ try {
         Write-Warning "SP run exited normally but no positive ReduceScatter count was logged. Continue numerical comparison; actual SP collective execution remains UNVERIFIED."
     }
     if ($Profile) { Write-Host "[GALAXY_PROFILE] directory=$($env:LLAMA_GALAXY_PROFILE_DIR)" }
+    if ($DumpLayers) { Write-Host "[GALAXY_LAYER_DUMP] layers=$DumpLayers dir=$($env:LLAMA_GALAXY_LAYER_DUMP_DIR)" }
     $spEvidence = if ($PureTP) { "N/A" } elseif ($spWitness) { "CONFIRMED" } else { "UNVERIFIED" }
     Write-Host "[GALAXY_SP_SMOKE] PASS mode=$mode inference=PASS sp_collectives=$spEvidence"
 }
