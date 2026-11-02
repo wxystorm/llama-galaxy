@@ -192,3 +192,25 @@ deciding whether it represents a meaningful correctness bug.
 This is a correctness check, NOT a reliable decode or prefill speed
 benchmark; binary file output and verbose logs add overhead. Keep phone
 RPC and model weight configuration unchanged between the two runs.
+
+
+### Windows process exit-code regression (fixed)
+
+A TP run can successfully finish, print first-token logits and Prefill timing,
+but the original PowerShell smoke wrapper may show \`exit=\` (empty) and
+erroneously fail. \`Start-Process -NoNewWindow\` with stdout/stderr
+redirection can return a Process object with a null \`ExitCode\` on
+Windows; it is a wrapper problem, not evidence of a Qwen3 TP/SP failure.
+
+Both smoke and numerical-parity scripts now use the shared
+\`tools/galaxy/galaxy-process.ps1\` helper, which creates
+\`System.Diagnostics.Process\` directly, drains stdout/stderr
+asynchronously to files, enforces a timeout and returns a real integer
+exit code. Logs remain available after successful completion or timeout.
+
+The parity script runs \`test_galaxy_process.ps1\` before loading the
+model. The small test checks exit codes 0 and 7 and one-second timeout
+handling with the native Windows \`cmd.exe\`; expected output:
+\`GALAXY_PROCESS_SELFTEST PASS exit0=0 exit7=7 timeout=1\`.
+Run the test alone if debugging process handling. These changes are
+PowerShell-only and require no PC/Phone recompilation.
