@@ -50,7 +50,9 @@ try {
 
     $modelArg = '"' + (Resolve-Path -LiteralPath $Model).Path + '"'
     $promptArg = '"' + (Resolve-Path -LiteralPath $PromptFile).Path + '"'
+    $logVerbosity = if ($Trace) { "4" } else { "3" }
     $arguments = @(
+        "--single-turn", "-lv", $logVerbosity,
         "-m", $modelArg, "--rpc", $Rpc, "-dev", $Devices, "-sm", "tensor",
         "-ts", "1,1", "-ngl", "all", "-fa", "on", "-ctk", "f16", "-ctv", "f16",
         "-fit", "off", "-c", $Ctx.ToString(), "-b", $Batch.ToString(),
