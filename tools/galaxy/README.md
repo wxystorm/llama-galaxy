@@ -513,3 +513,23 @@ times separately. The phone server does not require protocol changes.
 Accept the previously documented TP-vs-SP numerical deviations for
 performance exploration, but require fused-vs-unfused *within-mode*
 numerical parity before reporting a fused-read speedup.
+
+
+For a matched four-run A/B harness with identical tile sizes and fused
+ReduceScatter toggled off/on for both Galaxy and Galaxy2:
+
+    .\tools\galaxy\run_galaxy_rs_fused_sweep.ps1 -Model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" -PromptFile "D:\prima.cpp\prompts\prompt_64.txt" -Rpc "10.39.52.114:50052" -Galaxy2FfnSpLayers 1 -CollectiveTileTokens 256 -TimeoutSec 300
+
+It writes \`galaxy-sp-results/rs-fused-*/timing.csv\`,
+\`parity-sp.json\`, \`parity-galaxy2.json\` and \`manifest.json\`, plus
+all full first-token logits. The A/B numerical checks use max_abs=0 and
+RMSE=0: exact equality is expected because fused input reads change
+only data movement, not the reduction arithmetic.
+
+To check the actual read/write call counts instead of clean Prefill
+performance, run the same sweep with \`-Profile\`.
+Its \`rpc_call_counts.csv\` summarizes total backend read/write calls
+for RS and the number of RS operations that actually used fused reads.
+These counts include BOTH backend ranks and may include initialization
+and repeated graph execution; they are not unique TCP packets.
+Do not compare Profile-on time against Profile-off time.
