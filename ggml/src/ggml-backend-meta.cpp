@@ -2991,7 +2991,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
             const bool selected = std::strncmp(node->name, "ffn_up-", 7) == 0 ||
                     std::strncmp(node->name, "ffn_gate-", 9) == 0 ||
-                    std::strncmp(node->name, "ffn_gate_par-", 13) == 0;
+                    std::strncmp(node->name, "ffn_swiglu-", 11) == 0;
             if (!selected) {
                 continue;
             }
