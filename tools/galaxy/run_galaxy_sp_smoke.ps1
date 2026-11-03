@@ -67,6 +67,9 @@ try {
     $mode = if ($PureTP) { "tp" } elseif ($Galaxy2) { "galaxy2" } else { "sp" }
     $dir = Join-Path $OutputDir "$mode-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    # Every artifact path should be absolute. Powershell's current location
+    # and the .NET process working directory are not necessarily the same.
+    $dir = (Resolve-Path -LiteralPath $dir).Path
     $env:LLAMA_GALAXY_PROFILE_DIR = if ($Profile) {
         $profileDir = Join-Path (Resolve-Path -LiteralPath $dir).Path "profile"
         New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
