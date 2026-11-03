@@ -112,7 +112,7 @@ def main():
             states[(layer, stage)] = (a, b)
             rows.append({"layer": layer, "stage": stage, **metrics(a, b, args.hidden, weights)})
         if args.ffn_ops:
-            for op in ("ffn_up", "ffn_gate", "ffn_gate_par"):
+            for op in ("ffn_up", "ffn_gate", "ffn_swiglu"):
                 op_path = f"ffn_ops/{op}-{layer}.f32"
                 a, b = (read_snapshot(run / op_path) for run in (args.reference, args.candidate))
                 rows.append({"layer": layer, "stage": op,
