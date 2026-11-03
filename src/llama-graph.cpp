@@ -1,6 +1,7 @@
 #include "llama-graph.h"
 
 #include "llama-impl.h"
+#include "llama-galaxy-tp.h"
 #include "llama-model.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
@@ -1599,8 +1600,15 @@ ggml_tensor * llm_graph_context::build_ffn(
     GGML_ASSERT(!gate_s || !gate || gate->type != GGML_TYPE_NVFP4 || !has_lora(gate));
     GGML_ASSERT(!down_s || !down || down->type != GGML_TYPE_NVFP4 || !has_lora(down));
 
+    const bool galaxy_ffn_op_dump = arch == LLM_ARCH_LLAMA && cur->ne[1] > 1 &&
+            llama_galaxy_tp::dump_ffn_op_enabled(il) &&
+            type_gate == LLM_FFN_PAR && type_op == LLM_FFN_SILU;
+
     ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;
     cb(tmp, "ffn_up", il);
+    if (galaxy_ffn_op_dump) {
+        ggml_set_output(tmp);
+    }
 
     if (up_b) {
         tmp = ggml_add(ctx0, tmp, up_b);
@@ -1624,6 +1632,9 @@ ggml_tensor * llm_graph_context::build_ffn(
                     cur = build_lora_mm(gate, cur);
                     cb(cur, "ffn_gate", il);
                 } break;
+        }
+        if (galaxy_ffn_op_dump) {
+            ggml_set_output(cur);
         }
 
         if (gate_b) {
@@ -1726,6 +1737,9 @@ ggml_tensor * llm_graph_context::build_ffn(
     if (gate && type_gate == LLM_FFN_PAR) {
         cur = ggml_mul(ctx0, cur, tmp);
         cb(cur, "ffn_gate_par", il);
+        if (galaxy_ffn_op_dump) {
+            ggml_set_output(cur);
+        }
     }
 
     if (down) {
