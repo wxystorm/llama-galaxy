@@ -123,6 +123,34 @@ void run_device_test(const devices_t & devices) {
     const measurement m=shadow(devices,fx.r);
     test(m.rmse<=fx.r.max_rmse,"native dual-rank attention parity");
     test(m.first_token_rmse<1e-8,"token0 V identity");
+    // Replacement mode must independently return the native TP-head
+    // output, without running the original TP Flash as a reference.
+    request without_ref=fx.r;
+    without_ref.reference.bytes={nullptr,nullptr};
+    without_ref.reference.heads={0,0};
+    std::array<std::vector<uint8_t>,2> produced;
+    const measurement replaced=replace(devices,without_ref,produced);
+    test(replaced.first_token_rmse<0.005,"replacement token0 causal invariant");
+    test(std::isnan(replaced.rmse),"replacement has no fake reference RMSE");
+    double sum_sq=0; uint64_t count=0;
+    for(int rank=0;rank<2;++rank) {
+        test(produced[rank].size()==fx.reference[rank].size(),"replacement TP size");
+        for(size_t off=0;off<produced[rank].size();off+=sizeof(float)) {
+            float got=0,exp=0;
+            std::memcpy(&got,produced[rank].data()+off,sizeof(float));
+            std::memcpy(&exp,fx.reference[rank].data()+off,sizeof(float));
+            const double delta=double(got)-double(exp);
+            sum_sq+=delta*delta;
+            count++;
+        }
+    }
+    const double rmse=std::sqrt(sum_sq/double(count));
+    test(rmse<0.001,"replacement output differs from synthetic reference");
+    std::cout << "[GALAXY_CAUSAL_REPLACE_TEST] tokens=" << fx.r.tokens
+              << " tp_heads=6+6"
+              << " rmse_against_independent_reference=" << rmse
+              << " original_flash_executed=0"
+              << " output_shards=2 status=PASS\n";
     std::cout << "[GALAXY_CAUSAL_LIVE_TEST] tokens=" << fx.r.tokens
               << " tp_heads=6+6 kv_heads=2+2"
               << " rmse=" << m.rmse << " max_abs=" << m.max_abs
