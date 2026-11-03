@@ -12,3 +12,9 @@ endif()
 # Full-vocabulary numerical comparison: standalone C++17 executable.
 add_executable(galaxy-logits-compare galaxy-logits-compare.cpp)
 target_compile_features(galaxy-logits-compare PRIVATE cxx_std_17)
+
+# Model-independent reference contract for the upstream Galaxy-LM BERT
+# configuration modes: TP, Galaxy, Galaxy2, full SP and mixed variants.
+add_executable(galaxy-source-plan-selftest galaxy-source-plan-selftest.cpp)
+target_include_directories(galaxy-source-plan-selftest PRIVATE ${CMAKE_SOURCE_DIR}/ggml/include)
+target_compile_features(galaxy-source-plan-selftest PRIVATE cxx_std_17)
