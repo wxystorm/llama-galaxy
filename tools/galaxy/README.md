@@ -1323,3 +1323,45 @@ Interpretation:
 
 Stop before enabling production SP-Attention until this boundary is
 understood and the reference Attention is trustworthy.
+
+
+## Post raw-Flash pinning: cross-run QKV capture stability
+
+With `fattn_raw` pinned, a Llama-3.2 3B TP diagnostic run again
+passed inference, and the new raw Attention and reshaped output are
+**exactly identical** (`301056/301056`). Also, the prior exact
+12-head duplication of `kqv_out` disappeared: the two halves now
+differ (RMSE=0.0211013231; zero exact elements).
+
+However the newly captured `Vcur` two 4-head halves are almost
+identical (RMSE=0.0263049762, cosine=0.999928845) whereas the previous
+run had RMSE=0.729279249, cosine=-0.0361658005. Since the main
+change was adding the raw Attention diagnostic output pin, a
+lifetime/aliasing or snapshot-timing problem is plausible. This is
+**not** evidence to change GQA, RoPE or the production Attention mask.
+
+Before another remote inference, compare the *existing* full probes:
+
+```powershell
+git pull --ff-only origin feat/galaxy-baseline
+
+$old = "E:\llama\llama-galaxy\galaxy-sp-results\real-qkv-replay\tp-20261103-190442\real-qkv\tokens-98"
+$new = "E:\llama\llama-galaxy\galaxy-sp-results\raw-attn-boundary\tp-20261103-204930\real-qkv\tokens-98"
+
+python .\tools\galaxy\galaxy-real-qkv-sanity.py `
+    --probe-dir $new --compare-probe-dir $old `
+    --layer 0 --tokens 98 --heads 24 --kv-heads 8 --head-dim 128 |
+    Select-String "GALAXY_QKV_CROSS_RUN|grouped_GQA|interleaved_GQA|tensor=Vcur|tensor=kqv_out"
+```
+
+This prints old-vs-new RMSE/MaxAbs/Cosine and exact element counts for
+Qcur, Kcur, Vcur and kqv_out (whole graph, token 0, each head half).
+If Q/K are bitwise identical but V/Attention are not, it narrows the
+problem to the data captured after Q/K projection and validates the
+hypothesis that diagnostic pinning changes snapshot observability.
+It does not by itself identify a single invalid buffer lifetime.
+
+A later probe run now emits `[GALAXY_REAL_QKV_RANK]` with explicit
+`stderr` writes instead of verbosity-filtered INFO logs. Both
+`stderr.log` and `stdout.log` can be searched for older runs, but
+missing entries in an old log are not evidence of equal device hashes.
