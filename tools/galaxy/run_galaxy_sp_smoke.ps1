@@ -221,7 +221,7 @@ try {
         $latest = $tokenRuns[0].FullName
         if ($ProbeQkvLayers -ne "all") {
             foreach ($layer in $ProbeQkvLayers.Split(",")) {
-                foreach ($stage in @("Qcur", "Kcur", "Vcur", "kqv_out")) {
+                foreach ($stage in @("Qcur", "Kcur", "Vcur", "fattn_raw", "kqv_out")) {
                     $snap = Join-Path $latest "$stage-$layer.f32"
                     if (-not (Test-Path -LiteralPath $snap) -or
                             (Get-Item -LiteralPath $snap).Length -le 8) {
