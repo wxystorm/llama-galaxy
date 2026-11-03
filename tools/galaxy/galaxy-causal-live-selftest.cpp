@@ -123,7 +123,7 @@ void run_device_test(const devices_t & devices) {
               << " cosine=" << m.cosine
               << " tp_sp_ms=" << m.head_to_token_ms
               << " kv_gather_ms=" << m.kv_gather_ms
-              << " native_phase_ms=" << m.native_phase_ms
+              << " native_ready_wall_ms=" << m.native_ready_wall_ms
               << " sp_tp_ms=" << m.token_to_head_ms
               << " status=PASS\n";
 }
