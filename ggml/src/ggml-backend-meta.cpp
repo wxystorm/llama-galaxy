@@ -7,6 +7,7 @@
 #include "ggml-rpc.h"
 #include "ggml-backend-galaxy-collectives.h"
 #include "ggml-backend-galaxy-causal-live.h"
+#include "ggml-backend-galaxy-causal-layers.h"
 #include "ggml-backend-galaxy-profile.h"
 #include "ggml-backend-galaxy-markers.h"
 
@@ -2146,34 +2147,26 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // finishes is unsafe even when diagnostic OUTPUT flags are present.
     const char * qkv_probe_dir = std::getenv("LLAMA_GALAXY_QKV_PROBE_DIR");
     const bool qkv_probe_enabled = qkv_probe_dir != nullptr && qkv_probe_dir[0] != '\0';
-    const char * live_layer_raw = std::getenv("LLAMA_GALAXY_CAUSAL_LIVE_LAYER");
-    const bool live_shadow_requested = live_layer_raw != nullptr && live_layer_raw[0] != '\0';
-    const char * live_mode_raw=std::getenv("LLAMA_GALAXY_CAUSAL_LIVE_MODE");
-    const std::string live_mode=live_mode_raw && live_mode_raw[0] ?
+    const auto live_plan = ggml_galaxy_causal_layers::from_environment();
+    if (!live_plan.valid()) {
+        std::fprintf(stderr,
+                "[GALAXY_CAUSAL_LIVE] phase=CONFIG status=FAIL reason=%s\n",
+                live_plan.error.c_str());
+        return GGML_STATUS_FAILED;
+    }
+    const bool live_shadow_requested = !live_plan.layers.empty();
+    const char * live_mode_raw = std::getenv("LLAMA_GALAXY_CAUSAL_LIVE_MODE");
+    const std::string live_mode = live_mode_raw && live_mode_raw[0] ?
             std::string(live_mode_raw) : "SHADOW";
     if ((live_shadow_requested && live_mode != "SHADOW" && live_mode != "REPLACE") ||
             (!live_shadow_requested && live_mode_raw && live_mode_raw[0])) {
         GGML_LOG_ERROR("[GALAXY_CAUSAL_LIVE] invalid mode/selector combination\n");
         return GGML_STATUS_FAILED;
     }
-    const bool live_replace_requested=live_shadow_requested && live_mode=="REPLACE";
-    // Fail closed on an invalid selector rather than silently letting the
-    // model run without producing a live correctness witness.
-    int live_shadow_layer = -1;
-    if (live_shadow_requested) {
-        const std::string selector(live_layer_raw);
-        if (selector.size() > 3 || selector.empty() ||
-                !std::all_of(selector.begin(),selector.end(),
-                             [](char ch) { return ch >= '0' && ch <= '9'; })) {
-            GGML_LOG_ERROR("[GALAXY_CAUSAL_LIVE] invalid LLAMA_GALAXY_CAUSAL_LIVE_LAYER\n");
-            return GGML_STATUS_FAILED;
-        }
-        live_shadow_layer = std::stoi(selector);
-        if (live_shadow_layer != 0) {
-            GGML_LOG_ERROR("[GALAXY_CAUSAL_LIVE] phase=v1 only layer 0 is supported\n");
-            return GGML_STATUS_FAILED;
-        }
-    }
+    const bool live_replace_requested = live_shadow_requested && live_mode == "REPLACE";
+    const auto selected_layer = [&](const char * name, const char * stem) -> int {
+        return live_plan.match_boundary(name,stem);
+    };
     const bool qkv_capture_enabled = qkv_probe_enabled || live_shadow_requested;
     const auto is_qkv_probe_node = [qkv_capture_enabled](const ggml_tensor * node) -> bool {
         if (!qkv_capture_enabled || node == nullptr ||
@@ -2190,20 +2183,25 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // Per invocation only. Once captured, the independent host copy
     // survives subsequent backend buffer reuse and next-layer execution.
     std::map<const ggml_tensor *, std::vector<std::vector<uint8_t>>> qkv_live_snapshots;
-    // Rank-local pre-W_o shards produced by native SP Attention. Kept
-    // until the next kqv_out boundary confirms the reshape consumes the
-    // exact injected bytes, before W_o is allowed to execute.
-    std::array<std::vector<uint8_t>,2> live_replaced_shards;
-    bool live_replaced_pending=false;
-    bool live_replaced_verified=false;
+    // Each selected layer owns a separate injection lifecycle. Never allow
+    // an unfinished Layer N raw Flash output to be consumed/acknowledged
+    // by Layer M's kqv_out, even when the two have the same byte extent.
+    struct live_layer_state {
+        std::array<std::vector<uint8_t>,2> tp_heads;
+        bool pending = false;
+        bool verified = false;
+        int64_t tokens = 0;
+    };
+    std::map<int,live_layer_state> live_states;
+    std::set<int> live_shadow_verified;
 
     // Name alone is not identity: projection, reshape and RoPE can all
     // share "Qcur-0". Restrict selection to the actual OUTPUT node that
     // was captured when its producing subgraph completed. Q/K must be
     // post-RoPE, V must be the final rank-sharded 3D tensor.
-    const auto find_live_stage = [&](const char * stage,
+    const auto find_live_stage = [&](int layer, const char * stage,
                                       bool must_be_rope) -> const ggml_tensor * {
-        const std::string expected=std::string(stage)+"-"+std::to_string(live_shadow_layer);
+        const std::string expected=std::string(stage)+"-"+std::to_string(layer);
         const ggml_tensor * match=nullptr;
         int named=0,eligible=0;
         for(int id=0;id<cgraph->n_nodes;++id) {
@@ -2228,11 +2226,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return match;
     };
 
-    const auto build_live_request = [&](const ggml_tensor * reference)
+    const auto build_live_request = [&](int layer, const ggml_tensor * reference)
             -> ggml_galaxy_causal_live::request {
-        const ggml_tensor * q=find_live_stage("Qcur",true);
-        const ggml_tensor * k=find_live_stage("Kcur",true);
-        const ggml_tensor * v=find_live_stage("Vcur",false);
+        const ggml_tensor * q=find_live_stage(layer,"Qcur",true);
+        const ggml_tensor * k=find_live_stage(layer,"Kcur",true);
+        const ggml_tensor * v=find_live_stage(layer,"Vcur",false);
         const int64_t dim=q->ne[0],tokens=q->ne[2];
         if(q->ne[3]!=1 || dim<=0 || tokens<8 || tokens>512 ||
                 k->ne[0]!=dim || v->ne[0]!=dim ||
@@ -2284,7 +2282,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         if(reference) work.reference=take(reference,false,"kqv_out");
         work.tokens=tokens;
         work.head_dim=dim;
-        work.layer=live_shadow_layer;
+        work.layer=layer;
         work.tile_tokens=ggml_galaxy_collectives::configured_tile_tokens();
         work.max_rmse=0.001;
         return work;
