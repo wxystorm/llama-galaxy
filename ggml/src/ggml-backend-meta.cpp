@@ -3738,17 +3738,52 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             std::fflush(stderr);
         }
     }
-    if (live_replace_requested && live_replaced_pending) {
-        GGML_LOG_ERROR("[GALAXY_CAUSAL_REPLACE] output was not consumed by kqv_out\n");
-        return GGML_STATUS_FAILED;
-    }
-    if (live_replaced_verified) {
-        std::fprintf(stderr,
-                "[GALAXY_CAUSAL_REPLACE_SUM] layer=%d"
-                " tp_flash_skipped=1 pre_wo_input=SP"
-                " tp_head_restore=BYTE_EXACT"
-                " mode=REPLACE status=PASS\n",live_shadow_layer);
-        std::fflush(stderr);
+    // Graph-invocation-wide prefix contract. 2-token warmup graphs may
+    // legitimately complete zero selected layers; the 98-token Prefill
+    // must complete ALL selected layers, in order, within the same graph.
+    // The PowerShell smoke script independently requires the full prefix
+    // witness, so a silent skipped layer can never pass.
+    if (live_shadow_requested) {
+        size_t completed=0;
+        for(const int layer:live_plan.layers) {
+            const auto found=live_states.find(layer);
+            const bool pending=found!=live_states.end() && found->second.pending;
+            if(pending) {
+                GGML_LOG_ERROR("[GALAXY_CAUSAL_PREFIX_SUM] layer=%d has unconsumed Flash output status=FAIL\n",
+                        layer);
+                return GGML_STATUS_FAILED;
+            }
+            const bool verified=live_replace_requested ?
+                    (found!=live_states.end() && found->second.verified) :
+                    live_shadow_verified.count(layer)!=0;
+            if(!verified) continue;
+            ++completed;
+            if(live_replace_requested) {
+                std::fprintf(stderr,
+                        "[GALAXY_CAUSAL_REPLACE_SUM] layer=%d"
+                        " tp_flash_skipped=1 pre_wo_input=SP"
+                        " tp_head_restore=BYTE_EXACT"
+                        " mode=REPLACE status=PASS\n",layer);
+            }
+        }
+        if(completed>0 && completed!=live_plan.layers.size()) {
+            std::fprintf(stderr,
+                    "[GALAXY_CAUSAL_PREFIX_SUM] mode=%s layers=%s"
+                    " completed=%zu expected=%zu status=FAIL"
+                    " reason=PARTIAL_PREFIX\n",
+                    live_mode.c_str(),live_plan.description().c_str(),
+                    completed,live_plan.layers.size());
+            return GGML_STATUS_FAILED;
+        }
+        if(completed==live_plan.layers.size()) {
+            std::fprintf(stderr,
+                    "[GALAXY_CAUSAL_PREFIX_SUM] mode=%s layers=%s"
+                    " completed=%zu expected=%zu"
+                    " all_layers_verified=1 status=PASS\n",
+                    live_mode.c_str(),live_plan.description().c_str(),
+                    completed,live_plan.layers.size());
+        }
+        if(completed>0) std::fflush(stderr);
     }
     if (has_galaxy_markers) {
         // A required correctness witness, not a verbose debug message.
