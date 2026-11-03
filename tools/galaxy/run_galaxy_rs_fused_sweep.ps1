@@ -18,6 +18,8 @@ param(
     [string]$HeadSplit = "20,20",
     [string]$FfnSplit = "8704,8704",
     [string]$Galaxy2FfnSpLayers = "1",
+    [string]$SeqWeights = "1,1",
+    [switch]$FinalLayerSP,
     [int]$CollectiveTileTokens = 256,
     [switch]$Profile,
     [int]$TimeoutSec = 300,
@@ -56,6 +58,8 @@ $opts = @{
     HeadSplit = $HeadSplit
     FfnSplit = $FfnSplit
     Galaxy2FfnSpLayers = $Galaxy2FfnSpLayers
+    SeqWeights = $SeqWeights
+    FinalLayerSP = $FinalLayerSP
     OutputDir = $root
     CollectiveTileTokens = $CollectiveTileTokens
     Profile = $Profile
@@ -206,6 +210,8 @@ $manifest = @{
     head_split = $HeadSplit
     ffn_split = $FfnSplit
     galaxy2_sp_ffn_layers = $Galaxy2FfnSpLayers
+    seq_weights = $SeqWeights
+    final_layer_sp = [bool]$FinalLayerSP
     collective_tile_tokens = $CollectiveTileTokens
     profile_forced_sync = [bool]$Profile
     resumed_from = if ($ResumeDir) { $root } else { $null }
