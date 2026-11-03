@@ -1042,3 +1042,72 @@ global key visibility, (4) gather/shard residuals and FFN transitions,
 and (5) verify first-token logits and chunked-prefill/decode
 continuations. Inference paths must reject unsupported combinations
 rather than silently pretending that source BERT-SP is already active.
+
+
+## Backend-stage causal SP Attention on actual PC+Phone buffers (not model graph)
+
+The standalone mathematical reference has now been extended to a **real
+ggml-backend host-staged execution primitive**. This is the second stage of
+the SP-Attention port, not a replacement for Qwen3/Llama inference.
+
+Files:
+
+- `ggml/src/ggml-backend-galaxy-causal-runtime.h`:
+  `gather_kv_with_history()` and `host_staged_attention()`.
+- `tools/galaxy/galaxy-causal-backend-selftest.cpp`:
+  CPU+CPU and optional CUDA+RPC end-to-end checks.
+
+Contract and actual data movement:
+
+1. Rank 0 and rank 1 each own contiguous, already-RoPE-rotated Query,
+   new Key and new Value tokens. Each rank's Q projection includes all
+   Query heads; K/V include all KV heads. This requires full projected
+   weights and **is not** compatible with the existing head-sharded TP
+   Attention outputs without changing their weight layout.
+2. A canonical historical K/V prefix lives on rank 0 as contiguous
+   logical positions (when the prefix length is nonzero). The primitive
+   stages that prefix, and each rank's new K and V, to *both* backends.
+   The full logical K/V `[n_kv_heads*head_dim, cached+new_tokens]`
+   must match byte-for-byte on each device.
+3. For each destination rank, it reads that rank's local Q and full
+   K/V back to the PC host, applies grouped-query causal attention
+   using **absolute query positions** and a stable F64-accumulation
+   softmax, then writes only that rank's local output back to its
+   backend. Inputs can be F32 or F16.
+4. The independent golden reference uses an unsharded causal mask and
+   checks each output element, both K/V buffers, asymmetric splits,
+   nonzero history, GQA, F16/F32 and invalid alias/shape settings.
+
+This is intentionally a *slow correctness bridge*: K/V history is
+retransmitted on every call, and Q/K/V are read back for host softmax.
+It does not implement device-local fused kernels, real llama.cpp
+paged KV slots, multi-sequence batching, asynchronous overlap or
+fast cache replication. One-token decode remains TP.
+
+First test locally, with no RPC server:
+
+```powershell
+git pull --ff-only origin feat/galaxy-baseline
+cmake --build build-galaxy --config Release --target galaxy-causal-backend-selftest -j 8
+.\build-galaxy\bin\Release\galaxy-causal-backend-selftest.exe
+```
+
+Then run the same test with the real PC+Phone backend:
+
+```powershell
+.\build-galaxy\bin\Release\galaxy-causal-backend-selftest.exe `
+    --pc CUDA0 --rpc 10.39.52.114:50052
+```
+
+Expected final line: `GALAXY_CAUSAL_BACKEND_SELFTEST PASS mode=PC_RPC`.
+The test runs a few *small deterministic tensors*, not an entire
+Llama-3.2 model; it does not require a GGUF or recompiled Phone RPC
+server. The companion mathematical reference
+`galaxy-causal-attention-selftest` is still independent and should
+also pass.
+
+Next integration gate: before enabling SP Attention in Qwen3/Llama,
+the Meta graph must support mirrored full Q/K/V projection weights,
+rank-local Q/K/V sequence inputs, global absolute positions and
+mask rows, and validated KV-cache physical-to-logical ownership.
+Until then the existing TP/Galaxy/Galaxy2 graph is unchanged.
