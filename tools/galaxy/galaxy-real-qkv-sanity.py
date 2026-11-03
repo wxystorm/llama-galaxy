@@ -58,6 +58,8 @@ def as_row(data, index, width):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--probe-dir", type=Path, required=True)
+    p.add_argument("--compare-probe-dir", type=Path,
+                   help="optional earlier GLG1 probe for detecting snapshot lifetime changes")
     p.add_argument("--layer", type=int, default=0)
     p.add_argument("--tokens", type=int, default=98)
     p.add_argument("--heads", type=int, default=24)
@@ -78,6 +80,41 @@ def main():
                         ("Vcur", kvwidth), ("kqv_out", qwidth)]:
         snapshots[name] = load(args.probe_dir / f"{name}-{args.layer}.f32",
                                args.tokens * width)
+
+    if args.compare_probe_dir:
+        # Compare two independently captured runs *without recomputation*.
+        # In these investigations only diagnostic graph-output pinning
+        # changed. Identical Q/K and changed V/Attention is strong evidence
+        # that an end-of-graph snapshot should not be assumed stable.
+        for name, width in (("Qcur", qwidth), ("Kcur", kvwidth),
+                            ("Vcur", kvwidth), ("kqv_out", qwidth)):
+            earlier = load(args.compare_probe_dir / f"{name}-{args.layer}.f32",
+                           args.tokens * width)
+            current = snapshots[name]
+            rmse, max_abs, cosine = metrics(earlier, current)
+            exact = sum(x == y for x, y in zip(earlier, current))
+            print(f"[GALAXY_QKV_CROSS_RUN] tensor={name} scope=all "
+                  f"rmse={rmse:.9g} max_abs={max_abs:.9g} "
+                  f"cosine={cosine:.9g} exact={exact}/{len(current)}")
+            a, b = earlier[:width], current[:width]
+            tr, tm, tc = metrics(a, b)
+            te = sum(x == y for x, y in zip(a, b))
+            print(f"[GALAXY_QKV_CROSS_RUN] tensor={name} scope=token0 "
+                  f"rmse={tr:.9g} max_abs={tm:.9g} "
+                  f"cosine={tc:.9g} exact={te}/{width}")
+            if width % 2 == 0:
+                for rank in (0, 1):
+                    ra, rb = [], []
+                    half = width // 2
+                    for token in range(args.tokens):
+                        first = token * width + rank * half
+                        ra.extend(earlier[first:first + half])
+                        rb.extend(current[first:first + half])
+                    rr, rm, rc = metrics(ra, rb)
+                    re = sum(x == y for x, y in zip(ra, rb))
+                    print(f"[GALAXY_QKV_CROSS_RUN] tensor={name} scope=rank{rank} "
+                          f"rmse={rr:.9g} max_abs={rm:.9g} "
+                          f"cosine={rc:.9g} exact={re}/{len(ra)}")
 
     # An exceptionally specific symptom: the best KV-head sequence and
     # best RMSE repeat in h=0..11 and h=12..23. Test whether exported
