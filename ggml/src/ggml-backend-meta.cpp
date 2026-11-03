@@ -2754,9 +2754,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 : size_t(cgraph->n_nodes);
         GGML_ASSERT(i_stop > i_start);
         ggml_tensor * original_last = cgraph->nodes[i_stop - 1];
-        const bool is_replace_raw_boundary = live_replace_requested &&
-                std::strcmp(original_last->name,
-                        ("fattn_raw-"+std::to_string(live_shadow_layer)).c_str())==0 &&
+        const int raw_layer = live_replace_requested ?
+                selected_layer(original_last->name,"fattn_raw") : -1;
+        const bool is_replace_raw_boundary = raw_layer >= 0 &&
                 original_last->ne[2]>=8;
         if (is_replace_raw_boundary) {
             const auto split=ggml_backend_meta_get_split_state(original_last,false);
@@ -2769,9 +2769,21 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 GGML_LOG_ERROR("[GALAXY_CAUSAL_REPLACE] raw Flash boundary contract failed\n");
                 return GGML_STATUS_FAILED;
             }
-            if (live_replaced_pending) {
-                GGML_LOG_ERROR("[GALAXY_CAUSAL_REPLACE] previous output not consumed\n");
+            auto & state=live_states[raw_layer];
+            if (state.pending || state.verified) {
+                GGML_LOG_ERROR("[GALAXY_CAUSAL_REPLACE] layer=%d duplicate or unconsumed Flash output\n",raw_layer);
                 return GGML_STATUS_FAILED;
+            }
+            // Prefill layers are visited in ascending order. A later
+            // layer must not begin before every preceding selected layer
+            // proved its SP->TP kqv_out consumption.
+            for(const int preceding:live_plan.layers) {
+                if(preceding>=raw_layer) break;
+                if(!live_states[preceding].verified) {
+                    GGML_LOG_ERROR("[GALAXY_CAUSAL_REPLACE] layer=%d previous layer %d not verified\n",
+                            raw_layer,preceding);
+                    return GGML_STATUS_FAILED;
+                }
             }
         }
         std::vector<double> dispatch_ms(n_backends, 0);
@@ -2824,11 +2836,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 without_flash.uid=0;
                 run_graph=&without_flash;
                 std::fprintf(stderr,
-                        "[GALAXY_CAUSAL_REPLACE_DISPATCH] rank=%zu"
+                        "[GALAXY_CAUSAL_REPLACE_DISPATCH] layer=%d rank=%zu"
                         " subgraph=%zu nodes_total=%d nodes_run=%d"
                         " skipped_node=%s skipped_op=%s"
                         " tp_flash_skipped=1 status=PASS\n",
-                        j,i,simple_graph->n_nodes,without_flash.n_nodes,
+                        raw_layer,j,i,simple_graph->n_nodes,without_flash.n_nodes,
                         original_last->name,ggml_op_name(source_last->op));
                 std::fflush(stderr);
             }
@@ -2876,7 +2888,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         // predecessor nodes have already been dispatched normally.
         if (is_replace_raw_boundary) {
             try {
-                const auto work=build_live_request(nullptr);
+                const auto work=build_live_request(raw_layer,nullptr);
                 if (work.tokens!=original_last->ne[2] ||
                         work.head_dim!=original_last->ne[0] ||
                         work.q.heads[0]+work.q.heads[1]!=original_last->ne[1]) {
@@ -2918,8 +2930,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                                 "native SP raw Flash destination readback mismatch");
                     }
                 }
-                live_replaced_shards=std::move(outputs);
-                live_replaced_pending=true;
+                auto & state=live_states.at(raw_layer);
+                state.tp_heads=std::move(outputs);
+                state.pending=true;
+                state.tokens=work.tokens;
                 std::fprintf(stderr,
                         "[GALAXY_CAUSAL_LIVE] layer=%d tokens=%" PRId64
                         " mode=REPLACE tp_heads=%" PRId64 "+%" PRId64
@@ -2931,7 +2945,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         " injected_into=FATTN_RAW"
                         " reference=SEPARATE_BASELINE_REQUIRED"
                         " status=INJECTED\n",
-                        live_shadow_layer,work.tokens,
+                        raw_layer,work.tokens,
                         work.q.heads[0],work.q.heads[1],
                         work.k.heads[0],work.k.heads[1],
                         measured.first_token_rmse,
@@ -2942,7 +2956,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 std::fprintf(stderr,
                         "[GALAXY_CAUSAL_LIVE] layer=%d mode=REPLACE"
                         " status=FAIL reason=%s\n",
-                        live_shadow_layer,e.what());
+                        raw_layer,e.what());
                 std::fflush(stderr);
                 return GGML_STATUS_FAILED;
             }
