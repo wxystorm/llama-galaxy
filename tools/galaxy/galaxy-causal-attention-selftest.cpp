@@ -96,7 +96,8 @@ static sample make_sample(layout shape) {
 
 static std::vector<float> attention_one(const sample & data,
                                         int64_t new_query, int64_t query_head,
-                                        bool causal = true) {
+                                        bool causal = true,
+                                        bool use_sp_contract = false) {
     const layout & shape = data.shape;
     const int64_t query_pos = shape.cached_tokens + new_query;
     const int64_t kv_head = ggml_galaxy_causal::kv_head_for_query(shape, query_head);
@@ -106,7 +107,10 @@ static std::vector<float> attention_one(const sample & data,
                                -std::numeric_limits<double>::infinity());
     double max_score = -std::numeric_limits<double>::infinity();
     for (int64_t key = 0; key < n_kv; ++key) {
-        if (causal && key > query_pos) {
+        const bool permitted = !causal || (use_sp_contract
+                ? ggml_galaxy_causal::visible(shape, query_pos, key)
+                : key <= query_pos);
+        if (!permitted) {
             continue;
         }
         double dot = 0.0;
@@ -182,7 +186,7 @@ static std::vector<float> sequence_parallel(const sample & data) {
             const int64_t pos = ggml_galaxy_causal::absolute_query_position(s, rank, local);
             const int64_t t = pos - s.cached_tokens;
             for (int64_t h = 0; h < s.query_heads; ++h) {
-                const auto result = attention_one(gathered, t, h);
+                const auto result = attention_one(gathered, t, h, true, true);
                 for (int64_t d = 0; d < s.head_dim; ++d) {
                     out[index(t,h,d,s.query_heads,s.head_dim)] = result[static_cast<size_t>(d)];
                 }
