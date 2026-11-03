@@ -173,6 +173,18 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                 cb(Qcur, "Qcur_normed", il);
                 cb(Kcur, "Kcur_normed", il);
             }
+            // Opt-in real-GGUF bridge: preserve the actual post-RoPE
+            // Q/K and projected V before the existing cache/Attention path.
+            // Llama with Q/K RMSNorm changes the source node naming and is
+            // not yet supported by this diagnostic (Llama-3.2-3B has none).
+            if (!embed && n_tokens > 1 && llama_galaxy_tp::qkv_probe_enabled(il)) {
+                if (hparams.use_kq_norm) {
+                    throw std::invalid_argument("Galaxy QKV probe requires Llama without Q/K RMSNorm");
+                }
+                ggml_set_output(Qcur);
+                ggml_set_output(Kcur);
+                ggml_set_output(Vcur);
+            }
             //计算self-attention的输出
             cur = build_attn(inp_attn,
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
