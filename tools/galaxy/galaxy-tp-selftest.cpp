@@ -33,6 +33,11 @@ int main() {
     must_throw([] { validate_counts({16, 24}, 40, 5, "heads"); });
     must_throw([] { validate_counts({20, 20}, 41, 5, "heads"); });
     must_throw([] { validate_counts({8704, 8704}, 17408, 1024, "ffn"); });
+    // The original Qwen3 last-token shortcut is retained unless final-layer
+    // SP was explicitly requested, so these eligible counts differ by one.
+    require_test(llama_galaxy_tp::galaxy2_eligible_ffn_layers(40, false) == 39, "last TP");
+    require_test(llama_galaxy_tp::galaxy2_eligible_ffn_layers(40, true) == 40, "full Galaxy2");
+    must_throw([] { (void) llama_galaxy_tp::galaxy2_eligible_ffn_layers(0, true); });
     // Galaxy2 full mode and limited-memory hybrid share the same parser.
     require_test(llama_galaxy_tp::galaxy2_parse_ffn_layers(nullptr, 39) == 39, "galaxy2 all");
     require_test(llama_galaxy_tp::galaxy2_parse_ffn_layers("all", 39) == 39, "galaxy2 all2");

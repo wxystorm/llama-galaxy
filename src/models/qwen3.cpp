@@ -59,6 +59,7 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
     // Keep the final layer pure TP because it may select a single output
     // token via inp_out_ids; decode (n_tokens == 1) stays entirely pure TP.
     const bool galaxy_sp = llama_galaxy_tp::sp_enabled() && n_tokens > 1;
+    const bool galaxy_sp_final = galaxy_sp && llama_galaxy_tp::sp_include_final_layer();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
     GGML_ASSERT(n_embd_head == n_rot);
@@ -118,7 +119,7 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
         }
-        const bool galaxy_sp_layer = galaxy_sp && il + 1 < n_layer;
+        const bool galaxy_sp_layer = galaxy_sp && (il + 1 < n_layer || galaxy_sp_final);
         const bool galaxy2_ffn_sp = galaxy_sp_layer &&
                 llama_galaxy_tp::galaxy2_ffn_is_sp(il, n_layer);
         if (galaxy_sp_layer) {
@@ -128,7 +129,9 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
             ggml_galaxy::mark_transition(cur, ggml_galaxy::sp_transition::reduce_scatter);
             ggml_format_name(cur, "GALAXY_RS_ATT_%d", il);
         }
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_layer - 1 && inp_out_ids && !galaxy_sp_final) {
+            // The default last-layer optimization reduces FFN to selected
+            // output tokens; full Galaxy SP instead defers it to CON2 AG.
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -194,6 +197,12 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
         inpL = cur;
     }
     cur = inpL;
+    if (galaxy_sp_final && inp_out_ids) {
+        // Full Galaxy/Galaxy2 prefill: restore mirrored sequence first, then
+        // select output logits. This matches source CON2->AG semantics.
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        cb(cur, "galaxy_final_out_ids", -1);
+    }
 
     cur = build_norm(cur,
             model.output_norm, NULL,

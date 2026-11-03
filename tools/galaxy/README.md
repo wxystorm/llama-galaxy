@@ -611,3 +611,33 @@ Galaxy-LM defines that path for encoder-only BERT, but Qwen3's causal
 KV-cache model needs separate masking, position and cache-ownership
 handling. Until implemented, the Qwen3 modes remain TP, Galaxy,
 Galaxy2 (full or per-layer-capped).
+
+
+## Full last-layer SP (source CON2 AllGather semantics)
+
+By default Qwen3 retains llama.cpp's last-layer optimization:
+\`inp_out_ids\` selects only output tokens *before* the final FFN.
+This means the last layer remains TP even when Galaxy2FfnSpLayers=all.
+For a source-aligned, full-layer Galaxy/Galaxy2 prefill, use
+\`-FinalLayerSP\` in the smoke runner
+(\`LLAMA_GALAXY_SP_FINAL_LAYER=1\`).
+
+This keeps the last layer's Attention/CON/FFN processing on the full
+multi-token sequence, performs the final CON2 AllGather, then applies
+\`inp_out_ids\` to the now-mirrored output. **It changes performance
+characteristics:** the final layer computes all input tokens rather
+than only the output token. Single-token decode remains pure TP.
+
+Expected single-graph Qwen3-14B operation counts:
+- Galaxy with FinalLayerSP: RS 80, AG 80, Residual Scatter 40
+- Galaxy2 with FinalLayerSP and N=1: RS 79, AG 79, scatter 40
+- Galaxy2 with FinalLayerSP and N=all: RS 40, AG 40, scatter 40
+
+The last configuration mirrors all 40 FFN weight sets and is likely
+out-of-memory on the user's 14B hardware; test with a smaller GGUF
+first. Existing 39-eligible-layer experiments are unchanged unless
+the switch is explicitly enabled.
+
+Example:
+
+    .\tools\galaxy\run_galaxy_sp_smoke.ps1 -Model "E:\llama\models\Qwen3-0.6B-Q4_K_M.gguf" -Rpc "10.39.52.114:50052" -PromptFile "D:\prima.cpp\prompts\prompt_64.txt" -Galaxy2 -Galaxy2FfnSpLayers all -FinalLayerSP -SeqWeights "20,12" -TimeoutSec 300

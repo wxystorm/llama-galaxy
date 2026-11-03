@@ -40,6 +40,22 @@ inline bool galaxy2_enabled() {
     return value != nullptr && std::string(value) == "1";
 }
 
+// Default OFF: legacy optimization selects only the last token before
+// the final FFN. Source Galaxy-LM restores its full sequence after CON2;
+// enabling this keeps the final layer in SP and postpones output selection
+// until after the last AllGather. Qwen3 decoding (one token) stays TP.
+inline bool sp_include_final_layer() {
+    const char * value = std::getenv("LLAMA_GALAXY_SP_FINAL_LAYER");
+    return value != nullptr && std::string(value) == "1";
+}
+
+inline int64_t galaxy2_eligible_ffn_layers(int64_t n_layers, bool include_final) {
+    if (n_layers < 1) {
+        throw std::invalid_argument("Galaxy2 requires a positive layer count");
+    }
+    return n_layers - (include_final ? 0 : 1);
+}
+
 inline int64_t galaxy2_parse_ffn_layers(const char * raw, int64_t eligible) {
     if (eligible < 0) {
         throw std::invalid_argument("Galaxy2 requires a positive layer count");
@@ -71,10 +87,8 @@ inline int64_t galaxy2_ffn_sp_count(int64_t n_layers) {
     if (!galaxy2_enabled()) {
         return 0;
     }
-    if (n_layers < 1) {
-        throw std::invalid_argument("Galaxy2 requires a positive layer count");
-    }
-    return galaxy2_parse_ffn_layers(std::getenv("LLAMA_GALAXY2_FFN_SP_LAYERS"), n_layers - 1);
+    return galaxy2_parse_ffn_layers(std::getenv("LLAMA_GALAXY2_FFN_SP_LAYERS"),
+            galaxy2_eligible_ffn_layers(n_layers, sp_include_final_layer()));
 }
 
 inline bool galaxy2_ffn_is_sp(int64_t il, int64_t n_layers) {
