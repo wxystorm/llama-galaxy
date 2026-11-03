@@ -1563,3 +1563,93 @@ either (a) a TP-head -> SP-token activation/layout exchange (and reverse
 exchange for W_o), or (b) full QKV/W_o weight mirroring plus SP inputs
 and KV cache ownership. A successful standalone Flash replay alone
 does not choose between these two architectures.
+
+
+## TP HEAD -> SP TOKEN -> native Flash -> TP HEAD (bridge v1)
+
+The first fully explicit two-way activation-layout bridge is now in the
+standalone Galaxy runtime, without altering the production Meta graph.
+The pure header ggml/src/ggml-backend-galaxy-layout.h contains:
+
+- head_to_token: each TP rank provides its **local complete heads for ALL
+  tokens**; after tiled cross-rank exchange each SP rank receives **ALL
+  heads for its local tokens**.
+- token_to_head: after native SP Flash computes full-head results for
+  local tokens, each TP rank receives only its assigned attention heads
+  for **ALL tokens**, which is the layout expected by the existing
+  TP-head-sharded output projection W_o.
+- F16/F32 (no numerical conversions), 2D and contiguous 3D layouts,
+  uneven token/head ownership, explicit overflow/shape/alias checks and
+  no RPC-unsupported memset. Implemented with host staging as a
+  correctness bridge, NOT yet a direct GPU-to-phone transport.
+- Profiling tags HEAD_TO_TOKEN and TOKEN_TO_HEAD work with existing
+  Galaxy profiling. The default path remains unaffected.
+
+A separate galaxy-layout-selftest checks byte-exact round trips for
+2D/3D, F32/F16, 1-token tiles, uneven splits and the 24-head,
+98-token Llama scenario. It rejects incorrect shapes and zero tiles.
+
+When galaxy-causal-native-flash-replay is invoked with
+--bridge-tp-sp 1, it loads the **same validated** GLG1 Q/K/V values,
+re-packs them into per-rank TP head-owned backend tensors (this INPUT
+packing is still a diagnostic emulation of the GGUF projection, not
+real integration with model graph), then:
+
+    CUDA0 TP Q heads 0..11                 Phone TP Q heads 12..23
+    CUDA0 TP K/V heads 0..3                Phone TP K/V heads 4..7
+                 |                                     |
+                 +------------ HEAD_TO_TOKEN ----------+
+                 |                                     |
+       PC local Token Q/K/V 0..48          Phone local Token Q/K/V 49..97
+                 |                                     |
+                 +-------------- KV AG ----------------+
+                 |                                     |
+        Native CUDA FLASH_ATTN_EXT          Native RPC FLASH_ATTN_EXT
+                 |                                     |
+                 +------------ TOKEN_TO_HEAD ----------+
+                 |                                     |
+      PC full Tokens, heads 0..11          Phone full Tokens, heads 12..23
+
+Each of the three forward transfers Q/K/V is checked **byte for byte**
+against original GLG1; the reverse transfer is checked **byte for byte**
+against the *calculated* SP Flash outputs. Output numerical parity
+against the model's original TP Attention is still measured separately.
+
+### Build and test on Windows
+
+    git pull --ff-only origin feat/galaxy-baseline
+    cmake --build build-galaxy --config Release --target galaxy-layout-selftest galaxy-causal-native-flash-replay -j 8
+
+CPU unit tests (no Phone connection required):
+
+    .\build-galaxy\bin\Release\galaxy-layout-selftest.exe
+
+Real CUDA+Phone device tests:
+
+    .\build-galaxy\bin\Release\galaxy-layout-selftest.exe --pc CUDA0 --rpc 10.39.52.114:50052
+
+Replay the **already exported** 98-token Layer 0 model QKV:
+
+    $probe = "E:\llama\llama-galaxy\galaxy-sp-results\qkv-producer-capture\tp-20261103-210405\real-qkv\tokens-98"
+    .\build-galaxy\bin\Release\galaxy-causal-native-flash-replay.exe --probe-dir $probe --layer 0 --tokens 98 --heads 24 --kv-heads 8 --head-dim 128 --rank0 49 --pc CUDA0 --rpc 10.39.52.114:50052 --bridge-tp-sp 1 --tp-heads-rank0 12 --require-rmse 0.001
+
+Expected markers, once tested on your actual devices:
+
+- GALAXY_LAYOUT_SELFTEST PASS mode=PC_RPC
+- [GALAXY_TP_SP] ... forward=BYTE_EXACT status=PASS
+- [GALAXY_CAUSAL_NATIVE_GATHER] ... status=PASS
+- [GALAXY_CAUSAL_NATIVE] ... parity=THRESHOLD_CHECKED
+- [GALAXY_SP_TP] ... reverse=BYTE_EXACT status=PASS
+- GALAXY_CAUSAL_NATIVE_FLASH_REPLAY PASS kernel_executed=1 production_graph_enabled=0
+
+The optional --tp-heads-rank0 must be a multiple of the number of
+Query heads per KV head (3 for 24Q/8KV), so each device owns complete
+GQA groups. Its default with --bridge-tp-sp 1 is an approximately
+even partition of KV heads. The SP Token split remains controlled
+independently by --rank0.
+
+The bridge is not yet connected to the model's existing device-local
+Q/K/V projection nodes, actual KV-cache slots or Wo/FFN. It instead
+validates their exact *activation layouts* on both real backends while
+keeping production TP inference unchanged. Integration requires
+Meta split propagation and per-layer lifetime/ownership contracts.
