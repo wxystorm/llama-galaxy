@@ -177,7 +177,9 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
             // Q/K and projected V before the existing cache/Attention path.
             // Llama with Q/K RMSNorm changes the source node naming and is
             // not yet supported by this diagnostic (Llama-3.2-3B has none).
-            if (!embed && n_tokens > 1 && llama_galaxy_tp::qkv_probe_enabled(il)) {
+            if (!embed && n_tokens > 1 &&
+                    (llama_galaxy_tp::qkv_probe_enabled(il) ||
+                     llama_galaxy_tp::causal_live_shadow_enabled(il))) {
                 if (hparams.use_kq_norm) {
                     throw std::invalid_argument("Galaxy QKV probe requires Llama without Q/K RMSNorm");
                 }
