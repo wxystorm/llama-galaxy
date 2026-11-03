@@ -93,7 +93,7 @@ inline void validate_shards(const head_shards & s, int64_t tokens, int64_t dim,
     }
 }
 
-inline void validate(const request & r) {
+inline void validate(const request & r, bool reference_required = true) {
     require(r.layer >= 0 && r.tokens >= 8 && r.tokens <= 512 &&
             (r.head_dim == 64 || r.head_dim == 128),
             "first-prefill CUDA/Phone live shadow supports 8..512 tokens and head_dim=64 or 128 (CUDA Flash does not support 16)");
@@ -104,13 +104,17 @@ inline void validate(const request & r) {
     validate_shards(r.q,r.tokens,r.head_dim,"Q");
     validate_shards(r.k,r.tokens,r.head_dim,"K");
     validate_shards(r.v,r.tokens,r.head_dim,"V");
-    validate_shards(r.reference,r.tokens,r.head_dim,"pre-Wo Attention");
+    if (reference_required) {
+        validate_shards(r.reference,r.tokens,r.head_dim,"pre-Wo Attention");
+    }
     const int64_t q=total_heads(r.q),kv=total_heads(r.k);
-    require(kv == total_heads(r.v) && q == total_heads(r.reference),
+    require(kv == total_heads(r.v) &&
+            (!reference_required || q == total_heads(r.reference)),
             "head counts disagree across Q/K/V/Attention");
     require(q%kv == 0 && r.q.heads[0]% (q/kv) == 0 &&
             r.q.heads[0]/(q/kv) == r.k.heads[0] &&
-            r.k.heads == r.v.heads && r.q.heads == r.reference.heads,
+            r.k.heads == r.v.heads &&
+            (!reference_required || r.q.heads == r.reference.heads),
             "TP splits must be aligned to complete GQA groups");
     require(q*r.head_dim <= INT32_MAX/r.tokens &&
             kv*r.head_dim <= INT32_MAX/r.tokens,
@@ -272,13 +276,21 @@ inline double first_token_error(const request & r) {
     return std::sqrt(sum_sq/double(count));
 }
 
-inline measurement shadow(const devices_t & devices, const request & r) {
-    validate(r);
+// In replacement mode, caller supplies no original Attention reference,
+ // and receives independent F32 copies of the reconstructed TP head shards.
+ // The model's real Flash kernel must be skipped at its producer boundary;
+ // this routine never modifies model tensors itself.
+inline measurement run_native(const devices_t & devices, const request & r,
+                              std::array<std::vector<uint8_t>,2> * replace_tp) {
+    const bool reference_required = replace_tp == nullptr;
+    validate(r, reference_required);
     require(devices[0] && devices[1],"two native backend handles required");
     measurement m;
-    m.first_token_rmse=first_token_error(r);
-    require(m.first_token_rmse <= 0.005,
-            "not a supported fresh causal first prefill (token0 != V0)");
+    if (reference_required) {
+        m.first_token_rmse=first_token_error(r);
+        require(m.first_token_rmse <= 0.005,
+                "not a supported fresh causal first prefill (token0 != V0)");
+    }
 
     native_rank pc(devices[0],r,0);
     native_rank phone(devices[1],r,1);
@@ -334,40 +346,79 @@ inline measurement shadow(const devices_t & devices, const request & r) {
     m.token_to_head_ms=ms(start);
 
     double norm_ref=0,norm_out=0,dot=0,sq=0;
-    uint64_t seen=0;
+    double first_sq=0;
+    uint64_t seen=0, first_seen=0;
     const int64_t q_heads=total_heads(r.q);
+    const int64_t kv_total=total_heads(r.k);
+    const int64_t group=q_heads/kv_total;
     for (int rank=0;rank<2;++rank) {
         ggml_backend_synchronize(devices[rank]);
         std::vector<uint8_t> actual(ggml_nbytes(ranks[rank]->tp_output));
         ggml_backend_tensor_get(ranks[rank]->tp_output,actual.data(),0,actual.size());
-        const auto & expected=*r.reference.bytes[rank];
+        const std::vector<uint8_t> * expected =
+                reference_required ? r.reference.bytes[rank] : nullptr;
+        const auto & original_v=*r.v.bytes[rank];
         for (int64_t t=0;t<r.tokens;++t) {
             for (int64_t f=0;f<r.q.heads[rank]*r.head_dim;++f) {
                 const size_t ix=static_cast<size_t>(t*r.q.heads[rank]*r.head_dim+f);
-                const double ref=read_f32(expected,ix);
                 const double val=read_f32(actual,ix);
                 require(std::isfinite(val),"non-finite native Flash result");
-                const double delta=ref-val;
-                sq+=delta*delta;
-                dot+=ref*val;
-                norm_ref+=ref*ref;
-                norm_out+=val*val;
-                if (std::abs(delta)>m.max_abs) {
-                    m.max_abs=std::abs(delta);
-                    m.worst_token=t;
-                    m.worst_channel=(rank==0?0:r.q.heads[0]*r.head_dim)+f;
+                if (t==0) {
+                    const size_t k_index=static_cast<size_t>((f/r.head_dim/group)*r.head_dim+
+                                                              (f%r.head_dim));
+                    const double delta=val-read_f32(original_v,k_index);
+                    first_sq+=delta*delta;
+                    first_seen++;
+                }
+                if (reference_required) {
+                    const double ref=read_f32(*expected,ix);
+                    const double delta=ref-val;
+                    sq+=delta*delta;
+                    dot+=ref*val;
+                    norm_ref+=ref*ref;
+                    norm_out+=val*val;
+                    if (std::abs(delta)>m.max_abs) {
+                        m.max_abs=std::abs(delta);
+                        m.worst_token=t;
+                        m.worst_channel=(rank==0?0:r.q.heads[0]*r.head_dim)+f;
+                    }
                 }
                 seen++;
             }
         }
+        if (replace_tp != nullptr) {
+            (*replace_tp)[rank]=std::move(actual);
+        }
     }
-    require(seen==static_cast<uint64_t>(r.tokens*q_heads*r.head_dim),
+    require(seen==static_cast<uint64_t>(r.tokens*q_heads*r.head_dim) &&
+            first_seen==static_cast<uint64_t>(q_heads*r.head_dim),
             "incomplete native Flash output");
-    m.rmse=std::sqrt(sq/double(seen));
-    m.cosine=dot/std::sqrt(norm_ref*norm_out);
-    require(m.rmse<=r.max_rmse,
-            "native Flash vs production Attention RMSE exceeds requested threshold");
+    const double native_token0_rmse=std::sqrt(first_sq/double(first_seen));
+    require(native_token0_rmse<=0.005,
+            "native Flash output token0 does not match first V token");
+    if (reference_required) {
+        m.rmse=std::sqrt(sq/double(seen));
+        m.cosine=dot/std::sqrt(norm_ref*norm_out);
+        require(m.rmse<=r.max_rmse,
+                "native Flash vs production Attention RMSE exceeds requested threshold");
+    } else {
+        m.first_token_rmse=native_token0_rmse;
+        // No original Attention was run in REPLACE; this is NOT a
+        // whole-sequence numerical parity measurement. Compare separately
+        // against a baseline logits/activations run after integration.
+        m.rmse=std::numeric_limits<double>::quiet_NaN();
+        m.cosine=std::numeric_limits<double>::quiet_NaN();
+    }
     return m;
+}
+
+inline measurement shadow(const devices_t & devices, const request & r) {
+    return run_native(devices,r,nullptr);
+}
+
+inline measurement replace(const devices_t & devices, const request & r,
+                           std::array<std::vector<uint8_t>,2> & tp_heads) {
+    return run_native(devices,r,&tp_heads);
 }
 
 } // namespace ggml_galaxy_causal_live
