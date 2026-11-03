@@ -2439,6 +2439,16 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
+        // A real-model probe must distinguish the actual per-rank
+        // FLASH_ATTN_EXT result from the following 2D reshape/view.
+        // The 4D tensor is [head_dim, n_heads, n_tokens, n_stream].
+        // Only the explicitly selected dense-Llama prefill layer is pinned.
+        if (arch == LLM_ARCH_LLAMA && n_tokens > 1 &&
+                llama_galaxy_tp::qkv_probe_enabled(il)) {
+            cb(cur, "fattn_raw", il);
+            ggml_set_output(cur);
+        }
+
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
 
