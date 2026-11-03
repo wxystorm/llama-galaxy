@@ -2966,6 +2966,124 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         std::fflush(stderr);
     }
+    // Opt-in FFN Up/Gate/activated-output snapshots. The TP outputs are
+    // sharded along feature axis 0, while the Galaxy2 FFN SP outputs are
+    // sharded along token axis 1. Reconstruct the same logical matrix
+    // [feature, token] before writing the GLG1/F32 binary snapshot.
+    const char * ffn_op_dir = std::getenv("LLAMA_GALAXY_FFN_OP_DUMP_DIR");
+    if (ffn_op_dir != nullptr && ffn_op_dir[0] != '\0') {
+        if (n_backends != 2) {
+            GGML_LOG_ERROR("[GALAXY_FFN_OP_DUMP] requires exactly 2 backends\n");
+            return GGML_STATUS_FAILED;
+        }
+        const std::filesystem::path folder(ffn_op_dir);
+        std::error_code directory_error;
+        std::filesystem::create_directories(folder, directory_error);
+        if (directory_error) {
+            GGML_LOG_ERROR("[GALAXY_FFN_OP_DUMP] cannot create directory: %s\n", ffn_op_dir);
+            return GGML_STATUS_FAILED;
+        }
+        for (int node_id = 0; node_id < cgraph->n_nodes; ++node_id) {
+            const ggml_tensor * node = cgraph->nodes[node_id];
+            if (node == nullptr || (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 ||
+                    !ggml_backend_buffer_is_meta(node->buffer)) {
+                continue;
+            }
+            const bool selected = std::strncmp(node->name, "ffn_up-", 7) == 0 ||
+                    std::strncmp(node->name, "ffn_gate-", 9) == 0 ||
+                    std::strncmp(node->name, "ffn_gate_par-", 13) == 0;
+            if (!selected) {
+                continue;
+            }
+            if ((node->type != GGML_TYPE_F16 && node->type != GGML_TYPE_F32) ||
+                    !ggml_is_contiguous(node) || node->ne[0] <= 0 || node->ne[1] <= 0 ||
+                    node->ne[2] != 1 || node->ne[3] != 1 ||
+                    ggml_nelements(node) > std::numeric_limits<int32_t>::max()) {
+                GGML_LOG_ERROR("[GALAXY_FFN_OP_DUMP] name=%s invalid_type_or_shape\n", node->name);
+                return GGML_STATUS_FAILED;
+            }
+            const auto state = ggml_backend_meta_get_split_state(node, false);
+            if (state.axis != GGML_BACKEND_SPLIT_AXIS_0 &&
+                    state.axis != GGML_BACKEND_SPLIT_AXIS_1) {
+                GGML_LOG_ERROR("[GALAXY_FFN_OP_DUMP] name=%s unexpected_layout=%s\n",
+                        node->name, ggml_backend_meta_split_axis_name(state.axis));
+                return GGML_STATUS_FAILED;
+            }
+            const size_t features = static_cast<size_t>(node->ne[0]);
+            const size_t tokens = static_cast<size_t>(node->ne[1]);
+            std::vector<float> values(features * tokens);
+            size_t consumed = 0;
+            for (int rank = 0; rank < 2; ++rank) {
+                const ggml_tensor * source = ggml_backend_meta_buffer_simple_tensor(node, rank);
+                if (source == nullptr || source->buffer == nullptr ||
+                        source->type != node->type || !ggml_is_contiguous(source) ||
+                        source->ne[0] <= 0 || source->ne[1] <= 0 ||
+                        source->ne[2] != 1 || source->ne[3] != 1) {
+                    GGML_LOG_ERROR("[GALAXY_FFN_OP_DUMP] name=%s rank=%d invalid_source\n",
+                            node->name, rank);
+                    return GGML_STATUS_FAILED;
+                }
+                const size_t src_features = static_cast<size_t>(source->ne[0]);
+                const size_t src_tokens = static_cast<size_t>(source->ne[1]);
+                const bool feature_shard = state.axis == GGML_BACKEND_SPLIT_AXIS_0;
+                const bool shape_ok = feature_shard
+                        ? src_tokens == tokens && src_features <= features - consumed
+                        : src_features == features && src_tokens <= tokens - consumed;
+                const size_t item_bytes = node->type == GGML_TYPE_F32 ? sizeof(float) : sizeof(ggml_fp16_t);
+                if (!shape_ok || ggml_nbytes(source) != src_features * src_tokens * item_bytes) {
+                    GGML_LOG_ERROR("[GALAXY_FFN_OP_DUMP] name=%s rank=%d invalid_rank_shape\n",
+                            node->name, rank);
+                    return GGML_STATUS_FAILED;
+                }
+                ggml_backend_synchronize(backend_ctx->backend_configs[rank].backend);
+                std::vector<uint8_t> raw(ggml_nbytes(source));
+                ggml_backend_tensor_get(source, raw.data(), 0, raw.size());
+                const auto read_float = [&](size_t index) -> float {
+                    if (node->type == GGML_TYPE_F32) {
+                        float value;
+                        std::memcpy(&value, raw.data() + index*sizeof(float), sizeof(value));
+                        return value;
+                    }
+                    ggml_fp16_t half;
+                    std::memcpy(&half, raw.data() + index*sizeof(ggml_fp16_t), sizeof(half));
+                    return ggml_fp16_to_fp32(half);
+                };
+                for (size_t t = 0; t < src_tokens; ++t) {
+                    for (size_t f = 0; f < src_features; ++f) {
+                        const size_t dst_t = feature_shard ? t : consumed + t;
+                        const size_t dst_f = feature_shard ? consumed + f : f;
+                        values[dst_t*features + dst_f] = read_float(t*src_features + f);
+                    }
+                }
+                consumed += feature_shard ? src_features : src_tokens;
+            }
+            if (consumed != (state.axis == GGML_BACKEND_SPLIT_AXIS_0 ? features : tokens)) {
+                GGML_LOG_ERROR("[GALAXY_FFN_OP_DUMP] name=%s incomplete_shards=%zu\n",
+                        node->name, consumed);
+                return GGML_STATUS_FAILED;
+            }
+            const std::filesystem::path filepath = folder / (std::string(node->name) + ".f32");
+            std::ofstream out(filepath, std::ios::binary | std::ios::trunc);
+            if (!out) {
+                GGML_LOG_ERROR("[GALAXY_FFN_OP_DUMP] name=%s open_failed\n", node->name);
+                return GGML_STATUS_FAILED;
+            }
+            const int32_t count = static_cast<int32_t>(values.size());
+            out.write("GLG1", 4);
+            out.write(reinterpret_cast<const char *>(&count), sizeof(count));
+            out.write(reinterpret_cast<const char *>(values.data()), values.size()*sizeof(float));
+            out.flush();
+            if (!out.good()) {
+                GGML_LOG_ERROR("[GALAXY_FFN_OP_DUMP] name=%s write_failed\n", node->name);
+                return GGML_STATUS_FAILED;
+            }
+            std::fprintf(stderr,
+                    "[GALAXY_FFN_OP_DUMP] name=%s layout=%s features=%zu tokens=%zu status=PASS\n",
+                    node->name, ggml_backend_meta_split_axis_name(state.axis),
+                    features, tokens);
+        }
+        std::fflush(stderr);
+    }
     if (has_galaxy_markers) {
         // A required correctness witness, not a verbose debug message.
         // The common CLI logger maps GGML_LOG_INFO to verbosity 4 (TRACE),
