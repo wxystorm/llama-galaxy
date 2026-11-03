@@ -4,6 +4,7 @@
 // cross-rank token exchange and result comparison without GGUF files.
 
 #include "../../ggml/src/ggml-backend-galaxy-causal-live.h"
+#include "ggml-backend-galaxy-causal-layers.h"
 #include "ggml-backend.h"
 
 #if defined(GALAXY_CAUSAL_LIVE_HAVE_RPC)
@@ -88,6 +89,36 @@ struct fixtures {
 };
 
 void contract_tests() {
+    using ggml_galaxy_causal_layers::parse;
+    const auto empty=parse(nullptr,nullptr);
+    test(empty.valid() && empty.layers.empty() && !empty.requested,
+         "causal prefix disabled by default");
+    const auto legacy=parse("0",nullptr);
+    test(legacy.valid() && legacy.description()=="0" &&
+         legacy.contains(0) && !legacy.contains(1),
+         "legacy layer0 selection preserved");
+    const auto one=parse(nullptr,"1");
+    const auto two=parse(nullptr,"2");
+    const auto four=parse(nullptr,"4");
+    test(one.valid() && one.description()=="0" &&
+         two.valid() && two.description()=="0,1" &&
+         four.valid() && four.description()=="0,1,2,3",
+         "causal 1/2/4 prefix layer order");
+    test(two.match_boundary("fattn_raw-1","fattn_raw")==1 &&
+         two.match_boundary("kqv_out-0","kqv_out")==0 &&
+         two.match_boundary("kqv_out-2","kqv_out")==-1 &&
+         two.match_boundary("kqv_out-10","kqv_out")==-1 &&
+         four.contains(3) && !four.contains(4),
+         "exact per-layer native boundaries");
+    for(const char * invalid:{"0","3","5","all","0,1","-1"}) {
+        test(!parse(nullptr,invalid).valid(),"invalid or sparse prefix accepted");
+    }
+    test(!parse("1",nullptr).valid() &&
+         !parse("0","2").valid(),
+         "legacy invalid layer or conflicting mode accepted");
+    std::cout << "[GALAXY_CAUSAL_PREFIX_TEST] prefixes=1,2,4"
+              << " legacy=0 fail_closed=1 status=PASS\n";
+
     fixtures fx;
     validate(fx.r);
     test(first_token_error(fx.r)==0.0,"token-zero causal identity");
