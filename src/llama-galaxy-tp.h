@@ -248,6 +248,13 @@ inline bool dump_ffn_op_enabled(int64_t il) {
     return layer_selection_contains(std::getenv("LLAMA_GALAXY_FFN_OP_DUMP"), il);
 }
 
+ // Opt-in: reconstruct actual model Q, K, V and pre-output-projection
+ // Attention results. This is a diagnostic bridge to the independent causal
+ // SP backend, NOT a switch to SP inference. Never active unless requested.
+inline bool qkv_probe_enabled(int64_t il) {
+    return layer_selection_contains(std::getenv("LLAMA_GALAXY_QKV_PROBE_LAYERS"), il);
+}
+
 inline std::vector<int64_t> parse_counts(const char * text, const char * key, size_t n_devices) {
     if (text == nullptr || text[0] == '\0') {
         throw std::invalid_argument(std::string(key) + " is required in Galaxy TP mode");
