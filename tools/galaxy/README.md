@@ -1722,7 +1722,7 @@ The user already used a 98-token Llama-3.2-3B prompt with
 The smoke script checks for the real witness rather than merely a
 successful inference exit:
 
-    [GALAXY_CAUSAL_LIVE] layer=0 tokens=98 mode=SHADOW tp_heads=12+12 kv_heads=4+4 first_token_rmse=... rmse=... max_abs=... cosine=... tp_sp_ms=... kv_gather_ms=... native_phase_ms=... sp_tp_ms=... threshold=0.001 production_output_unchanged=1 status=PASS
+    [GALAXY_CAUSAL_LIVE] layer=0 tokens=98 mode=SHADOW tp_heads=12+12 kv_heads=4+4 first_token_rmse=... rmse=... max_abs=... cosine=... tp_sp_ms=... kv_gather_ms=... native_ready_wall_ms=... sp_tp_ms=... threshold=0.001 production_output_unchanged=1 status=PASS
     [GALAXY_CAUSAL_LIVE] layer=0 mode=SHADOW reference=IN_FLIGHT result=CONFIRMED
 
 The 2-token warmup reports SKIP (not PASS). The script requires a
