@@ -85,6 +85,18 @@ int main() {
     require_test(llama_galaxy_tp::galaxy2_parse_layer_set("none", 0).empty(),
             "no eligible FFN layers allows none");
     must_throw([] { (void) llama_galaxy_tp::galaxy2_parse_layer_set("0", 0); });
+    const auto arbitrary = llama_galaxy_tp::galaxy2_resolve_ffn_sp_mask("0,2,5-7", nullptr, 27);
+    require_test(arbitrary.size() == 27 && arbitrary[0] && arbitrary[2] &&
+            arbitrary[5] && arbitrary[6] && arbitrary[7] && !arbitrary[1] &&
+            !arbitrary[3], "Galaxy2 resolve explicit layer set");
+    const auto legacy = llama_galaxy_tp::galaxy2_resolve_ffn_sp_mask(nullptr, "2", 27);
+    require_test(legacy.size() == 27 && legacy[0] && legacy[1] &&
+            !legacy[2], "Galaxy2 legacy leading two FFN layers");
+    const auto legacy_all = llama_galaxy_tp::galaxy2_resolve_ffn_sp_mask(nullptr, nullptr, 27);
+    require_test(legacy_all.size() == 27 && legacy_all[26],
+            "Galaxy2 legacy unset means all eligible");
+    must_throw([] { (void) llama_galaxy_tp::galaxy2_resolve_ffn_sp_mask("0", "1", 27); });
+    must_throw([] { (void) llama_galaxy_tp::galaxy2_resolve_ffn_sp_mask("27", nullptr, 27); });
     // Stage and final-layer snapshot selection share the exact same parser.
     require_test(llama_galaxy_tp::layer_selection_contains("0,1", 0), "stage selected 0");
     require_test(llama_galaxy_tp::layer_selection_contains("0,1", 1), "stage selected 1");
