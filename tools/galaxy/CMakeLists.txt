@@ -18,3 +18,9 @@ target_compile_features(galaxy-logits-compare PRIVATE cxx_std_17)
 add_executable(galaxy-source-plan-selftest galaxy-source-plan-selftest.cpp)
 target_include_directories(galaxy-source-plan-selftest PRIVATE ${CMAKE_SOURCE_DIR}/ggml/include)
 target_compile_features(galaxy-source-plan-selftest PRIVATE cxx_std_17)
+
+# Causal SP Attention reference: local Q, global gathered K/V, absolute
+# RoPE positions, GQA head mapping and a nonzero historical KV prefix.
+# This target does not activate the unfinished GPU/RPC SP Attention graph.
+add_executable(galaxy-causal-attention-selftest galaxy-causal-attention-selftest.cpp)
+target_compile_features(galaxy-causal-attention-selftest PRIVATE cxx_std_17)
