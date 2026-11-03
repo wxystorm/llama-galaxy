@@ -3084,6 +3084,134 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         std::fflush(stderr);
     }
+    // Opt-in real-GGUF Attention diagnostic. Reconstruct head-sharded Q/K/V
+    // after RoPE (3D [head_dim, heads, tokens]) and the pre-Wo kqv_out
+    // (2D [heads*head_dim, tokens]) as logical F32 [width, tokens].
+    // The production Attention and cache path are untouched. Each token
+    // count gets its own directory so warmup graphs cannot overwrite prefill.
+    const char * qkv_probe_dir = std::getenv("LLAMA_GALAXY_QKV_PROBE_DIR");
+    if (qkv_probe_dir != nullptr && qkv_probe_dir[0] != '\0') {
+        if (n_backends != 2) {
+            GGML_LOG_ERROR("[GALAXY_REAL_QKV] requires exactly 2 backends\n");
+            return GGML_STATUS_FAILED;
+        }
+        for (int node_id = 0; node_id < cgraph->n_nodes; ++node_id) {
+            const ggml_tensor * node = cgraph->nodes[node_id];
+            if (node == nullptr || (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 ||
+                    !ggml_backend_buffer_is_meta(node->buffer)) {
+                continue;
+            }
+            const bool is_q = std::strncmp(node->name, "Qcur-", 5) == 0;
+            const bool is_k = std::strncmp(node->name, "Kcur-", 5) == 0;
+            const bool is_v = std::strncmp(node->name, "Vcur-", 5) == 0;
+            const bool is_out = std::strncmp(node->name, "kqv_out-", 8) == 0;
+            if (!is_q && !is_k && !is_v && !is_out) {
+                continue;
+            }
+            const bool three_dimensional = !is_out;
+            const int64_t width = three_dimensional
+                    ? node->ne[0] * node->ne[1] : node->ne[0];
+            const int64_t tokens = three_dimensional ? node->ne[2] : node->ne[1];
+            if (tokens <= 1) {
+                continue; // prefill-only, do not dump decode or one-token graphs
+            }
+            if ((node->type != GGML_TYPE_F16 && node->type != GGML_TYPE_F32) ||
+                    !ggml_is_contiguous(node) || node->ne[0] <= 0 ||
+                    node->ne[1] <= 0 || node->ne[3] != 1 ||
+                    (three_dimensional ? node->ne[2] <= 0 : node->ne[2] != 1) ||
+                    width <= 0 || width > std::numeric_limits<int32_t>::max()/tokens ||
+                    ggml_nelements(node) != width*tokens) {
+                GGML_LOG_ERROR("[GALAXY_REAL_QKV] name=%s unsupported shape/type\n", node->name);
+                return GGML_STATUS_FAILED;
+            }
+            const auto split = ggml_backend_meta_get_split_state(node, false);
+            const auto expected_axis = three_dimensional
+                    ? GGML_BACKEND_SPLIT_AXIS_1 : GGML_BACKEND_SPLIT_AXIS_0;
+            if (split.axis != expected_axis) {
+                GGML_LOG_ERROR("[GALAXY_REAL_QKV] name=%s axis=%s expected=%s\n",
+                        node->name, ggml_backend_meta_split_axis_name(split.axis),
+                        ggml_backend_meta_split_axis_name(expected_axis));
+                return GGML_STATUS_FAILED;
+            }
+            const size_t bytes_per_item = node->type == GGML_TYPE_F32
+                    ? sizeof(float) : sizeof(ggml_fp16_t);
+            std::vector<float> values(static_cast<size_t>(width*tokens));
+            int64_t done_features = 0;
+            for (int rank = 0; rank < 2; ++rank) {
+                const ggml_tensor * local = ggml_backend_meta_buffer_simple_tensor(node, rank);
+                if (local == nullptr || local->buffer == nullptr ||
+                        local->type != node->type || !ggml_is_contiguous(local)) {
+                    GGML_LOG_ERROR("[GALAXY_REAL_QKV] name=%s rank=%d unavailable\n",
+                            node->name, rank);
+                    return GGML_STATUS_FAILED;
+                }
+                const int64_t local_width = three_dimensional
+                        ? local->ne[0]*local->ne[1] : local->ne[0];
+                const int64_t local_tokens = three_dimensional ? local->ne[2] : local->ne[1];
+                if (local_width <= 0 || local_tokens != tokens ||
+                        local_width > width - done_features ||
+                        (three_dimensional && local->ne[0] != node->ne[0]) ||
+                        local->ne[3] != 1 ||
+                        (!three_dimensional && local->ne[2] != 1) ||
+                        ggml_nbytes(local) != static_cast<size_t>(local_width*tokens)*bytes_per_item) {
+                    GGML_LOG_ERROR("[GALAXY_REAL_QKV] name=%s rank=%d invalid_shard\n",
+                            node->name, rank);
+                    return GGML_STATUS_FAILED;
+                }
+                ggml_backend_synchronize(backend_ctx->backend_configs[rank].backend);
+                std::vector<uint8_t> raw(ggml_nbytes(local));
+                ggml_backend_tensor_get(local, raw.data(), 0, raw.size());
+                for (int64_t t = 0; t < tokens; ++t) {
+                    for (int64_t f = 0; f < local_width; ++f) {
+                        const size_t src_index = static_cast<size_t>(t*local_width+f);
+                        float value = 0.0f;
+                        if (node->type == GGML_TYPE_F32) {
+                            std::memcpy(&value, raw.data()+src_index*sizeof(float), sizeof(value));
+                        } else {
+                            ggml_fp16_t half;
+                            std::memcpy(&half, raw.data()+src_index*sizeof(ggml_fp16_t), sizeof(half));
+                            value = ggml_fp16_to_fp32(half);
+                        }
+                        values[static_cast<size_t>(t*width+done_features+f)] = value;
+                    }
+                }
+                done_features += local_width;
+            }
+            if (done_features != width) {
+                GGML_LOG_ERROR("[GALAXY_REAL_QKV] name=%s incomplete_features=%" PRId64 "\n",
+                        node->name, done_features);
+                return GGML_STATUS_FAILED;
+            }
+            const std::filesystem::path folder = std::filesystem::path(qkv_probe_dir) /
+                    ("tokens-" + std::to_string(tokens));
+            std::error_code ec;
+            std::filesystem::create_directories(folder, ec);
+            if (ec) {
+                GGML_LOG_ERROR("[GALAXY_REAL_QKV] mkdir_failed=%s\n", folder.string().c_str());
+                return GGML_STATUS_FAILED;
+            }
+            const std::filesystem::path filepath = folder / (std::string(node->name)+".f32");
+            std::ofstream out(filepath, std::ios::binary | std::ios::trunc);
+            const int32_t count = static_cast<int32_t>(values.size());
+            if (!out) {
+                GGML_LOG_ERROR("[GALAXY_REAL_QKV] open_failed=%s\n", filepath.string().c_str());
+                return GGML_STATUS_FAILED;
+            }
+            out.write("GLG1", 4);
+            out.write(reinterpret_cast<const char *>(&count), sizeof(count));
+            out.write(reinterpret_cast<const char *>(values.data()), values.size()*sizeof(float));
+            out.flush();
+            if (!out.good()) {
+                GGML_LOG_ERROR("[GALAXY_REAL_QKV] write_failed=%s\n", filepath.string().c_str());
+                return GGML_STATUS_FAILED;
+            }
+            GGML_LOG_INFO("[GALAXY_REAL_QKV] name=%s width=%" PRId64 " tokens=%" PRId64
+                    " axis=%s dtype=%s rank_features=%" PRId64 " status=PASS\n",
+                    node->name, width, tokens,
+                    ggml_backend_meta_split_axis_name(split.axis),
+                    ggml_type_name(node->type), done_features);
+        }
+    }
     if (has_galaxy_markers) {
         // A required correctness witness, not a verbose debug message.
         // The common CLI logger maps GGML_LOG_INFO to verbosity 4 (TRACE),
