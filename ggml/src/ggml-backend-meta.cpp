@@ -2242,6 +2242,61 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             throw std::invalid_argument(
                     "unsupported live causal QKV/reference shape or token count");
         }
+        // A token count >= 8 is NOT sufficient proof of a fresh first
+        // Prefill. The native SP path deliberately sees only the current
+        // token interval, so reject continuation/chunked prefill here.
+        // The post-RoPE Q's src[1] is the actual model position tensor.
+        const ggml_tensor * rope_pos=q->src[1];
+        if(q->op!=GGML_OP_ROPE || !rope_pos ||
+                rope_pos->type!=GGML_TYPE_I32 ||
+                !ggml_is_contiguous(rope_pos) ||
+                ggml_nelements(rope_pos)!=tokens) {
+            throw std::invalid_argument(
+                    "cannot prove zero-based contiguous RoPE positions for first prefill");
+        }
+        const auto check_pos=[&](const ggml_tensor * t,int rank) {
+            if(!t || t->type!=GGML_TYPE_I32 ||
+                    !ggml_is_contiguous(t) ||
+                    ggml_nbytes(t)!=size_t(tokens)*sizeof(int32_t)) {
+                throw std::invalid_argument("unavailable first-prefill position buffer");
+            }
+            std::vector<int32_t> pos(static_cast<size_t>(tokens),-1);
+            if(t->buffer) {
+                if(ggml_backend_buffer_is_meta(t->buffer)) {
+                    throw std::invalid_argument("position backend view still points to Meta");
+                }
+                // Works for CPU input buffers and RPC/CUDA physical
+                // views; get_tensor imposes the appropriate read fence.
+                ggml_backend_synchronize(backend_ctx->backend_configs[rank].backend);
+                ggml_backend_tensor_get(t,pos.data(),0,ggml_nbytes(t));
+            } else if(t->data) {
+                std::memcpy(pos.data(),t->data,ggml_nbytes(t));
+            } else {
+                throw std::invalid_argument("first-prefill RoPE positions not readable");
+            }
+            for(int64_t i=0;i<tokens;++i) {
+                if(pos[static_cast<size_t>(i)]!=i) {
+                    throw std::invalid_argument(
+                            "historical KV or nonzero/noncontiguous positions are unsupported");
+                }
+            }
+        };
+        if(ggml_backend_buffer_is_meta(rope_pos->buffer)) {
+            for(int rank=0;rank<2;++rank) {
+                const ggml_tensor * local_pos=
+                        ggml_backend_meta_buffer_simple_tensor(rope_pos,rank);
+                check_pos(local_pos,rank);
+            }
+        } else {
+            check_pos(rope_pos,0);
+        }
+        std::fprintf(stderr,
+                "[GALAXY_CAUSAL_FRESH_PREFIX] layer=%d"
+                " tokens=%" PRId64 " positions=0..%" PRId64
+                " history=UNSUPPORTED status=PASS\n",
+                layer,tokens,tokens-1);
+        std::fflush(stderr);
+
         const auto take=[&](const ggml_tensor * t,bool headed,const char * label)
                 -> ggml_galaxy_causal_live::head_shards {
             ggml_galaxy_causal_live::head_shards h;
