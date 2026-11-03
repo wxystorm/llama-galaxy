@@ -1491,3 +1491,27 @@ SCOPE: this is a native-kernel stage, NOT the full transformer graph.
 Full GGUF QKV weight mirroring, rank-local QKV projection, absolute
 RoPE positions, dynamic cache ownership, output/FFN transitions,
 multi-sequence scheduling and decode remain unimplemented.
+
+### Native Flash replay: unsupported RPC memset fixed
+
+An initial CUDA0 + RPC0 native Flash replay aborted at
+`ggml-backend.cpp:409` with `memset_tensor != NULL`. The standalone
+test used `ggml_backend_tensor_memset` to initialize its 256-token
+padded K/V storage, but the Phone RPC buffer does not implement this
+optional backend interface. No native Attention comparison was
+completed by that run.
+
+The standalone replay now creates a host F16 zero buffer and uploads
+it with `ggml_backend_tensor_set` to **each** padded K/V storage.
+Both backends already support this generic tensor upload operation.
+The later real-K/V AllGather replaces the populated prefix; the
+masked padding stays zero. Staging buffers live until the backend
+synchronization fence completes.
+
+The program also logs `[GALAXY_CAUSAL_NATIVE_INIT]`,
+`[GALAXY_CAUSAL_NATIVE_GATHER]` and
+`[GALAXY_CAUSAL_NATIVE_DISPATCH]` to distinguish any later
+backend/Flash kernel error from initialization.
+
+Rebuild only the PC standalone target and rerun the identical command.
+No model rerun or Phone RPC rebuild is required.
