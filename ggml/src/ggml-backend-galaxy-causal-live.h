@@ -95,8 +95,8 @@ inline void validate_shards(const head_shards & s, int64_t tokens, int64_t dim,
 
 inline void validate(const request & r) {
     require(r.layer >= 0 && r.tokens >= 8 && r.tokens <= 512 &&
-            r.head_dim > 0 && r.head_dim <= 256,
-            "first-prefill live shadow supports 8..512 tokens, head_dim<=256");
+            (r.head_dim == 64 || r.head_dim == 128),
+            "first-prefill CUDA/Phone live shadow supports 8..512 tokens and head_dim=64 or 128 (CUDA Flash does not support 16)");
     require(r.tile_tokens > 0 && r.tile_tokens <= 1024,
             "collective tile must be 1..1024");
     require(std::isfinite(r.max_rmse) && r.max_rmse >= 0,
@@ -198,6 +198,11 @@ struct native_rank {
         v=ggml_permute(ctx,v,0,2,1,3);
         ggml_tensor * output=ggml_flash_attn_ext(
                 ctx,q,k,v,mask,1.0f/std::sqrt(float(r.head_dim)),0.0f,0.0f);
+        // CUDA's kernel dispatcher aborts on BEST_FATTN_KERNEL_NONE.
+        // Detect unsupported native FLASH_ATTN_EXT shapes early instead
+        // of killing the entire llama-cli or selftest process.
+        require(ggml_backend_dev_supports_op(ggml_backend_get_device(backend),output),
+                "native backend does not support requested FLASH_ATTN_EXT shape/head_dim");
         ggml_flash_attn_ext_set_prec(output,GGML_PREC_F32);
         sp_output=ggml_reshape_2d(ctx,output,qw,rank_queries);
         ggml_set_output(sp_output);
