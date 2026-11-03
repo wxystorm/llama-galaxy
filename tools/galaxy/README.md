@@ -979,3 +979,66 @@ The added tests cover noncontiguous sets, ranges, duplicates, bad
 syntax, out-of-range layers, final-layer eligibility, `all`/`none`,
 and compatibility with the original N-layer behavior.
 
+
+
+## Causal SP Attention correctness baseline (standalone; runtime not enabled)
+
+After verifying the noncontiguous Galaxy2 FFN schedule
+(`0,2,5-7`, full-prefill collectives 49/27/49 on Llama-3.2-3B),
+the next source-parity gap is *SP Attention* rather than FFN.
+
+The original Galaxy-LM SPBertAttention gathers full K and V for each
+rank's local Query shard. Directly copying that graph into Qwen3 or
+Llama causal inference would be incorrect: existing `build_attn`
+writes persistent KV-cache entries, then reads a cached K/V tensor
+with a causal mask and absolute RoPE positions. A BERT-style one-shot
+K/V gather omits cached history, and naive local Query offsets produce
+wrong rotary positions and future-key visibility.
+
+This stage therefore adds a **standalone, executable C++17 reference
+contract**, not a switch to a partially correct production graph:
+
+- `ggml/src/ggml-backend-galaxy-causal-plan.h`
+  defines rank0/rank1 local Query ownership, absolute Query positions
+  including the cached prefix, full logical K/V extent, causal
+  visibility and GQA Query-to-KV head mapping.
+- `tools/galaxy/galaxy-causal-attention-selftest.cpp`
+  compares full unsharded attention against local Query shards with
+  globally reconstructed K/V. Data uses deterministic per-head
+  values, **absolute-position RoPE** and a numerically stable softmax.
+  Cases include symmetric/asymmetric splits, nonzero historical cache
+  (13 and 31 tokens), GQA (24/8 and 16/8), ordinary MHA (8/8) and a
+  one-token decode fallback contract. The independent full-reference
+  mask is compared with the SP helper's global-position visibility.
+  A negative control detects accidental future-token access.
+- The first implementation is intentionally limited to a single
+  logical sequence with contiguous logical KV positions. Paged KV
+  slots, multiple packed sequences, sliding windows, speculative or
+  recurrent memory are **not** supported by this reference.
+
+Build and run on Windows without starting Phone RPC:
+
+```powershell
+git pull --ff-only origin feat/galaxy-baseline
+cmake --build build-galaxy --config Release --target galaxy-causal-attention-selftest -j 8
+.\build-galaxy\bin\Release\galaxy-causal-attention-selftest.exe
+```
+
+Expected final output: `GALAXY_CAUSAL_ATTENTION_SELFTEST PASS`,
+plus `[GALAXY_CAUSAL_SP_REFERENCE]` numerical comparisons.
+
+**Runtime scope:** The new contract is not yet called by the Qwen3
+or Llama computation graph, and does not modify existing TP, Galaxy,
+Galaxy2, FFN layer schedules, RPC collectives or Decode. Passing the
+standalone test is a prerequisite, not proof of correct distributed
+causal inference.
+
+For actual runtime SP Attention the remaining implementation is:
+(1) full-width Q/K/V weights and local sequence-sharded Q with the
+correct absolute position handling, (2) gather current K/V plus
+historical cached K/V or establish a validated replicated cache,
+(3) select the correct per-rank causal Mask rows without altering
+global key visibility, (4) gather/shard residuals and FFN transitions,
+and (5) verify first-token logits and chunked-prefill/decode
+continuations. Inference paths must reject unsupported combinations
+rather than silently pretending that source BERT-SP is already active.
