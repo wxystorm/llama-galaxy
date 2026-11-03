@@ -24,7 +24,29 @@ try {
         throw "Runner did not enforce a one-second timeout"
     }
 
-    Write-Host "GALAXY_PROCESS_SELFTEST PASS exit0=0 exit7=7 timeout=1"
+    # Regression: relative stdout/stderr must resolve against PowerShell's
+    # location, even when the .NET process CWD points somewhere else.
+    Push-Location -LiteralPath $dir
+    try {
+        $relOut = ".\relative\nested\test.stdout"
+        $relErr = ".\relative\nested\test.stderr"
+        $relative = Invoke-GalaxyProcess -Executable $cmdExe `
+            -ArgumentList @("/d", "/c", "echo GALAXY_RELATIVE_PATH_OK") `
+            -StdoutPath $relOut -StderrPath $relErr -TimeoutSec 10
+        $expectedOut = Join-Path $dir "relative\nested\test.stdout"
+        $expectedErr = Join-Path $dir "relative\nested\test.stderr"
+        if ($relative.TimedOut -or $relative.ExitCode -ne 0 -or
+                -not (Test-Path -LiteralPath $expectedOut) -or
+                -not (Test-Path -LiteralPath $expectedErr) -or
+                -not (Select-String -LiteralPath $expectedOut -SimpleMatch -Pattern "GALAXY_RELATIVE_PATH_OK" -Quiet)) {
+            throw "Runner did not resolve relative output paths against PowerShell current location"
+        }
+    }
+    finally {
+        Pop-Location
+    }
+
+    Write-Host "GALAXY_PROCESS_SELFTEST PASS exit0=0 exit7=7 timeout=1 relative_path=PASS"
 }
 finally {
     Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
