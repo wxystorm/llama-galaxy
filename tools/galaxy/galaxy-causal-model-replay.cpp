@@ -217,7 +217,7 @@ void run(const settings & c, const backend_pair & devices) {
               << " max_abs=" << first_token_identity.maximum
               << " cosine=" << first_token_identity.cosine()
               << " expectation=fresh_single_sequence_causal_prefill"
-              << " status=MEASURED\\n";
+              << " status=MEASURED\n";
 
     buffers rank0(devices[0],l,0);
     buffers rank1(devices[1],l,1);
@@ -264,7 +264,7 @@ void run(const settings & c, const backend_pair & devices) {
     if (entire.cosine() < 0.9) {
         std::cerr << "[GALAXY_REAL_REPLAY] WARNING numerical_reference_is_unrelated"
                   << " cosine=" << entire.cosine()
-                  << " action=inspect_first_token_v_identity_and_attention_mask\\n";
+                  << " action=inspect_first_token_v_identity_and_attention_mask\n";
     }
     std::cout << "[GALAXY_REAL_REPLAY] layer=" << c.layer
               << " tokens=" << c.tokens << " split=" << c.rank0 << ","
