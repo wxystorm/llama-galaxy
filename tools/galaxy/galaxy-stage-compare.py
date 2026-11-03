@@ -114,7 +114,7 @@ def main():
         rows.append({"layer": layer, "stage": "FFN_contribution",
                      **metrics(subtraction(out_a, in_a), subtraction(out_b, in_b),
                                args.hidden, weights)})
-        if (layer > 0 and (layer - 1, "l_out") in states:
+        if layer > 0 and (layer - 1, "l_out") in states:
             prev_a, prev_b = states[(layer - 1, "l_out")]
             rows.append({"layer": layer, "stage": "Attention_contribution",
                          **metrics(subtraction(in_a, prev_a), subtraction(in_b, prev_b),
