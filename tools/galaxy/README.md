@@ -1826,3 +1826,107 @@ Check stderr for the new identity evidence:
 Note that the llama CLI returned exit=0 even though several
 llama_decode calls failed. The smoke runner correctly rejected it
 because it requires a real `mode=SHADOW status=PASS` witness.
+
+
+## Native SP Attention REPLACE: first real Llama layer (opt-in only)
+
+Status before this change: the full real-model in-flight SHADOW passed on
+Llama-3.2-3B Layer 0, 98 prefill tokens, CUDA0+RPC0, using the same actual
+Q/K/V tensors and model-produced pre-Wo Attention output. It selected
+post-RoPE Q/K and final 3D V correctly and achieved:
+
+- first_token_rmse 2.20174721e-6
+- pre-Wo total RMSE 9.37426762e-6
+- max_abs 0.00088454783, cosine 0.999999803
+- TP->SP 87.545ms, KV gather 28.391ms, native-ready wall 34.105ms,
+  SP->TP 28.508ms. These are diagnostic staging timings, not optimized
+  production performance.
+
+There is now a new, SEPARATE optional flag, -LiveCausalReplace, which
+sets LLAMA_GALAXY_CAUSAL_LIVE_MODE=REPLACE. Without this switch,
+-LiveCausalLayer 0 still uses the *unchanged* original SHADOW mode.
+Without either switch the normal TP/TP-SP execution is unchanged.
+
+Implementation for first 8..512-token, fresh single-sequence Prefill,
+layer 0 only:
+1. Build the normal Llama TP graph (including all real model QKV
+   projections and KV-cache cpy_k/cpy_v nodes). The original
+   fattn_raw-0 and kqv_out-0 nodes remain in the symbolic model graph.
+2. At the 4D fattn_raw-0 native Flash terminal, Meta creates a
+   *temporary shallow graph view* excluding ONLY the last
+   GGML_OP_FLASH_ATTN_EXT node, and dispatches its predecessor nodes
+   normally. Those predecessor nodes retain normal KV-cache writes.
+   The temporary graph has uid=0 so Phone RPC hashes the TRIMMED
+   graph instead of reusing the original TP Flash graph UID.
+3. Using the producer-time Qcur/Kcur/Vcur HOST-owned copies already
+   captured at earlier Meta boundaries, run the same validated TP-head
+   -> SP-token -> K/V AllGather -> native CUDA/Phone Flash ->
+   SP-token to TP-head pipeline. No GLG1 files.
+4. Fill each rank's real underlying fattn_raw-0 backend tensor
+   with the SP-computed F32 head shard. Verify first F32 word via
+   backend readback to force RPC completion.
+5. Allow the existing kqv_out-0 reshape to run. At that Meta boundary,
+   compare BOTH backend rank-local kqv_out buffers BYTE FOR BYTE
+   against the injected SP shards. If either differs, fail inference
+   BEFORE W_o. With exact bytes, the original W_o -> residual -> FFN
+   and remaining transformer layers run unchanged.
+6. The 2-token warmup and subsequent decode are not replaced. For
+   the first full Prefill (98 tokens), the original TP Flash kernel
+   is NOT executed. A REPLACE PASS is not a within-run RMSE: that
+   requires an INDEPENDENT pure-TP baseline, compared through logits.
+
+The new evidence markers are:
+
+    [GALAXY_CAUSAL_REPLACE_DISPATCH] rank=0 ... skipped_op=FLASH_ATTN_EXT tp_flash_skipped=1 status=PASS
+    [GALAXY_CAUSAL_REPLACE_DISPATCH] rank=1 ... skipped_op=FLASH_ATTN_EXT tp_flash_skipped=1 status=PASS
+    [GALAXY_CAUSAL_LIVE] layer=0 tokens=98 mode=REPLACE ... injected_into=FATTN_RAW status=INJECTED
+    [GALAXY_CAUSAL_REPLACE_VERIFY] layer=0 rank=0 ... pre_wo_identity=BYTE_EXACT status=PASS
+    [GALAXY_CAUSAL_REPLACE_VERIFY] layer=0 rank=1 ... pre_wo_identity=BYTE_EXACT status=PASS
+    [GALAXY_CAUSAL_LIVE] layer=0 tokens=98 mode=REPLACE tp_flash_skipped=1 production_wo_input=SP_ATTENTION pre_wo_identity=BYTE_EXACT status=PASS
+    [GALAXY_CAUSAL_REPLACE_SUM] ... pre_wo_input=SP mode=REPLACE status=PASS
+
+The smoke script requires these proofs on both ranks and a complete
+first-token logits file; a normal process exit without them is NOT PASS.
+
+### Compare a pure TP baseline and true SP REPLACE output
+
+Build only the PC client plus the existing full-logits comparator:
+
+    git pull --ff-only origin feat/galaxy-baseline
+    cmake --build build-galaxy --config Release --target llama-cli galaxy-logits-compare galaxy-causal-live-selftest -j 8
+    .\build-galaxy\bin\Release\galaxy-causal-live-selftest.exe --pc CUDA0 --rpc 10.39.52.114:50052
+
+From an existing 98-token Llama-3.2-3B $common hashtable
+(same Model, PromptFile, HeadSplit=12,12, FfnSplit, Batch, RPC, Threads):
+
+    $common["ProbeQkvLayers"] = ""
+    $common["DumpLogits"] = $true
+    $common["LiveCausalLayer"] = -1
+    $common["LiveCausalReplace"] = $false
+    $common["OutputDir"] = ".\galaxy-sp-results\causal-replace-baseline"
+    .\tools\galaxy\run_galaxy_sp_smoke.ps1 @common -PureTP
+    $tp = Get-ChildItem $common["OutputDir"] -Directory -Filter "tp-*" |
+        Sort-Object CreationTime -Descending | Select-Object -First 1
+
+    $common["LiveCausalLayer"] = 0
+    $common["LiveCausalReplace"] = $true
+    $common["OutputDir"] = ".\galaxy-sp-results\causal-replace"
+    .\tools\galaxy\run_galaxy_sp_smoke.ps1 @common -PureTP
+    $sp = Get-ChildItem $common["OutputDir"] -Directory -Filter "tp-*" |
+        Sort-Object CreationTime -Descending | Select-Object -First 1
+
+    .\build-galaxy\bin\Release\galaxy-logits-compare.exe --tp (Join-Path $tp.FullName "first_logits.f32") --sp (Join-Path $sp.FullName "first_logits.f32") --max-abs 0.10 --max-rmse 0.02 --json (Join-Path $sp.FullName "compare-to-tp.json")
+
+All settings other than the explicit causal REPLACE switch must match.
+The comparator additionally requires Top-1 equality. Even if REPLACE
+passes its byte-exact kqv_out injection check, whole-model logits
+parity must still be measured separately. The performance baseline
+must disable all Shadow/REPLACE instrumentation.
+
+Known limits: host-staged layout conversion, separate native scratch
+Flash graphs, F16 K/V reconstruction, no support for historical KV
+context, chunked Prefill, multi-sequence scheduling, multiple selected
+layers, or real SP Decode. The original persistent TP KV-cache is
+maintained for conventional Decode; it is NOT yet partitioned into
+a new SP cache design. Do not infer SP KV-cache ownership or timing
+speedup from this single-layer replacement.
