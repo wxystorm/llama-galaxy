@@ -160,13 +160,10 @@ inline std::vector<uint8_t> galaxy2_parse_layer_set(const char * raw, int64_t el
     return selected;
 }
 
-inline std::vector<uint8_t> galaxy2_ffn_sp_mask(int64_t n_layers) {
-    if (!galaxy2_enabled()) {
-        return {};
-    }
-    const int64_t eligible = galaxy2_eligible_ffn_layers(n_layers, sp_include_final_layer());
-    const char * layer_set = std::getenv("LLAMA_GALAXY2_FFN_SP_LAYER_SET");
-    const char * leading_count = std::getenv("LLAMA_GALAXY2_FFN_SP_LAYERS");
+// Pure resolver for testing and future planners. Both model loading and
+// graph building consume exactly the same effective mask.
+inline std::vector<uint8_t> galaxy2_resolve_ffn_sp_mask(
+        const char * layer_set, const char * leading_count, int64_t eligible) {
     if (layer_set != nullptr) {
         if (leading_count != nullptr && *leading_count != '\0') {
             throw std::invalid_argument(
@@ -180,6 +177,16 @@ inline std::vector<uint8_t> galaxy2_ffn_sp_mask(int64_t n_layers) {
         selected[static_cast<size_t>(il)] = 1;
     }
     return selected;
+}
+
+inline std::vector<uint8_t> galaxy2_ffn_sp_mask(int64_t n_layers) {
+    if (!galaxy2_enabled()) {
+        return {};
+    }
+    const int64_t eligible = galaxy2_eligible_ffn_layers(n_layers, sp_include_final_layer());
+    return galaxy2_resolve_ffn_sp_mask(
+            std::getenv("LLAMA_GALAXY2_FFN_SP_LAYER_SET"),
+            std::getenv("LLAMA_GALAXY2_FFN_SP_LAYERS"), eligible);
 }
 
 inline int64_t galaxy2_ffn_sp_count(int64_t n_layers) {
