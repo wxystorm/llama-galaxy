@@ -14,6 +14,8 @@ param(
     [string]$HeadSplit = "20,20",
     [string]$FfnSplit = "8704,8704",
     [string]$Galaxy2FfnSpLayers = "1",
+    [string]$SeqWeights = "1,1",
+    [switch]$FinalLayerSP,
     [int]$CollectiveTileTokens = 32,
     [switch]$RequireNumericalParity,
     [double]$MaxAbs = 0.1,
@@ -50,6 +52,8 @@ $opts = @{
     Exe = $Exe
     OutputDir = $root
     CollectiveTileTokens = $CollectiveTileTokens
+    SeqWeights = $SeqWeights
+    FinalLayerSP = $FinalLayerSP
     Devices = $Devices
     HeadSplit = $HeadSplit
     FfnSplit = $FfnSplit
@@ -67,7 +71,10 @@ $results = @{}
 foreach ($mode in @("tp", "sp", "galaxy2")) {
     Write-Host "[GALAXY_THREE_MODE] phase=$mode"
     if ($mode -eq "tp") {
-        & $smoke @opts -PureTP
+        # Final-layer SP applies only to Galaxy/Galaxy2, not the TP control.
+        $tpOpts = $opts.Clone()
+        $tpOpts["FinalLayerSP"] = $false
+        & $smoke @tpOpts -PureTP
     } elseif ($mode -eq "sp") {
         & $smoke @opts
     } else {
@@ -122,6 +129,9 @@ $manifest = @{
     collective_witness = $witness
     galaxy2_sp_ffn_layers = $Galaxy2FfnSpLayers
     collective_tile_tokens = $CollectiveTileTokens
+    seq_weights = $SeqWeights
+    final_layer_sp = [bool]$FinalLayerSP
+    full_galaxy2 = ($Galaxy2FfnSpLayers -eq "all" -and [bool]$FinalLayerSP)
     require_numerical_parity = [bool]$RequireNumericalParity
     numerical_status = if ($bad.Count -gt 0) { "KNOWN_DEVIATION" } else { "PASS" }
     galaxy2_scope = if ($Galaxy2FfnSpLayers -eq "all") { "full" } else { "partial_hybrid" }
