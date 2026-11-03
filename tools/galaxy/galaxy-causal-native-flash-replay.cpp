@@ -254,10 +254,18 @@ struct native_graph {
                 const std::vector<ggml_fp16_t> & all_v) const {
         const size_t qw = static_cast<size_t>(c.heads*c.dim);
         const size_t kvw = static_cast<size_t>(c.kv_heads*c.dim);
-        // Without zeroing padded cache capacity, an implementation could
-        // encounter uninitialized values even behind a -infinity mask.
-        ggml_backend_tensor_memset(k_storage,0,0,ggml_nbytes(k_storage));
-        ggml_backend_tensor_memset(v_storage,0,0,ggml_nbytes(v_storage));
+        // RPC buffers (and some other ggml backends) have no
+        // buffer->iface.memset_tensor callback. Backend tensor_set is
+        // supported on both CUDA and RPC, so zero padded KV capacity
+        // with a host-owned F16 buffer before gathering actual K/V.
+        // Keep the host allocation alive through the backend fence.
+        const size_t padded_elements = static_cast<size_t>(kv_padded)*kvw;
+        std::vector<ggml_fp16_t> zero_padded_kv(padded_elements, ggml_fp16_t(0));
+        demand(ggml_nbytes(k_storage) == zero_padded_kv.size()*sizeof(ggml_fp16_t)
+                && ggml_nbytes(v_storage) == ggml_nbytes(k_storage),
+                "padded K/V allocation mismatch");
+        ggml_backend_tensor_set(k_storage, zero_padded_kv.data(), 0, ggml_nbytes(k_storage));
+        ggml_backend_tensor_set(v_storage, zero_padded_kv.data(), 0, ggml_nbytes(v_storage));
         ggml_backend_tensor_set(q, all_q.data()+q_begin*qw, 0, ggml_nbytes(q));
         ggml_backend_tensor_set(k_local, all_k.data()+q_begin*kvw,
                                 0, ggml_nbytes(k_local));
