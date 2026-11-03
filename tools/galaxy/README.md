@@ -1653,3 +1653,86 @@ Q/K/V projection nodes, actual KV-cache slots or Wo/FFN. It instead
 validates their exact *activation layouts* on both real backends while
 keeping production TP inference unchanged. Integration requires
 Meta split propagation and per-layer lifetime/ownership contracts.
+
+
+## In-flight causal SP Attention SHADOW inside the real Meta graph
+
+After byte-exact bidirectional layout exchange and real native
+Flash-Attention Replay passed on CUDA0+Phone, this change connects
+that *same* execution path to the actual Llama TP graph.
+
+Opt in with -PureTP -LiveCausalLayer 0. This sets the process-only
+LLAMA_GALAXY_CAUSAL_LIVE_LAYER=0 and pins Layer 0's Qcur, Kcur,
+Vcur, raw Flash, and pre-Wo kqv_out tensors. Meta takes rank-local
+F32 snapshots immediately as each producer subgraph finishes, **not**
+at the end of the model, and it never reads GLG1 files. At
+kqv_out-0, Meta constructs backend-owned scratch tensors directly
+from these actual producer-time in-memory bytes:
+
+    Actual TP projection Q/K/V (rank-local, all 98 tokens)
+                |
+    TP HEAD -> SP TOKEN exchange (existing implementation)
+                |
+    K/V F16 conversion and SP KV AllGather (real CUDA+RPC)
+                |
+    Native FLASH_ATTN_EXT on BOTH physical backends
+                |
+    SP TOKEN -> TP HEAD exchange
+                |
+    Compare rank-local TP outputs against production kqv_out
+                |
+    Original TP kqv_out -> W_o -> FFN proceeds unchanged
+
+This is a correctness shadow, NOT a production SP-Attention
+replacement. It allocates temporary GGML buffers and spends additional
+RPC time; runtime throughput is NOT comparable to normal TP. The
+original TP Flash still executes to provide the numerical reference.
+First-prefill of one sequence only, 8..512 tokens, head_dim <= 256,
+F32 source activations, F16 SP KV, exactly two real backends. Currently
+the only eligible layer is 0. A first-token V[0] causal invariant
+checks for zero historical cache; an incompatible or continuation run
+fails closed rather than emitting a false numerical parity result.
+
+The shadow checks 3 separate correctness contracts:
+- Q/K/V Head alignment: both TP ranks own whole GQA groups.
+- Original output and native SP output after TP restoration agree to
+  RMSE <= 0.001. The original kqv_out is not modified.
+- Both backend Flash ops genuinely dispatch via their physical GGML
+  devices. A Phone RPC graph submission time is not a kernel time.
+
+First run the standalone helper selftest:
+
+    git pull --ff-only origin feat/galaxy-baseline
+    cmake --build build-galaxy --config Release --target galaxy-causal-live-selftest llama-cli -j 8
+    .\build-galaxy\bin\Release\galaxy-causal-live-selftest.exe
+    .\build-galaxy\bin\Release\galaxy-causal-live-selftest.exe --pc CUDA0 --rpc 10.39.52.114:50052
+
+Then re-use the existing $common hashtable for the real model.
+The user already used a 98-token Llama-3.2-3B prompt with
+-HeadSplit "12,12", -PureTP and normal first prefill.
+
+    $common.LiveCausalLayer = 0
+    $common.ProbeQkvLayers = ""
+    $common.DumpLayers = ""
+    $common.DumpStages = ""
+    $common.DumpFfnOps = ""
+    $common.OutputDir = ".\galaxy-sp-results\causal-live-shadow"
+    .\tools\galaxy\run_galaxy_sp_smoke.ps1 @common -PureTP
+
+The smoke script checks for the real witness rather than merely a
+successful inference exit:
+
+    [GALAXY_CAUSAL_LIVE] layer=0 tokens=98 mode=SHADOW tp_heads=12+12 kv_heads=4+4 first_token_rmse=... rmse=... max_abs=... cosine=... tp_sp_ms=... kv_gather_ms=... native_phase_ms=... sp_tp_ms=... threshold=0.001 production_output_unchanged=1 status=PASS
+    [GALAXY_CAUSAL_LIVE] layer=0 mode=SHADOW reference=IN_FLIGHT result=CONFIRMED
+
+The 2-token warmup reports SKIP (not PASS). The script requires a
+multi-token PASS witness. If CMake, RPC or the model fails, inspect
+stderr.log and fix that actual error; do not silently replace Phone
+with CPU or remove source-layout validation.
+
+SCOPE BEFORE NEXT PHASE: this proves live inference DATA integration
+and in-graph numerical parity, but the SP result is not yet connected
+to W_o, the persistent KV-cache has not been redistributed, and
+Decode still runs the original TP code. Only after a successful
+live-shadow test should a separate explicit REPLACE mode consume the
+computed TP-form output and bypass/override production Attention.
