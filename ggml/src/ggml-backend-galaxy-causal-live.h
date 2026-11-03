@@ -64,7 +64,7 @@ struct measurement {
     int64_t worst_channel = 0;
     double head_to_token_ms = 0;
     double kv_gather_ms = 0;
-    double native_phase_ms = 0;
+    double native_ready_wall_ms = 0;
     double token_to_head_ms = 0;
 };
 
@@ -320,7 +320,7 @@ inline measurement shadow(const devices_t & devices, const request & r) {
         require(std::isfinite(completion_sample),
                 "nonfinite native Flash completion sample");
     }
-    m.native_phase_ms=ms(start);
+    m.native_ready_wall_ms=ms(start);
 
     start=ggml_galaxy_profile::clock::now();
     ggml_galaxy_layout::token_to_head(
