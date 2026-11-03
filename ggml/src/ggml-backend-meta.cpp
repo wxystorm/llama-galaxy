@@ -2147,6 +2147,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     const bool qkv_probe_enabled = qkv_probe_dir != nullptr && qkv_probe_dir[0] != '\0';
     const char * live_layer_raw = std::getenv("LLAMA_GALAXY_CAUSAL_LIVE_LAYER");
     const bool live_shadow_requested = live_layer_raw != nullptr && live_layer_raw[0] != '\0';
+    const char * live_mode_raw=std::getenv("LLAMA_GALAXY_CAUSAL_LIVE_MODE");
+    const std::string live_mode=live_mode_raw && live_mode_raw[0] ?
+            std::string(live_mode_raw) : "SHADOW";
+    if ((live_shadow_requested && live_mode != "SHADOW" && live_mode != "REPLACE") ||
+            (!live_shadow_requested && live_mode_raw && live_mode_raw[0])) {
+        GGML_LOG_ERROR("[GALAXY_CAUSAL_LIVE] invalid mode/selector combination\n");
+        return GGML_STATUS_FAILED;
+    }
+    const bool live_replace_requested=live_shadow_requested && live_mode=="REPLACE";
     // Fail closed on an invalid selector rather than silently letting the
     // model run without producing a live correctness witness.
     int live_shadow_layer = -1;
@@ -2180,6 +2189,106 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // Per invocation only. Once captured, the independent host copy
     // survives subsequent backend buffer reuse and next-layer execution.
     std::map<const ggml_tensor *, std::vector<std::vector<uint8_t>>> qkv_live_snapshots;
+    // Rank-local pre-W_o shards produced by native SP Attention. Kept
+    // until the next kqv_out boundary confirms the reshape consumes the
+    // exact injected bytes, before W_o is allowed to execute.
+    std::array<std::vector<uint8_t>,2> live_replaced_shards;
+    bool live_replaced_pending=false;
+    bool live_replaced_verified=false;
+
+    // Name alone is not identity: projection, reshape and RoPE can all
+    // share "Qcur-0". Restrict selection to the actual OUTPUT node that
+    // was captured when its producing subgraph completed. Q/K must be
+    // post-RoPE, V must be the final rank-sharded 3D tensor.
+    const auto find_live_stage = [&](const char * stage,
+                                      bool must_be_rope) -> const ggml_tensor * {
+        const std::string expected=std::string(stage)+"-"+std::to_string(live_shadow_layer);
+        const ggml_tensor * match=nullptr;
+        int named=0,eligible=0;
+        for(int id=0;id<cgraph->n_nodes;++id) {
+            const ggml_tensor * t=cgraph->nodes[id];
+            if (!t || expected != t->name) continue;
+            ++named;
+            if ((t->flags & GGML_TENSOR_FLAG_OUTPUT)==0 ||
+                    qkv_live_snapshots.find(t)==qkv_live_snapshots.end() ||
+                    (must_be_rope && t->op != GGML_OP_ROPE)) continue;
+            ++eligible;
+            if(match) throw std::invalid_argument("ambiguous captured model stage "+expected);
+            match=t;
+        }
+        std::fprintf(stderr,
+                "[GALAXY_CAUSAL_LIVE_NODE] name=%s candidates=%d"
+                " captured_eligible=%d selected_op=%s"
+                " selection=PRODUCER_CAPTURED_OUTPUT status=%s\n",
+                expected.c_str(),named,eligible,
+                match?ggml_op_name(match->op):"NONE",match?"PASS":"FAIL");
+        std::fflush(stderr);
+        if(!match) throw std::invalid_argument("missing captured model stage "+expected);
+        return match;
+    };
+
+    const auto build_live_request = [&](const ggml_tensor * reference)
+            -> ggml_galaxy_causal_live::request {
+        const ggml_tensor * q=find_live_stage("Qcur",true);
+        const ggml_tensor * k=find_live_stage("Kcur",true);
+        const ggml_tensor * v=find_live_stage("Vcur",false);
+        const int64_t dim=q->ne[0],tokens=q->ne[2];
+        if(q->ne[3]!=1 || dim<=0 || tokens<8 || tokens>512 ||
+                k->ne[0]!=dim || v->ne[0]!=dim ||
+                k->ne[2]!=tokens || v->ne[2]!=tokens ||
+                k->ne[3]!=1 || v->ne[3]!=1 ||
+                (reference && (reference->ne[1]!=tokens ||
+                        reference->ne[2]!=1 || reference->ne[3]!=1 ||
+                        reference->ne[0]!=q->ne[0]*q->ne[1]))) {
+            throw std::invalid_argument(
+                    "unsupported live causal QKV/reference shape or token count");
+        }
+        const auto take=[&](const ggml_tensor * t,bool headed,const char * label)
+                -> ggml_galaxy_causal_live::head_shards {
+            ggml_galaxy_causal_live::head_shards h;
+            h.type=t->type;
+            if (t->type!=GGML_TYPE_F32 ||
+                    !ggml_backend_buffer_is_meta(t->buffer) ||
+                    !ggml_is_contiguous(t))
+                throw std::invalid_argument(std::string(label)+" is not dense F32 Meta");
+            const auto found=qkv_live_snapshots.find(t);
+            if(found==qkv_live_snapshots.end() || found->second.size()!=2)
+                throw std::invalid_argument(std::string(label)+" has no producer snapshot");
+            const auto state=ggml_backend_meta_get_split_state(t,false);
+            const auto expected=headed?GGML_BACKEND_SPLIT_AXIS_1:
+                                       GGML_BACKEND_SPLIT_AXIS_0;
+            if(state.axis!=expected)
+                throw std::invalid_argument(std::string(label)+" is not head-sharded");
+            for(int rank=0;rank<2;++rank) {
+                const ggml_tensor * local=ggml_backend_meta_buffer_simple_tensor(t,rank);
+                if(!local || !local->buffer || local->type!=GGML_TYPE_F32 ||
+                        !ggml_is_contiguous(local) ||
+                        (headed ? (local->ne[0]!=dim || local->ne[2]!=tokens ||
+                                   local->ne[3]!=1)
+                                 : (local->ne[1]!=tokens || local->ne[2]!=1 ||
+                                    local->ne[3]!=1 || local->ne[0]%dim!=0))) {
+                    throw std::invalid_argument(std::string(label)+" rank shape mismatch");
+                }
+                h.heads[rank]=headed?local->ne[1]:local->ne[0]/dim;
+                h.bytes[rank]=&found->second[rank];
+                if(h.heads[rank]<=0 || h.bytes[rank]->size()!=ggml_nbytes(local))
+                    throw std::invalid_argument(std::string(label)+" rank byte size mismatch");
+            }
+            return h;
+        };
+        ggml_galaxy_causal_live::request work;
+        work.q=take(q,true,"Qcur");
+        work.k=take(k,true,"Kcur");
+        work.v=take(v,true,"Vcur");
+        if(reference) work.reference=take(reference,false,"kqv_out");
+        work.tokens=tokens;
+        work.head_dim=dim;
+        work.layer=live_shadow_layer;
+        work.tile_tokens=ggml_galaxy_collectives::configured_tile_tokens();
+        work.max_rmse=0.001;
+        return work;
+    };
+
     if (trace) {
         GGML_LOG_INFO("[GALAXY_META_TRACE] event=GRAPH_BEGIN nodes=%d backends=%zu sp=%d uid=%" PRIu64 "\n",
                 cgraph->n_nodes, n_backends, int(has_galaxy_markers), cgraph->uid);
