@@ -1775,3 +1775,54 @@ snapshot, Phone RPC server, or model inference changes are needed.
 Only after both tests PASS, run the real single-layer model in
 -PureTP -LiveCausalLayer 0 mode. Never report the original
 dim-16 fatal error as evidence that the SP Attention design failed.
+
+
+## Fixed: duplicate Qcur/Kcur labels in real in-flight Meta graph
+
+The first real `-LiveCausalLayer 0` smoke returned an error before
+native Flash execution:
+
+    [GALAXY_CAUSAL_LIVE] layer=0 mode=SHADOW status=FAIL reason=duplicate model QKV node Qcur-0
+
+This is a graph-builder *name collision*, not a second Attention
+compute and not a numerical mismatch. The Llama builder names the
+2D matmul Q projection `Qcur-0`, names its 3D reshape `Qcur-0`,
+then names the post-RoPE Q `Qcur-0`. K similarly has repeated
+debug labels. Requiring a unique name was incorrect.
+
+The live Meta selector now requires:
+- The exact layer name, **plus** the OUTPUT flag applied by the
+  opt-in graph builder.
+- A producer-time host-copy entry keyed by the actual ggml_tensor
+  pointer, not a matching name alone.
+- A ROPE op for Q and K (these must be post-RoPE). The V tensor is
+  also required to have its captured, 3D rank-sharded shape.
+- The pre-W_o reference is the *actual just-computed kqv_out boundary
+  pointer* (not a graph-wide name lookup).
+
+It emits `[GALAXY_CAUSAL_LIVE_NODE]` with candidate count,
+eligible captured count, selected op, and selection status.
+If more than one producer-captured candidate remains, it fails
+closed and requests an explicit graph-identity fix, rather than
+guessing or taking an arbitrary first/last name match.
+
+Rebuild only the PC llama-cli:
+
+    git pull --ff-only origin feat/galaxy-baseline
+    cmake --build build-galaxy --config Release --target llama-cli -j 8
+
+Re-run the existing `$common` 98-token command unchanged:
+
+    $common["LiveCausalLayer"] = 0
+    $common["HeadSplit"] = "12,12"
+    $common["ProbeQkvLayers"] = ""
+    $common["OutputDir"] = ".\galaxy-sp-results\causal-live-shadow"
+    .\tools\galaxy\run_galaxy_sp_smoke.ps1 @common -PureTP
+
+Check stderr for the new identity evidence:
+
+    Select-String -Path (Join-Path $run.FullName "stderr.log") -Pattern "GALAXY_CAUSAL_LIVE_NODE|GALAXY_CAUSAL_LIVE" | ForEach-Object { $_.Line }
+
+Note that the llama CLI returned exit=0 even though several
+llama_decode calls failed. The smoke runner correctly rejected it
+because it requires a real `mode=SHADOW status=PASS` witness.
