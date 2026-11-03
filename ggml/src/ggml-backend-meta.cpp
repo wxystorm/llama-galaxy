@@ -2754,27 +2754,58 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         if (live_shadow_requested &&
                 std::strcmp(original_last->name,
                         ("kqv_out-"+std::to_string(live_shadow_layer)).c_str()) == 0) {
-            const auto find_stage = [&](const char * stage) -> const ggml_tensor * {
+            // The ordinary Llama builder names the 2D projection,
+            // 3D reshape AND post-RoPE tensor "Qcur-<layer>" (K is
+            // similar). A tensor name is a debugging label, NOT an
+            // identity. Only the post-RoPE Q/K and final 3D V are
+            // explicitly pinned as OUTPUT and captured at their true
+            // producing subgraph. Match those captured tensor POINTERS
+            // and reject any remaining ambiguity.
+            const auto find_stage = [&](const char * stage,
+                                        bool must_be_rope) -> const ggml_tensor * {
                 const std::string expected = std::string(stage)+"-"+
                         std::to_string(live_shadow_layer);
                 const ggml_tensor * match = nullptr;
+                int named_nodes = 0;
+                int captured_nodes = 0;
                 for (int node_id=0;node_id<cgraph->n_nodes;++node_id) {
                     const ggml_tensor * node=cgraph->nodes[node_id];
-                    if (node && expected == node->name) {
-                        if (match) throw std::invalid_argument(
-                                "duplicate model QKV node "+expected);
-                        match=node;
+                    if (node == nullptr || expected != node->name) {
+                        continue;
                     }
+                    ++named_nodes;
+                    if ((node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 ||
+                            qkv_live_snapshots.find(node) == qkv_live_snapshots.end() ||
+                            (must_be_rope && node->op != GGML_OP_ROPE)) {
+                        continue;
+                    }
+                    ++captured_nodes;
+                    if (match) {
+                        throw std::invalid_argument(
+                                "ambiguous captured post-projection model tensor "+
+                                expected);
+                    }
+                    match=node;
                 }
+                std::fprintf(stderr,
+                        "[GALAXY_CAUSAL_LIVE_NODE] name=%s candidates=%d"
+                        " captured_eligible=%d selected_op=%s"
+                        " selection=PRODUCER_CAPTURED_OUTPUT status=%s\n",
+                        expected.c_str(),named_nodes,captured_nodes,
+                        match ? ggml_op_name(match->op) : "NONE",
+                        match ? "PASS" : "FAIL");
+                std::fflush(stderr);
                 if (!match) throw std::invalid_argument(
-                        "missing producer-time model node "+expected);
+                        "missing captured post-projection model tensor "+expected);
                 return match;
             };
             try {
-                const ggml_tensor * q_model=find_stage("Qcur");
-                const ggml_tensor * k_model=find_stage("Kcur");
-                const ggml_tensor * v_model=find_stage("Vcur");
-                const ggml_tensor * out_model=find_stage("kqv_out");
+                const ggml_tensor * q_model=find_stage("Qcur",true);
+                const ggml_tensor * k_model=find_stage("Kcur",true);
+                const ggml_tensor * v_model=find_stage("Vcur",false);
+                // Directly use the boundary that triggered this execution:
+                // it has just completed and was captured by exact pointer.
+                const ggml_tensor * out_model=original_last;
                 const int64_t head_dim=q_model->ne[0];
                 const int64_t tokens=q_model->ne[2];
                 if (tokens < 8) {
