@@ -83,16 +83,119 @@ inline int64_t galaxy2_parse_ffn_layers(const char * raw, int64_t eligible) {
     return value;
 }
 
-inline int64_t galaxy2_ffn_sp_count(int64_t n_layers) {
-    if (!galaxy2_enabled()) {
-        return 0;
+// A per-layer Galaxy2 FFN schedule is the common source of truth for
+// graph construction AND weight placement. Explicit layer sets use zero-based
+// indices or inclusive ranges, e.g. "0,3,6-8". "none" and "all" are allowed.
+// The legacy leading-N FFN_SP_LAYERS setting remains backward compatible.
+// Do not silently combine the two settings: inconsistent ownership would
+// cause a per-rank tensor layout mismatch.
+inline int64_t galaxy2_parse_layer_index(const std::string & spec, size_t & cursor) {
+    if (cursor >= spec.size() || spec[cursor] < '0' || spec[cursor] > '9') {
+        throw std::invalid_argument("Galaxy2 layer set requires an integer index");
     }
-    return galaxy2_parse_ffn_layers(std::getenv("LLAMA_GALAXY2_FFN_SP_LAYERS"),
-            galaxy2_eligible_ffn_layers(n_layers, sp_include_final_layer()));
+    int64_t value = 0;
+    while (cursor < spec.size() && spec[cursor] >= '0' && spec[cursor] <= '9') {
+        const int digit = spec[cursor] - '0';
+        if (value > (std::numeric_limits<int64_t>::max() - digit)/10) {
+            throw std::invalid_argument("Galaxy2 layer index overflows int64");
+        }
+        value = value * 10 + digit;
+        ++cursor;
+    }
+    return value;
+}
+
+inline std::vector<uint8_t> galaxy2_parse_layer_set(const char * raw, int64_t eligible) {
+    if (eligible < 0) {
+        throw std::invalid_argument("Galaxy2 layer set requires nonnegative eligible layers");
+    }
+    if (raw == nullptr || *raw == '\0') {
+        throw std::invalid_argument("Galaxy2 layer set must be 'all', 'none', or indices/ranges");
+    }
+    // An index that is out of range is always an error, including the
+    // excluded last layer when FinalLayerSP is not enabled.
+    std::vector<uint8_t> selected(static_cast<size_t>(eligible), uint8_t(0));
+    const std::string spec(raw);
+    if (spec == "none") {
+        return selected;
+    }
+    if (spec == "all") {
+        for (auto & flag : selected) {
+            flag = 1;
+        }
+        return selected;
+    }
+    size_t cursor = 0;
+    while (cursor < spec.size()) {
+        const int64_t first = galaxy2_parse_layer_index(spec, cursor);
+        int64_t last = first;
+        if (cursor < spec.size() && spec[cursor] == '-') {
+            ++cursor;
+            last = galaxy2_parse_layer_index(spec, cursor);
+            if (last < first) {
+                throw std::invalid_argument("Galaxy2 layer set has a descending range");
+            }
+        }
+        if (last >= eligible) {
+            throw std::invalid_argument("Galaxy2 layer set selects a noneligible layer");
+        }
+        for (int64_t il = first; il <= last; ++il) {
+            uint8_t & flag = selected[static_cast<size_t>(il)];
+            if (flag) {
+                throw std::invalid_argument("Galaxy2 layer set contains a duplicate layer");
+            }
+            flag = 1;
+        }
+        if (cursor == spec.size()) {
+            break;
+        }
+        if (spec[cursor] != ',') {
+            throw std::invalid_argument("Galaxy2 layer set must separate ranges with commas");
+        }
+        ++cursor;
+        if (cursor == spec.size()) {
+            throw std::invalid_argument("Galaxy2 layer set must not end with a comma");
+        }
+    }
+    return selected;
+}
+
+inline std::vector<uint8_t> galaxy2_ffn_sp_mask(int64_t n_layers) {
+    if (!galaxy2_enabled()) {
+        return {};
+    }
+    const int64_t eligible = galaxy2_eligible_ffn_layers(n_layers, sp_include_final_layer());
+    const char * layer_set = std::getenv("LLAMA_GALAXY2_FFN_SP_LAYER_SET");
+    const char * leading_count = std::getenv("LLAMA_GALAXY2_FFN_SP_LAYERS");
+    if (layer_set != nullptr) {
+        if (leading_count != nullptr && *leading_count != '\0') {
+            throw std::invalid_argument(
+                    "Galaxy2 FFN_SP_LAYER_SET and FFN_SP_LAYERS cannot both be configured");
+        }
+        return galaxy2_parse_layer_set(layer_set, eligible);
+    }
+    const int64_t count = galaxy2_parse_ffn_layers(leading_count, eligible);
+    std::vector<uint8_t> selected(static_cast<size_t>(eligible), uint8_t(0));
+    for (int64_t il = 0; il < count; ++il) {
+        selected[static_cast<size_t>(il)] = 1;
+    }
+    return selected;
+}
+
+inline int64_t galaxy2_ffn_sp_count(int64_t n_layers) {
+    int64_t count = 0;
+    for (uint8_t flag : galaxy2_ffn_sp_mask(n_layers)) {
+        count += flag ? 1 : 0;
+    }
+    return count;
 }
 
 inline bool galaxy2_ffn_is_sp(int64_t il, int64_t n_layers) {
-    return il >= 0 && il < galaxy2_ffn_sp_count(n_layers);
+    if (il < 0) {
+        return false;
+    }
+    const auto mask = galaxy2_ffn_sp_mask(n_layers);
+    return static_cast<size_t>(il) < mask.size() && mask[static_cast<size_t>(il)] != 0;
 }
 
 // Comma-delimited diagnostic layer selection, or 'all'. Keep the original
