@@ -56,6 +56,8 @@ foreach ($name in @("PureTP","LiveCausalLayer","LiveCausalPrefixLayers",
 }
 $shared["DumpLogits"] = $true
 $shared["ProbeQkvLayers"] = ""
+$shared["Galaxy2"] = $false
+$shared["FinalLayerSP"] = $false
 $shared["Profile"] = $false
 $shared["Trace"] = $false
 $shared["DumpLayers"] = ""
