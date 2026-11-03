@@ -232,6 +232,11 @@ int main() {
               "single-token decode must not enable SP Attention");
         check(ggml_galaxy_causal::runtime_prefill_eligible({13,11,7,24,8,8}),
               "asymmetric prefill should be eligible");
+        check(ggml_galaxy_causal::absolute_query_position({13,11,7,24,8,8}, 1, 0) == 20,
+              "rank1 absolute query position must include past and rank0 new tokens");
+        check(ggml_galaxy_causal::kv_head_for_query({13,11,7,24,8,8}, 3) == 1,
+              "GQA group-head mapping");
+        rejects([] { ggml_galaxy_causal::validate({0, 4, 2, 24, 8, 8, 2}); });
         rejects([] { ggml_galaxy_causal::validate({0, 4, 5, 24, 8, 8}); });
         rejects([] { ggml_galaxy_causal::validate({0, 4, 2, 24, 7, 8}); });
         rejects([] { ggml_galaxy_causal::validate({-1, 4, 2, 24, 8, 8}); });
