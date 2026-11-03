@@ -2672,6 +2672,51 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
+        // Capture the producing node NOW, immediately after both backend
+        // submissions have completed. The normal end-of-model buffer may
+        // be reused by later graph nodes, especially for V and reshape
+        // views; never read it late to create a numerical reference.
+        if (is_qkv_probe_node(original_last)) {
+            if (n_backends != 2 || !ggml_backend_buffer_is_meta(original_last->buffer)) {
+                GGML_LOG_ERROR("[GALAXY_QKV_CAPTURE] expected a two-backend Meta tensor\n");
+                return GGML_STATUS_FAILED;
+            }
+            std::vector<std::vector<uint8_t>> rank_copies;
+            rank_copies.reserve(n_backends);
+            for (size_t rank = 0; rank < n_backends; ++rank) {
+                const ggml_tensor * local =
+                        ggml_backend_meta_buffer_simple_tensor(original_last, rank);
+                if (local == nullptr || local->buffer == nullptr ||
+                        ggml_nbytes(local) == 0) {
+                    GGML_LOG_ERROR("[GALAXY_QKV_CAPTURE] name=%s rank=%zu missing source buffer\n",
+                            original_last->name, rank);
+                    return GGML_STATUS_FAILED;
+                }
+                ggml_backend_synchronize(backend_ctx->backend_configs[rank].backend);
+                rank_copies.emplace_back(ggml_nbytes(local));
+                std::vector<uint8_t> & bytes = rank_copies.back();
+                ggml_backend_tensor_get(local, bytes.data(), 0, bytes.size());
+                uint64_t hash = UINT64_C(14695981039346656037);
+                for (uint8_t byte : bytes) {
+                    hash ^= static_cast<uint64_t>(byte);
+                    hash *= UINT64_C(1099511628211);
+                }
+                std::fprintf(stderr,
+                        "[GALAXY_QKV_CAPTURE] name=%s rank=%zu subgraph=%zu"
+                        " backend=%s bytes=%zu fnv1a64=%016" PRIx64
+                        " phase=PRODUCER_DONE status=PASS\n",
+                        original_last->name, rank, i,
+                        ggml_backend_name(backend_ctx->backend_configs[rank].backend),
+                        bytes.size(), hash);
+            }
+            std::fflush(stderr);
+            if (!qkv_live_snapshots.emplace(original_last, std::move(rank_copies)).second) {
+                GGML_LOG_ERROR("[GALAXY_QKV_CAPTURE] name=%s duplicate producer\n",
+                        original_last->name);
+                return GGML_STATUS_FAILED;
+            }
+        }
+
         const galaxy_sp_transition transition = galaxy_sp_get_transition(original_last);
         if (transition != galaxy_sp_transition::none) {
             if (original_last->src[0] == nullptr ||
@@ -2746,6 +2791,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
 
         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+            // Q/K/V and Flash Attention tensor-parallel shards are already
+            // owned by their rank (axis 0/1), not PARTIAL contributions.
+            // Forced diagnostic cuts must not invoke a spurious AllReduce.
+            if (is_qkv_probe_node(original_last)) {
+                const auto probe_state = ggml_backend_meta_get_split_state(original_last, false);
+                if (probe_state.axis != GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+                    continue;
+                }
+            }
             if (has_galaxy_markers) {
                 // Only an actual PARTIAL terminal needs AllReduce. When the
                 // next node is GALAXY_RS, skip the old AllReduce entirely;
