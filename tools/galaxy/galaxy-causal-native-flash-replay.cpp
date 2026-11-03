@@ -250,9 +250,8 @@ struct native_graph {
             tp_q_begin = rank == 0 ? 0 : c.tp_heads0;
             tp_q_count = rank == 0 ? c.tp_heads0 : c.heads-c.tp_heads0;
             tp_kv_begin = rank == 0 ? 0 : c.tp_heads0/(c.heads/c.kv_heads);
-            tp_kv_count = rank == 0 ? tp_kv_begin /* overwritten below */
+            tp_kv_count = rank == 0 ? c.tp_heads0/(c.heads/c.kv_heads)
                                     : c.kv_heads-tp_kv_begin;
-            if (rank == 0) tp_kv_count = c.tp_heads0/(c.heads/c.kv_heads);
             q_tp = ggml_new_tensor_2d(ctx,GGML_TYPE_F32,tp_q_count*c.dim,c.tokens);
             k_tp = ggml_new_tensor_2d(ctx,GGML_TYPE_F16,tp_kv_count*c.dim,c.tokens);
             v_tp = ggml_new_tensor_2d(ctx,GGML_TYPE_F16,tp_kv_count*c.dim,c.tokens);
@@ -449,7 +448,7 @@ void execute(const options & c, const devices_t & backends) {
                   << "+" << kv_layout.head_counts[1]
                   << " query_tokens=" << c.rank0 << "+" << c.tokens-c.rank0
                   << " forward_ms=" << tp_sp_ms
-                  << " forward=BYTE_EXACT status=PASS\\n";
+                  << " forward=BYTE_EXACT status=PASS\n";
     }
 
     const input_t local_k = {pc.k_local,phone.k_local};
@@ -560,7 +559,7 @@ void execute(const options & c, const devices_t & backends) {
                   << "+" << c.heads-c.tp_heads0
                   << " tokens=" << c.rank0 << "+" << c.tokens-c.rank0
                   << " reverse_ms=" << sp_tp_ms
-                  << " reverse=BYTE_EXACT status=PASS\\n";
+                  << " reverse=BYTE_EXACT status=PASS\n";
     }
 
     comparison total;
