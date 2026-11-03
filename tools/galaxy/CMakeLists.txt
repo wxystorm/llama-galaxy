@@ -44,3 +44,14 @@ target_compile_features(galaxy-causal-model-replay PRIVATE cxx_std_17)
 if (GGML_RPC)
     target_compile_definitions(galaxy-causal-model-replay PRIVATE GALAXY_CAUSAL_HAVE_RPC=1)
 endif()
+
+# First native-backend step toward causal SP Attention: token-local Q,
+# F16 K/V AllGather to both devices, global causal mask, and per-rank
+# GGML FLASH_ATTN_EXT graph executed on CUDA and (optionally) Phone RPC.
+# This is a standalone GGUF activation replay, not production inference.
+add_executable(galaxy-causal-native-flash-replay galaxy-causal-native-flash-replay.cpp)
+target_link_libraries(galaxy-causal-native-flash-replay PRIVATE ggml)
+target_compile_features(galaxy-causal-native-flash-replay PRIVATE cxx_std_17)
+if (GGML_RPC)
+    target_compile_definitions(galaxy-causal-native-flash-replay PRIVATE GALAXY_CAUSAL_HAVE_RPC=1)
+endif()
