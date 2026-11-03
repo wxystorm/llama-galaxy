@@ -533,3 +533,30 @@ for RS and the number of RS operations that actually used fused reads.
 These counts include BOTH backend ranks and may include initialization
 and repeated graph execution; they are not unique TCP packets.
 Do not compare Profile-on time against Profile-off time.
+
+
+### Resume an interrupted fused-ReduceScatter sweep (Windows)
+
+Older run_galaxy_rs_fused_sweep.ps1 passed Galaxy2FfnSpLayers twice:
+once through the @opts hashtable and once explicitly. PowerShell
+rejected the Galaxy2 invocation before model loading. The duplicate
+argument has been removed.
+
+An optional -ResumeDir parameter lets the fixed script reuse completed
+mode/fused cases from the same sweep directory and run missing cases.
+It checks each candidate's [GALAXY_SP_SUM] witness for the same tile
+size and fused setting, its full first-token logits, and Prefill timing.
+It also preserves the Profile-on/off distinction. Always use the SAME
+model, prompt, RPC backend, head/FFN split, thread and batch settings
+as the original interrupted run; old run directories do not carry a
+complete per-case argument manifest.
+
+For the interrupted 2026-11-03 experiment:
+
+    .\tools\galaxy\run_galaxy_rs_fused_sweep.ps1 -Model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" -Rpc "10.39.52.114:50052" -PromptFile "D:\prima.cpp\prompts\prompt_64.txt" -Galaxy2FfnSpLayers 1 -CollectiveTileTokens 256 -TimeoutSec 300 -ResumeDir ".\galaxy-sp-results\rs-fused-20261103-090908"
+
+Two completed Galaxy cases should show [GALAXY_RS_FUSED_SWEEP] REUSE.
+The missing Galaxy2 OFF/ON cases will then execute; afterwards the
+comparator and timing summary are computed from all four runs.
+Resume does not require recompiling either endpoint since this patch
+changes only PowerShell orchestration.
