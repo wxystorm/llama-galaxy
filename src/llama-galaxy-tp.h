@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 
+#include "ggml-backend-galaxy-causal-layers.h"
+
 namespace llama_galaxy_tp {
 
 struct policy {
@@ -255,16 +257,12 @@ inline bool qkv_probe_enabled(int64_t il) {
     return layer_selection_contains(std::getenv("LLAMA_GALAXY_QKV_PROBE_LAYERS"), il);
 }
 
-// Real-model causal SP SHADOW: pass the actual in-flight TP Q/K/V through
-// native CUDA+Phone Flash Attention, then compare its TP-form output to the
-// original model's pre-Wo Attention tensor. This does NOT replace W_o input.
-// For this first integration gate, require an explicit single layer index;
-// no default and no implicit "all" selection.
+// Explicitly selected causal SP Attention layers. Both the SHADOW
+// numerical validation and the REPLACE producer path use the same pinning
+// contract as the Meta executor. The normal TP graph is unchanged unless
+// the legacy layer=0 or new 1/2/4 prefix env selector is set.
 inline bool causal_live_shadow_enabled(int64_t il) {
-    const char * raw=std::getenv("LLAMA_GALAXY_CAUSAL_LIVE_LAYER");
-    if (raw == nullptr || raw[0] == '\0' || il < 0) return false;
-    const std::string spec(raw);
-    return spec == std::to_string(il);
+    return ggml_galaxy_causal_layers::enabled(il);
 }
 
 inline std::vector<int64_t> parse_counts(const char * text, const char * key, size_t n_devices) {
