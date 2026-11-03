@@ -6,6 +6,7 @@
 #include "ggml-cpp.h"
 #include "ggml-rpc.h"
 #include "ggml-backend-galaxy-collectives.h"
+#include "ggml-backend-galaxy-causal-live.h"
 #include "ggml-backend-galaxy-profile.h"
 #include "ggml-backend-galaxy-markers.h"
 
@@ -2144,8 +2145,28 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // finishes is unsafe even when diagnostic OUTPUT flags are present.
     const char * qkv_probe_dir = std::getenv("LLAMA_GALAXY_QKV_PROBE_DIR");
     const bool qkv_probe_enabled = qkv_probe_dir != nullptr && qkv_probe_dir[0] != '\0';
-    const auto is_qkv_probe_node = [qkv_probe_enabled](const ggml_tensor * node) -> bool {
-        if (!qkv_probe_enabled || node == nullptr ||
+    const char * live_layer_raw = std::getenv("LLAMA_GALAXY_CAUSAL_LIVE_LAYER");
+    const bool live_shadow_requested = live_layer_raw != nullptr && live_layer_raw[0] != '\0';
+    // Fail closed on an invalid selector rather than silently letting the
+    // model run without producing a live correctness witness.
+    int live_shadow_layer = -1;
+    if (live_shadow_requested) {
+        const std::string selector(live_layer_raw);
+        if (selector.size() > 3 || selector.empty() ||
+                !std::all_of(selector.begin(),selector.end(),
+                             [](char ch) { return ch >= '0' && ch <= '9'; })) {
+            GGML_LOG_ERROR("[GALAXY_CAUSAL_LIVE] invalid LLAMA_GALAXY_CAUSAL_LIVE_LAYER\n");
+            return GGML_STATUS_FAILED;
+        }
+        live_shadow_layer = std::stoi(selector);
+        if (live_shadow_layer != 0) {
+            GGML_LOG_ERROR("[GALAXY_CAUSAL_LIVE] phase=v1 only layer 0 is supported\n");
+            return GGML_STATUS_FAILED;
+        }
+    }
+    const bool qkv_capture_enabled = qkv_probe_enabled || live_shadow_requested;
+    const auto is_qkv_probe_node = [qkv_capture_enabled](const ggml_tensor * node) -> bool {
+        if (!qkv_capture_enabled || node == nullptr ||
                 (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 ||
                 node->ne[1] <= 0) {
             return false;
@@ -2167,7 +2188,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         GGML_LOG_ERROR("[GALAXY_SP] graph transitions need exactly two Meta backends\n");
         return GGML_STATUS_FAILED;
     }
-    if (qkv_probe_enabled && n_backends != 2) {
+    if (qkv_capture_enabled && n_backends != 2) {
         GGML_LOG_ERROR("[GALAXY_QKV_CAPTURE] producer-time capture requires two Meta backends\n");
         return GGML_STATUS_FAILED;
     }
@@ -2233,7 +2254,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 // A Galaxy layout transition must immediately follow the
                 // original PARTIAL output. Delaying the AllReduce would
                 // incorrectly consume/overwrite one of its partial inputs.
-                if (has_galaxy_markers || qkv_probe_enabled) {
+                if (has_galaxy_markers || qkv_capture_enabled) {
                     // Never delay a reduction across an opt-in diagnostic
                     // boundary: the producing tensor must remain last.
                     return i;
