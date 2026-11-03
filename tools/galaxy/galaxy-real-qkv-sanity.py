@@ -79,6 +79,61 @@ def main():
         snapshots[name] = load(args.probe_dir / f"{name}-{args.layer}.f32",
                                args.tokens * width)
 
+    # An exceptionally specific symptom: the best KV-head sequence and
+    # best RMSE repeat in h=0..11 and h=12..23. Test whether exported
+    # Attention/Query/KV activations themselves duplicate their rank
+    # halves. Equal best matches alone are only suggestive; an exact
+    # activation equality is decisive evidence of duplicated data.
+    for name, head_count in (("Qcur", args.heads), ("Kcur", args.kv_heads),
+                             ("Vcur", args.kv_heads), ("kqv_out", args.heads)):
+        data = snapshots[name]
+        if head_count % 2:
+            print(f"[GALAXY_QKV_DUPLICATE] tensor={name} skip=odd_head_count")
+            continue
+        stride = head_count * args.head_dim
+        half = stride // 2
+        a = []
+        b = []
+        for token in range(args.tokens):
+            begin = token * stride
+            a.extend(data[begin:begin + half])
+            b.extend(data[begin + half:begin + stride])
+        rmse, maxabs, cosine = metrics(a, b)
+        exact = sum(x == y for x, y in zip(a, b))
+        print(f"[GALAXY_QKV_DUPLICATE] tensor={name} halves={head_count//2}+{head_count//2} "
+              f"rmse={rmse:.9g} max_abs={maxabs:.9g} cosine={cosine:.9g} "
+              f"exact={exact}/{len(a)}")
+        # Emit token0 metrics separately, to correlate with the
+        # first-token causal invariant, rather than guessing from averages.
+        t_rmse, t_max, t_cos = metrics(a[:half], b[:half])
+        print(f"[GALAXY_QKV_DUPLICATE] tensor={name} token=0 "
+              f"rmse={t_rmse:.9g} max_abs={t_max:.9g} cosine={t_cos:.9g}")
+
+    # For an exact rank-half duplication, every aligned head-pair and
+    # every token must match. The per-head check helps spot just one
+    # duplicated logical Q head even when the entire half differs.
+    for name in ("Qcur", "kqv_out"):
+        width = qwidth
+        data = snapshots[name]
+        half_heads = args.heads // 2
+        if args.heads % 2:
+            continue
+        for h in range(half_heads):
+            va = []
+            vb = []
+            for token in range(args.tokens):
+                base = token * width
+                i = base + h * args.head_dim
+                j = base + (h + half_heads) * args.head_dim
+                va.extend(data[i:i+args.head_dim])
+                vb.extend(data[j:j+args.head_dim])
+            h_rmse, h_max, h_cos = metrics(va, vb)
+            if h == 0 or h_rmse < 1.0e-7:
+                print(f"[GALAXY_QKV_HEAD_PAIR] tensor={name} "
+                      f"head_a={h} head_b={h+half_heads} "
+                      f"rmse={h_rmse:.9g} max_abs={h_max:.9g} "
+                      f"cosine={h_cos:.9g} exact={sum(x == y for x, y in zip(va, vb))}/{len(va)}")
+
     original = as_row(snapshots["kqv_out"], 0, qwidth)
     v0 = as_row(snapshots["Vcur"], 0, kvwidth)
     ratio = args.heads // args.kv_heads
