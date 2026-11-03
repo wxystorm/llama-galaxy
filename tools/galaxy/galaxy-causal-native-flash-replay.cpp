@@ -105,6 +105,7 @@ options parse_args(int argc, char ** argv) {
     demand(c.dim > 0 && c.heads <= INT64_MAX/c.dim && c.kv_heads <= INT64_MAX/c.dim,
             "invalid head dimension");
     demand(c.tile >= 1 && c.tile <= 1024, "--tile must be 1..1024");
+    demand(c.tokens <= 4096, "native replay is limited to 4096-token prefills");
     demand(c.tokens <= INT32_MAX/(c.heads*c.dim) &&
            c.tokens <= INT32_MAX/(c.kv_heads*c.dim),
            "GLG1 snapshot exceeds 32-bit element count");
@@ -176,8 +177,10 @@ struct native_graph {
     ggml_tensor * q = nullptr;
     ggml_tensor * k_local = nullptr;
     ggml_tensor * v_local = nullptr;
-    ggml_tensor * k_full = nullptr;
+    ggml_tensor * k_full = nullptr;  // contiguous 2D view: first actual tokens
     ggml_tensor * v_full = nullptr;
+    ggml_tensor * k_storage = nullptr; // padded to match llama.cpp KV cache
+    ggml_tensor * v_storage = nullptr;
     ggml_tensor * mask = nullptr;
     ggml_tensor * attention = nullptr;
     ggml_tensor * output = nullptr;
@@ -185,6 +188,7 @@ struct native_graph {
     int64_t q_count = 0;
     int64_t mask_width = 0;
     int64_t mask_rows = 0;
+    int64_t kv_padded = 0;
 
     native_graph(ggml_backend_t backend, const options & c,
                  int64_t begin, int64_t count) : q_begin(begin), q_count(count) {
@@ -199,23 +203,29 @@ struct native_graph {
         q       = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.dim, c.heads, count);
         k_local = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kvw, count);
         v_local = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kvw, count);
-        k_full  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kvw, c.tokens);
-        v_full  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kvw, c.tokens);
+        // Real llama.cpp Flash Attention reads a padded KV-cache length.
+        // Gather into a contiguous view of its populated first tokens;
+        // the remaining capacity is zero-filled and masked to -infinity.
+        kv_padded = GGML_PAD(c.tokens, 256);
+        k_storage = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kvw, kv_padded);
+        v_storage = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kvw, kv_padded);
+        const size_t kv_row_bytes = size_t(kvw)*sizeof(ggml_fp16_t);
+        k_full = ggml_view_2d(ctx,k_storage,kvw,c.tokens,kv_row_bytes,0);
+        v_full = ggml_view_2d(ctx,v_storage,kvw,c.tokens,kv_row_bytes,0);
         ggml_set_input(q);
-        ggml_set_input(k_full);
-        ggml_set_input(v_full);
+        ggml_set_input(k_storage);
+        ggml_set_input(v_storage);
 
         // CUDA/Phone Flash Attention masks are F16, with padded rows.
-        // The K/V data themselves have exactly c.tokens logical entries.
-        mask_width = GGML_PAD(c.tokens, 256);
+        mask_width = kv_padded;
         mask_rows  = GGML_PAD(count, 32);
         mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, mask_width, mask_rows);
         ggml_set_input(mask);
 
         ggml_tensor * query = ggml_permute(ctx, q, 0, 2, 1, 3);
-        ggml_tensor * key = ggml_reshape_3d(ctx, k_full, c.dim, c.kv_heads, c.tokens);
+        ggml_tensor * key = ggml_reshape_3d(ctx, k_storage, c.dim, c.kv_heads, kv_padded);
         key = ggml_permute(ctx, key, 0, 2, 1, 3);
-        ggml_tensor * value = ggml_reshape_3d(ctx, v_full, c.dim, c.kv_heads, c.tokens);
+        ggml_tensor * value = ggml_reshape_3d(ctx, v_storage, c.dim, c.kv_heads, kv_padded);
         value = ggml_permute(ctx, value, 0, 2, 1, 3);
         // For Flash Attention with a non-transposed contiguous V cache,
         // Llama's v_trans is FALSE before permute, so the kernel expects
@@ -244,6 +254,10 @@ struct native_graph {
                 const std::vector<ggml_fp16_t> & all_v) const {
         const size_t qw = static_cast<size_t>(c.heads*c.dim);
         const size_t kvw = static_cast<size_t>(c.kv_heads*c.dim);
+        // Without zeroing padded cache capacity, an implementation could
+        // encounter uninitialized values even behind a -infinity mask.
+        ggml_backend_tensor_memset(k_storage,0,0,ggml_nbytes(k_storage));
+        ggml_backend_tensor_memset(v_storage,0,0,ggml_nbytes(v_storage));
         ggml_backend_tensor_set(q, all_q.data()+q_begin*qw, 0, ggml_nbytes(q));
         ggml_backend_tensor_set(k_local, all_k.data()+q_begin*kvw,
                                 0, ggml_nbytes(k_local));
