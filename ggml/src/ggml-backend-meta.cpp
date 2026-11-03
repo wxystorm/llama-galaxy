@@ -2994,6 +2994,56 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
+        // Check the NEXT production boundary after replacement. This is
+        // a hard byte-for-byte proof that the existing kqv_out reshape
+        // sees the injected Flash tensor instead of stale/original TP
+        // output. W_o is in a later Meta subgraph and cannot execute
+        // until this test succeeds.
+        if (live_replace_requested &&
+                std::strcmp(original_last->name,
+                        ("kqv_out-"+std::to_string(live_shadow_layer)).c_str())==0 &&
+                original_last->ne[1]>=8) {
+            if (!live_replaced_pending ||
+                    original_last->op!=GGML_OP_RESHAPE ||
+                    original_last->type!=GGML_TYPE_F32 ||
+                    !ggml_is_contiguous(original_last) ||
+                    ggml_backend_meta_get_split_state(original_last,false).axis!=
+                            GGML_BACKEND_SPLIT_AXIS_0) {
+                GGML_LOG_ERROR("[GALAXY_CAUSAL_REPLACE] no compatible injected Flash output\n");
+                return GGML_STATUS_FAILED;
+            }
+            const auto captured=qkv_live_snapshots.find(original_last);
+            if (captured==qkv_live_snapshots.end() || captured->second.size()!=2) {
+                GGML_LOG_ERROR("[GALAXY_CAUSAL_REPLACE] missing reshaped producer snapshot\n");
+                return GGML_STATUS_FAILED;
+            }
+            for(int rank=0;rank<2;++rank) {
+                if(captured->second[rank].size()!=live_replaced_shards[rank].size() ||
+                        std::memcmp(captured->second[rank].data(),
+                                    live_replaced_shards[rank].data(),
+                                    live_replaced_shards[rank].size())!=0) {
+                    std::fprintf(stderr,
+                            "[GALAXY_CAUSAL_REPLACE_VERIFY] layer=%d rank=%d"
+                            " pre_wo_identity=FAIL status=FAIL\n",
+                            live_shadow_layer,rank);
+                    return GGML_STATUS_FAILED;
+                }
+                std::fprintf(stderr,
+                        "[GALAXY_CAUSAL_REPLACE_VERIFY] layer=%d rank=%d"
+                        " bytes=%zu pre_wo_identity=BYTE_EXACT status=PASS\n",
+                        live_shadow_layer,rank,live_replaced_shards[rank].size());
+            }
+            live_replaced_pending=false;
+            live_replaced_verified=true;
+            std::fprintf(stderr,
+                    "[GALAXY_CAUSAL_LIVE] layer=%d tokens=%" PRId64
+                    " mode=REPLACE tp_flash_skipped=1"
+                    " production_wo_input=SP_ATTENTION"
+                    " pre_wo_identity=BYTE_EXACT status=PASS\n",
+                    live_shadow_layer,original_last->ne[1]);
+            std::fflush(stderr);
+        }
+
         // The live causal path is a SHADOW of a single TP layer: it consumes
         // the actual Q/K/V producer-time bytes from THIS Meta graph and
         // compares the native PC/Phone Flash result against THIS graph's
@@ -3659,6 +3709,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     qkv_live_snapshots.size());
             std::fflush(stderr);
         }
+    }
+    if (live_replace_requested && live_replaced_pending) {
+        GGML_LOG_ERROR("[GALAXY_CAUSAL_REPLACE] output was not consumed by kqv_out\n");
+        return GGML_STATUS_FAILED;
     }
     if (has_galaxy_markers) {
         // A required correctness witness, not a verbose debug message.
