@@ -1515,3 +1515,51 @@ backend/Flash kernel error from initialization.
 
 Rebuild only the PC standalone target and rerun the identical command.
 No model rerun or Phone RPC rebuild is required.
+
+
+## RPC Flash Attention timing semantics (after the first native PASS)
+
+The real 98-token PC+Phone native replay is NUMERICALLY CORRECT:
+
+- CUDA0 49 Query tokens: RMSE 4.19456e-6, MaxAbs 1.86935e-4
+- Phone RPC0 49 Query tokens: RMSE 1.24643e-5, MaxAbs 8.83922e-4
+- Combined RMSE 9.2993e-6, cosine approximately 1
+- F16 K/V gathering passed, gather_ms=77.0838, diagnostic
+  verification=30.4528 ms.
+
+HOWEVER, the previously reported Phone compute_ms=0.5921 is NOT the
+Phone device execution time. In ggml/src/ggml-rpc/ggml-rpc.cpp,
+ggml_backend_rpc_graph_compute() sends RPC_CMD_GRAPH_COMPUTE with the
+fire-and-forget send_rpc_cmd() overload and returns after transmission.
+The RPC server DOES execute ggml_backend_graph_compute() on the
+selected backend, and the subsequent tensor_get waits through command
+ordering for the correct result. Client graph submission is therefore
+not a meaningful measure of kernel duration.
+
+The native replay now:
+1. Dispatches BOTH CUDA and Phone Flash graphs using
+   ggml_backend_graph_compute_async(), before reading either result.
+2. Reports submit_ms per rank: submission/launch overhead ONLY.
+3. Reports readback_wait_ms: local sync and/or RPC result read.
+4. Reports observed_ready_wall_ms: elapsed since that rank's dispatch
+   started until the caller retrieved its result, which may include
+   waiting for the other rank or IO and is NOT an exclusive kernel time.
+5. Reports compute_phase_wall_ms for the two graph submissions and
+   both result readbacks, with no correctness/reference work included.
+
+The definitive Phone kernel time needs the Phone service-side
+GRAPH_COMPUTE profile, if enabled. Do not quote sub-millisecond
+RPC submit_ms as mobile GPU performance, and do not compare it to
+CUDA compute_ms as if those numbers were measured identically.
+
+Rebuild only galaxy-causal-native-flash-replay and repeat the SAME
+verified $probe/98-token invocation. No GGUF inference/Phone server
+rebuild is needed.
+
+The next full-graph integration constraint remains: current Q/K/V GGUF
+weights and KV cache are sharded by HEAD under TP; this native SP replay
+uses global heads but Q sharded by TOKEN. The production graph requires
+either (a) a TP-head -> SP-token activation/layout exchange (and reverse
+exchange for W_o), or (b) full QKV/W_o weight mirroring plus SP inputs
+and KV cache ownership. A successful standalone Flash replay alone
+does not choose between these two architectures.
