@@ -38,8 +38,16 @@ function Invoke-GalaxyProcess {
     $started = $false
 
     try {
-        $outFile = [System.IO.File]::Create($StdoutPath)
-        $errFile = [System.IO.File]::Create($StderrPath)
+        # PowerShell's current provider location may be on E: while .NET's
+        # Environment.CurrentDirectory remains C:\Users\<account>.  File.Create
+        # resolves relative paths against the latter, unlike New-Item. Normalize
+        # with PowerShell's own path resolver before calling .NET file APIs.
+        $stdoutFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($StdoutPath)
+        $stderrFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($StderrPath)
+        [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($stdoutFull)) | Out-Null
+        [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($stderrFull)) | Out-Null
+        $outFile = [System.IO.File]::Create($stdoutFull)
+        $errFile = [System.IO.File]::Create($stderrFull)
 
         if (-not $proc.Start()) {
             throw "Could not start executable: $Executable"
