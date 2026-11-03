@@ -2755,6 +2755,26 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 : size_t(cgraph->n_nodes);
         GGML_ASSERT(i_stop > i_start);
         ggml_tensor * original_last = cgraph->nodes[i_stop - 1];
+        const bool is_replace_raw_boundary = live_replace_requested &&
+                std::strcmp(original_last->name,
+                        ("fattn_raw-"+std::to_string(live_shadow_layer)).c_str())==0 &&
+                original_last->ne[2]>=8;
+        if (is_replace_raw_boundary) {
+            const auto split=ggml_backend_meta_get_split_state(original_last,false);
+            if (original_last->op!=GGML_OP_FLASH_ATTN_EXT ||
+                    original_last->type!=GGML_TYPE_F32 ||
+                    (original_last->flags & GGML_TENSOR_FLAG_OUTPUT)==0 ||
+                    split.axis!=GGML_BACKEND_SPLIT_AXIS_1 ||
+                    !ggml_is_contiguous(original_last) ||
+                    original_last->ne[3]!=1) {
+                GGML_LOG_ERROR("[GALAXY_CAUSAL_REPLACE] raw Flash boundary contract failed\n");
+                return GGML_STATUS_FAILED;
+            }
+            if (live_replaced_pending) {
+                GGML_LOG_ERROR("[GALAXY_CAUSAL_REPLACE] previous output not consumed\n");
+                return GGML_STATUS_FAILED;
+            }
+        }
         std::vector<double> dispatch_ms(n_backends, 0);
         std::vector<ggml_galaxy_profile::instant> dispatch_start(n_backends);
 
