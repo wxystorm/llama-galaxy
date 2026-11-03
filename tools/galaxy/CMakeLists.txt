@@ -64,3 +64,12 @@ target_compile_features(galaxy-layout-selftest PRIVATE cxx_std_17)
 if (GGML_RPC)
     target_compile_definitions(galaxy-layout-selftest PRIVATE GALAXY_LAYOUT_HAVE_RPC=1)
 endif()
+
+# The same native Flash shadow helper invoked by the Meta production graph.
+# CPU+CPU smoke checks contracts; CUDA+Phone RPC runs native device kernels.
+add_executable(galaxy-causal-live-selftest galaxy-causal-live-selftest.cpp)
+target_link_libraries(galaxy-causal-live-selftest PRIVATE ggml)
+target_compile_features(galaxy-causal-live-selftest PRIVATE cxx_std_17)
+if (GGML_RPC)
+    target_compile_definitions(galaxy-causal-live-selftest PRIVATE GALAXY_CAUSAL_LIVE_HAVE_RPC=1)
+endif()
