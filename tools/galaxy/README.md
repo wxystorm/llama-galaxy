@@ -837,3 +837,75 @@ operator dumps. The subtraction adds minor float32 rounding. Large
 differences in `ffn_norm-0` would implicate inputs/normalization before
 the FFN rather than the FFN itself. The stage comparator does not use
 the logits Top-1 threshold as a correctness criterion.
+
+
+
+## Final Llama3.2 Galaxy2 FFN Up/Gate/SwiGLU numerical experiment
+
+The cap=0/1 stage diagnosis found identical `ffn_inp-0` and
+`ffn_norm-0`, while layer-0 FFN contributions differ with
+RMSE ~= 0.00044864. Layer-1 Attention contributions remain close, so the
+last diagnostic tests whether the first divergence is in the FFN Up/Gate
+quantized GEMMs or in the Down projection/ReduceScatter.
+
+Opt-in `-DumpFfnOps "0"` pins precisely three layer-0 activations in
+dense Llama and dumps them **in common logical [8192, tokens] order**:
+
+- `ffn_ops/ffn_up-0.f32` -- Up projection before activation
+- `ffn_ops/ffn_gate-0.f32` -- Gate projection before activation
+- `ffn_ops/ffn_swiglu-0.f32` -- fused SwiGLU (Gate/Up activation product)
+
+Llama 3.2 uses a fused `ggml_swiglu_split` implementation. An
+`ffn_gate_par` node is **not** executed in its ordinary SwiGLU path.
+The diagnostic therefore captures `ffn_swiglu` instead.
+
+In FFN TP, the output is sharded across FFN feature dim 0; in FFN SP,
+it is sharded across token dim 1. The exporter checks split axis and
+source dimensions, performs the corresponding reconstruction, writes
+GLG1/F32, and fails explicitly on unsupported/incomplete layouts.
+The pre-existing stage comparator uses the final post-RS
+`FFN_contribution` (= `l_out-0 - ffn_inp-0`) as the logical Down
+projection result; the TP raw partial Down is NOT directly compared
+against SP Down.
+
+This does not change collectives or Phone RPC protocol. The output
+pins and readback are intrusive; do not use these runs for tok/s claims.
+Only the Windows PC `llama-cli` needs rebuilding.
+
+```powershell
+git pull --ff-only origin feat/galaxy-baseline
+cmake --build build-galaxy --config Release --target llama-cli -j 8
+python -m py_compile .\tools\galaxy\galaxy-stage-compare.py
+
+$common = @{
+  Model = "E:\llama\models\Llama-3.2-3B-Instruct-Q4_K_M.gguf"
+  Rpc = "10.39.52.114:50052"
+  PromptFile = "D:\prima.cpp\prompts\prompt_64.txt"
+  HeadSplit = "12,12"
+  FfnSplit = "4096,4096"
+  SeqWeights = "1,1"
+  DumpStages = "0"
+  DumpLayers = "0"
+  DumpFfnOps = "0"
+  OutputDir = ".\galaxy-sp-results\ffn-final-diagnostic"
+  TimeoutSec = 300
+}
+.\tools\galaxy\run_galaxy_sp_smoke.ps1 @common -Galaxy2 -Galaxy2FfnSpLayers 0
+.\tools\galaxy\run_galaxy_sp_smoke.ps1 @common -Galaxy2 -Galaxy2FfnSpLayers 1
+
+# Set these to the real run folders printed in the two smoke logs:
+$cap0 = ".\galaxy-sp-results\ffn-final-diagnostic\galaxy2-CAP0"
+$cap1 = ".\galaxy-sp-results\ffn-final-diagnostic\galaxy2-CAP1"
+python .\tools\galaxy\galaxy-stage-compare.py `
+    --reference $cap0 --candidate $cap1 --layers 0 `
+    --hidden 3072 --ffn-width 8192 --ffn-ops `
+    --seq-weights "1,1" `
+    --output ".\galaxy-sp-results\ffn-final-diagnostic\comparison.json"
+```
+
+Interpretation: If Up/Gate diverge, inspect FFN weight partitioning and
+quantized projection numerics; if Up/Gate agree but SwiGLU diverges,
+inspect fused activation; if all three agree within measurement noise
+but `FFN_contribution` diverges, investigate Down projection/TP
+ReduceScatter precision. This is a numerical diagnostic, not a proof
+of correctness or exact output equivalence.
