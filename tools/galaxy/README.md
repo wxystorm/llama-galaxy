@@ -1197,3 +1197,54 @@ or soft-capping. This bypasses the model's *physical* KV cache on
 purpose; it does not prove continuation/decode parity and does not
 change the existing TP/Galaxy/Galaxy2 inference path. The final graph
 integration remains separate.
+
+
+## Real-model replay mismatch: investigate the source QKV snapshots first
+
+Observed on CUDA0+Phone RPC, Llama-3.2-3B, first 98-token prompt,
+Layer 0, TP model QKV -> SP host-staged replay:
+
+- PC: RMSE=0.227125, MaxAbs=4.48022, Cosine=0.00028346
+- Phone: RMSE=0.271659, MaxAbs=4.66108, Cosine=-0.00699348
+- Combined: RMSE=0.250384, MaxAbs=4.66108, Cosine=-0.00397957
+- K/V transport from the GLG1 snapshots to both ranks was byte-exact.
+
+This is a **severe numerical mismatch**, not ordinary F16/Flash Attention
+rounding; do not enable SP Attention in inference on this evidence.
+The current replay's `PASS transport_verified numerical_parity_not_asserted`
+is deliberately **not** an Attention correctness verdict.
+
+`galaxy-real-qkv-sanity.py` now checks an independent invariant that
+requires no GPU, RPC or model rerun: for the FIRST token of a fresh
+single-sequence causal prefill, `kqv_out[0,query_head,:]` must equal
+`Vcur[0,query_head/(n_q_heads/n_kv_heads),:]` (modulo cache-type
+conversion). It prints group-vs-interleaved head-mapping metrics,
+the best matching KV head for every Query head, and whether the first
+Attention output more closely resembles V from another token.
+
+Run against the **already exported** 98-token probe:
+
+```powershell
+git pull --ff-only origin feat/galaxy-baseline
+python -m py_compile .\tools\galaxy\galaxy-real-qkv-sanity.py
+$probe = "E:\llama\llama-galaxy\galaxy-sp-results\real-qkv-replay\tp-20261103-190442\real-qkv\tokens-98"
+python .\tools\galaxy\galaxy-real-qkv-sanity.py `
+    --probe-dir $probe --layer 0 --tokens 98 `
+    --heads 24 --kv-heads 8 --head-dim 128
+```
+
+Interpretation:
+- If token0 matches grouped V[0] closely, the export and initial
+  Attention value layout pass a strong one-token sanity test.
+  Continue by comparing the actual KV-cache mask/slot indices and
+  the multi-key softmax execution.
+- If it matches a *different* KV head or Token, inspect the Meta
+  head/slot reconstruction before attempting a numerical fix.
+- If it matches NO V candidate, first check that `kqv_out` and
+  `Vcur` are sourced from the same graph and actual post-cache
+  execution; inspect physical cache V, mask and output tensor
+  lifetime. Do not infer that the transport primitive is incorrect.
+
+`galaxy-causal-model-replay` also prints
+`check=first_token_v_identity` and a severe mismatch warning after
+rebuilding, but the Python check works immediately on existing files.
