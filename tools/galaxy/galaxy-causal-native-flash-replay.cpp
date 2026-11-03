@@ -12,6 +12,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "../../ggml/src/ggml-backend-galaxy-collectives.h"
+#include "../../ggml/src/ggml-backend-galaxy-layout.h"
 #if defined(GALAXY_CAUSAL_HAVE_RPC)
 #include "ggml-rpc.h"
 #endif
@@ -64,6 +65,8 @@ struct options {
     int64_t kv_heads = 8;
     int64_t dim = 128;
     int64_t tile = 32;
+    bool bridge_tp_sp = false;
+    int64_t tp_heads0 = 0;    // TP rank0 Query heads (must align to GQA group)
     double require_rmse = -1.0;
 };
 
@@ -83,6 +86,11 @@ options parse_args(int argc, char ** argv) {
         else if (key == "--kv-heads") c.kv_heads = parse_uint(val,key);
         else if (key == "--head-dim") c.dim = parse_uint(val,key);
         else if (key == "--tile") c.tile = parse_uint(val,key);
+        else if (key == "--tp-heads-rank0") c.tp_heads0 = parse_uint(val,key);
+        else if (key == "--bridge-tp-sp") {
+            demand(val == "0" || val == "1", "--bridge-tp-sp requires 0 or 1");
+            c.bridge_tp_sp = val == "1";
+        }
         else if (key == "--require-rmse") {
             // The explicit requirement is optional. By default the program
             // reports parity measurements rather than claiming PASS.
@@ -107,6 +115,20 @@ options parse_args(int argc, char ** argv) {
             "invalid head dimension");
     demand(c.tile >= 1 && c.tile <= 1024, "--tile must be 1..1024");
     demand(c.tokens <= 4096, "native replay is limited to 4096-token prefills");
+    if (c.bridge_tp_sp) {
+        const int64_t group = c.heads / c.kv_heads;
+        if (c.tp_heads0 == 0) {
+            // Default to the closest balanced split of complete GQA groups.
+            c.tp_heads0 = (c.kv_heads/2)*group;
+        }
+        demand(c.tp_heads0 > 0 && c.tp_heads0 < c.heads &&
+               c.tp_heads0 % group == 0,
+               "TP head split must assign complete GQA groups to both ranks");
+        demand(c.tp_heads0/group > 0 && c.tp_heads0/group < c.kv_heads,
+               "TP K/V ownership must be nonempty on each rank");
+    } else {
+        demand(c.tp_heads0 == 0, "--tp-heads-rank0 requires --bridge-tp-sp 1");
+    }
     demand(c.tokens <= INT32_MAX/(c.heads*c.dim) &&
            c.tokens <= INT32_MAX/(c.kv_heads*c.dim),
            "GLG1 snapshot exceeds 32-bit element count");
@@ -139,6 +161,24 @@ std::vector<ggml_fp16_t> to_half(const std::vector<float> & input) {
         result[i] = ggml_fp32_to_fp16(input[i]);
     }
     return result;
+}
+
+template <typename T>
+std::vector<T> pack_tp_heads(const std::vector<T> & canonical,
+                             int64_t total_heads, int64_t dim,
+                             int64_t tokens, int64_t head_begin, int64_t local_heads) {
+    const size_t full_width = static_cast<size_t>(total_heads*dim);
+    const size_t local_width = static_cast<size_t>(local_heads*dim);
+    demand(canonical.size() == static_cast<size_t>(tokens)*full_width &&
+           head_begin >= 0 && head_begin+local_heads <= total_heads,
+           "TP source head extent mismatch");
+    std::vector<T> packed(static_cast<size_t>(tokens)*local_width);
+    for (int64_t t = 0; t < tokens; ++t) {
+        std::copy_n(canonical.data()+static_cast<size_t>(t)*full_width+
+                    static_cast<size_t>(head_begin*dim), local_width,
+                    packed.data()+static_cast<size_t>(t)*local_width);
+    }
+    return packed;
 }
 
 struct comparison {
@@ -176,6 +216,10 @@ struct native_graph {
     ggml_backend_buffer_t buffer = nullptr;
     ggml_cgraph * graph = nullptr;
     ggml_tensor * q = nullptr;
+    ggml_tensor * q_tp = nullptr;
+    ggml_tensor * k_tp = nullptr;
+    ggml_tensor * v_tp = nullptr;
+    ggml_tensor * output_tp = nullptr;
     ggml_tensor * k_local = nullptr;
     ggml_tensor * v_local = nullptr;
     ggml_tensor * k_full = nullptr;  // contiguous 2D view: first actual tokens
@@ -187,12 +231,14 @@ struct native_graph {
     ggml_tensor * output = nullptr;
     int64_t q_begin = 0;
     int64_t q_count = 0;
+    int64_t tp_q_begin = 0, tp_q_count = 0;
+    int64_t tp_kv_begin = 0, tp_kv_count = 0;
     int64_t mask_width = 0;
     int64_t mask_rows = 0;
     int64_t kv_padded = 0;
 
     native_graph(ggml_backend_t backend, const options & c,
-                 int64_t begin, int64_t count) : q_begin(begin), q_count(count) {
+                 int64_t begin, int64_t count, int rank) : q_begin(begin), q_count(count) {
         // One separate GGML graph per physical backend, not the Meta wrapper.
         // Input tensors are device-resident and FLASH_ATTN_EXT executes there.
         const ggml_init_params p = {size_t(4)*1024*1024, nullptr, true};
@@ -200,6 +246,18 @@ struct native_graph {
         demand(ctx != nullptr, "ggml_init failed");
         const int64_t qw = c.heads*c.dim;
         const int64_t kvw = c.kv_heads*c.dim;
+        if (c.bridge_tp_sp) {
+            tp_q_begin = rank == 0 ? 0 : c.tp_heads0;
+            tp_q_count = rank == 0 ? c.tp_heads0 : c.heads-c.tp_heads0;
+            tp_kv_begin = rank == 0 ? 0 : c.tp_heads0/(c.heads/c.kv_heads);
+            tp_kv_count = rank == 0 ? tp_kv_begin /* overwritten below */
+                                    : c.kv_heads-tp_kv_begin;
+            if (rank == 0) tp_kv_count = c.tp_heads0/(c.heads/c.kv_heads);
+            q_tp = ggml_new_tensor_2d(ctx,GGML_TYPE_F32,tp_q_count*c.dim,c.tokens);
+            k_tp = ggml_new_tensor_2d(ctx,GGML_TYPE_F16,tp_kv_count*c.dim,c.tokens);
+            v_tp = ggml_new_tensor_2d(ctx,GGML_TYPE_F16,tp_kv_count*c.dim,c.tokens);
+            output_tp = ggml_new_tensor_2d(ctx,GGML_TYPE_F32,tp_q_count*c.dim,c.tokens);
+        }
 
         q       = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.dim, c.heads, count);
         k_local = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kvw, count);
@@ -267,11 +325,26 @@ struct native_graph {
                 "padded K/V allocation mismatch");
         ggml_backend_tensor_set(k_storage, zero_padded_kv.data(), 0, ggml_nbytes(k_storage));
         ggml_backend_tensor_set(v_storage, zero_padded_kv.data(), 0, ggml_nbytes(v_storage));
-        ggml_backend_tensor_set(q, all_q.data()+q_begin*qw, 0, ggml_nbytes(q));
-        ggml_backend_tensor_set(k_local, all_k.data()+q_begin*kvw,
-                                0, ggml_nbytes(k_local));
-        ggml_backend_tensor_set(v_local, all_v.data()+q_begin*kvw,
-                                0, ggml_nbytes(v_local));
+        if (c.bridge_tp_sp) {
+            // Emulate real TP projection owners from a trusted GGUF
+            // activation snapshot. This is the only synthetic boundary:
+            // all subsequent TP->SP transfers run on actual backend buffers.
+            const auto q_heads = pack_tp_heads(all_q,c.heads,c.dim,c.tokens,
+                                               tp_q_begin,tp_q_count);
+            const auto k_heads = pack_tp_heads(all_k,c.kv_heads,c.dim,c.tokens,
+                                               tp_kv_begin,tp_kv_count);
+            const auto v_heads = pack_tp_heads(all_v,c.kv_heads,c.dim,c.tokens,
+                                               tp_kv_begin,tp_kv_count);
+            ggml_backend_tensor_set(q_tp,q_heads.data(),0,ggml_nbytes(q_tp));
+            ggml_backend_tensor_set(k_tp,k_heads.data(),0,ggml_nbytes(k_tp));
+            ggml_backend_tensor_set(v_tp,v_heads.data(),0,ggml_nbytes(v_tp));
+        } else {
+            ggml_backend_tensor_set(q, all_q.data()+q_begin*qw, 0, ggml_nbytes(q));
+            ggml_backend_tensor_set(k_local, all_k.data()+q_begin*kvw,
+                                    0, ggml_nbytes(k_local));
+            ggml_backend_tensor_set(v_local, all_v.data()+q_begin*kvw,
+                                    0, ggml_nbytes(v_local));
+        }
 
         std::vector<ggml_fp16_t> causal(
                 static_cast<size_t>(mask_width*mask_rows),
@@ -315,8 +388,8 @@ void execute(const options & c, const devices_t & backends) {
                                       c.tokens*qw);
     const auto k_half = to_half(k), v_half = to_half(v);
 
-    native_graph pc(backends[0],c,0,c.rank0);
-    native_graph phone(backends[1],c,c.rank0,c.tokens-c.rank0);
+    native_graph pc(backends[0],c,0,c.rank0,0);
+    native_graph phone(backends[1],c,c.rank0,c.tokens-c.rank0,1);
     native_graph * ranks[2] = {&pc,&phone};
     for (int i = 0; i < 2; ++i) {
         ranks[i]->upload(backends[i],c,q,k_half,v_half);
@@ -325,6 +398,58 @@ void execute(const options & c, const devices_t & backends) {
                   << " padded_tokens=" << ranks[i]->kv_padded
                   << " kv_bytes=" << ggml_nbytes(ranks[i]->k_storage)
                   << " zero_method=HOST_TENSOR_SET status=PASS\n";
+    }
+
+    double tp_sp_ms = 0.0;
+    const ggml_galaxy_layout::exchange q_layout{
+        {c.tp_heads0,c.heads-c.tp_heads0},
+        {c.rank0,c.tokens-c.rank0},c.dim
+    };
+    const ggml_galaxy_layout::exchange kv_layout{
+        {c.tp_heads0/(c.heads/c.kv_heads),
+         c.kv_heads-c.tp_heads0/(c.heads/c.kv_heads)},
+        {c.rank0,c.tokens-c.rank0},c.dim
+    };
+    if (c.bridge_tp_sp) {
+        const auto tp_start = clock_type::now();
+        ggml_galaxy_layout::head_to_token(
+            backends,{pc.q_tp,phone.q_tp},{pc.q,phone.q},
+            q_layout,static_cast<size_t>(c.tile));
+        ggml_galaxy_layout::head_to_token(
+            backends,{pc.k_tp,phone.k_tp},{pc.k_local,phone.k_local},
+            kv_layout,static_cast<size_t>(c.tile));
+        ggml_galaxy_layout::head_to_token(
+            backends,{pc.v_tp,phone.v_tp},{pc.v_local,phone.v_local},
+            kv_layout,static_cast<size_t>(c.tile));
+        tp_sp_ms = elapsed_ms(tp_start);
+        // Explicitly read back the converted activation vectors to
+        // establish a byte-exact layout boundary before native Flash.
+        for (int rank = 0; rank < 2; ++rank) {
+            ggml_backend_synchronize(backends[rank]);
+            const int64_t begin = ranks[rank]->q_begin;
+            const int64_t count = ranks[rank]->q_count;
+            std::vector<float> qr(static_cast<size_t>(count*qw));
+            std::vector<ggml_fp16_t> kr(static_cast<size_t>(count*kvw));
+            std::vector<ggml_fp16_t> vr(static_cast<size_t>(count*kvw));
+            ggml_backend_tensor_get(ranks[rank]->q,qr.data(),0,ggml_nbytes(ranks[rank]->q));
+            ggml_backend_tensor_get(ranks[rank]->k_local,kr.data(),0,ggml_nbytes(ranks[rank]->k_local));
+            ggml_backend_tensor_get(ranks[rank]->v_local,vr.data(),0,ggml_nbytes(ranks[rank]->v_local));
+            const size_t q_offset=static_cast<size_t>(begin*qw);
+            const size_t kv_offset=static_cast<size_t>(begin*kvw);
+            demand(std::equal(qr.begin(),qr.end(),q.begin()+q_offset),
+                   "TP->SP Query bytes do not match canonical GGUF Q");
+            demand(std::equal(kr.begin(),kr.end(),k_half.begin()+kv_offset),
+                   "TP->SP Key bytes do not match canonical F16 K");
+            demand(std::equal(vr.begin(),vr.end(),v_half.begin()+kv_offset),
+                   "TP->SP Value bytes do not match canonical F16 V");
+        }
+        std::cout << "[GALAXY_TP_SP] q_heads=" << q_layout.head_counts[0]
+                  << "+" << q_layout.head_counts[1]
+                  << " kv_heads=" << kv_layout.head_counts[0]
+                  << "+" << kv_layout.head_counts[1]
+                  << " query_tokens=" << c.rank0 << "+" << c.tokens-c.rank0
+                  << " forward_ms=" << tp_sp_ms
+                  << " forward=BYTE_EXACT status=PASS\\n";
     }
 
     const input_t local_k = {pc.k_local,phone.k_local};
@@ -401,6 +526,42 @@ void execute(const options & c, const devices_t & backends) {
                   << " status=PASS\n";
     }
     const double compute_phase_wall_ms = elapsed_ms(phase_begin);
+    double sp_tp_ms = 0.0;
+    if (c.bridge_tp_sp) {
+        const auto back_start = clock_type::now();
+        ggml_galaxy_layout::token_to_head(
+            backends,{pc.output,phone.output},
+            {pc.output_tp,phone.output_tp},q_layout,
+            static_cast<size_t>(c.tile));
+        sp_tp_ms = elapsed_ms(back_start);
+        // Validate the reverse layout against the COMPUTED SP data,
+        // not merely the original reference. This would catch misplaced
+        // or duplicated heads even when both runs had similar RMSE.
+        for (int rank=0;rank<2;++rank) {
+            const int64_t local_heads=ranks[rank]->tp_q_count;
+            const int64_t first_head=ranks[rank]->tp_q_begin;
+            const size_t local_width=static_cast<size_t>(local_heads*c.dim);
+            std::vector<float> actual(static_cast<size_t>(c.tokens)*local_width);
+            ggml_backend_synchronize(backends[rank]);
+            ggml_backend_tensor_get(ranks[rank]->output_tp,
+                                    actual.data(),0,ggml_nbytes(ranks[rank]->output_tp));
+            for (int64_t t=0;t<c.tokens;++t) {
+                const int source_rank=t<c.rank0?0:1;
+                const int64_t source_token=t-(source_rank==0?0:c.rank0);
+                const size_t input_start=static_cast<size_t>(source_token*qw+first_head*c.dim);
+                const size_t output_start=static_cast<size_t>(t)*local_width;
+                demand(std::memcmp(actual.data()+output_start,
+                          local_outputs[source_rank].data()+input_start,
+                          local_width*sizeof(float))==0,
+                          "SP->TP native Attention head output mismatch rank="+std::to_string(rank));
+            }
+        }
+        std::cout << "[GALAXY_SP_TP] q_heads=" << c.tp_heads0
+                  << "+" << c.heads-c.tp_heads0
+                  << " tokens=" << c.rank0 << "+" << c.tokens-c.rank0
+                  << " reverse_ms=" << sp_tp_ms
+                  << " reverse=BYTE_EXACT status=PASS\\n";
+    }
 
     comparison total;
     for (int rank = 0; rank < 2; ++rank) {
@@ -435,6 +596,9 @@ void execute(const options & c, const devices_t & backends) {
               << " mask=GLOBAL_CAUSAL"
               << " gather_ms=" << gather_ms
               << " verify_ms=" << verify_ms
+              << " tp_sp_ms=" << tp_sp_ms
+              << " sp_tp_ms=" << sp_tp_ms
+              << " layout=" << (c.bridge_tp_sp ? "TP_SP_TP" : "DIRECT_SP")
               << " compute_phase_wall_ms=" << compute_phase_wall_ms
               << " execution_timing=DISPATCH_PLUS_RESULT_READY"
               << " rmse=" << total.rmse()
