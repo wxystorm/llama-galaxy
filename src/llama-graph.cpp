@@ -1680,6 +1680,9 @@ ggml_tensor * llm_graph_context::build_ffn(
 
                 cur = ggml_swiglu_split(ctx0, cur, tmp);
                 cb(cur, "ffn_swiglu", il);
+                if (galaxy_ffn_op_dump) {
+                    ggml_set_output(cur);
+                }
                 type_gate = LLM_FFN_SEQ;
             } else {
                 cur = ggml_silu(ctx0, cur);
@@ -1737,9 +1740,6 @@ ggml_tensor * llm_graph_context::build_ffn(
     if (gate && type_gate == LLM_FFN_PAR) {
         cur = ggml_mul(ctx0, cur, tmp);
         cb(cur, "ffn_gate_par", il);
-        if (galaxy_ffn_op_dump) {
-            ggml_set_output(cur);
-        }
     }
 
     if (down) {
