@@ -2857,7 +2857,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             " first_token_rmse=%.9g rmse=%.9g max_abs=%.9g"
                             " cosine=%.9g"
                             " tp_sp_ms=%.3f kv_gather_ms=%.3f"
-                            " native_phase_ms=%.3f sp_tp_ms=%.3f"
+                            " native_ready_wall_ms=%.3f sp_tp_ms=%.3f"
                             " threshold=%.3g production_output_unchanged=1"
                             " status=PASS\n",
                             live_shadow_layer,tokens,
@@ -2866,7 +2866,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             measured.first_token_rmse,measured.rmse,
                             measured.max_abs,measured.cosine,
                             measured.head_to_token_ms,measured.kv_gather_ms,
-                            measured.native_phase_ms,measured.token_to_head_ms,
+                            measured.native_ready_wall_ms,measured.token_to_head_ms,
                             work.max_rmse);
                     std::fflush(stderr);
                 }
