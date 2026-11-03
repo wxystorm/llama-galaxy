@@ -659,3 +659,41 @@ rotary positions and a stateful KV cache; SP Q ownership and the causal
 mask must be adapted as well. The existing TP, Galaxy and Galaxy2
 Qwen3 paths do not call this new primitive. The test provides an
 independent transport baseline for implementing that remaining mode.
+
+
+## Source mode matrix and remaining scope
+
+This fork uses Qwen3 on a PC+Phone Meta backend as its inference target.
+The upstream Galaxy-LM repository implements the following BERT
+model-parallel configurations with \`att_parallel_method\`,
+\`mlp_parallel_method\` and \`con_parallel_method\`:
+
+| Upstream mode | Attention | Connection | FFN | Qwen3 runtime status |
+|---|---|---|---|---|
+| TP | TP | None | TP | Implemented |
+| Galaxy / Scheme-1 | TP | SP | TP | Implemented (prefill multi-token) |
+| Galaxy2 / Scheme-2 | TP | SP | SP | Implemented (per-layer or all eligible; optional final layer) |
+| SP | SP (full K/V gathers) | SP | SP | K/V collective ported/testable; Qwen3 graph not yet integrated |
+| Mixed variant | SP (full K/V gathers) | SP | TP | Source transition contract only; Qwen3 graph not yet integrated |
+
+A standalone \`galaxy-source-plan-selftest\` now checks all of those
+transition decisions independently of model inference, so the runtime
+port is evaluated against the upstream design rather than invented
+collective counts. Build it with:
+
+    cmake --build build-galaxy --config Release --target galaxy-source-plan-selftest -j 8
+    .\build-galaxy\bin\Release\galaxy-source-plan-selftest.exe
+
+**Do not claim complete source parity yet**: Qwen3's causal attention
+uses stateful KV cache and attention masks, whereas the upstream
+\`SPBertAttention\` is encoder-only and gathers K/V for local queries.
+Porting the two K/V gathers is not enough to make SP Attention
+correct for Qwen3; the Qwen3 attention graph, mask and cache placement
+still need integration and validation. The upstream repository also
+contains BERT training, adapters and PP variants; these are separate
+from this fork's PC+Phone Qwen3 HMP inference goal.
+
+Source references:
+- https://github.com/ysyisyourbrother/Galaxy-LM/blob/main/README.md
+- https://github.com/ysyisyourbrother/Galaxy-LM/blob/main/galaxy/models/bert/galaxy_bert_model.py
+- https://github.com/ysyisyourbrother/Galaxy-LM/blob/main/galaxy/models/bert/sp_bert_model.py
