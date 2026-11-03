@@ -22,6 +22,7 @@ param(
     [switch]$Profile,
     [string]$DumpLayers = "",
     [string]$DumpStages = "",
+    [string]$DumpFfnOps = "",
     [switch]$Trace,
     [switch]$DumpLogits,
     [int]$TimeoutSec = 0,
@@ -57,6 +58,7 @@ $keys = @("LLAMA_GALAXY_TP", "LLAMA_GALAXY_TP_HEADS", "LLAMA_GALAXY_TP_FFN", "LL
     "LLAMA_GALAXY2", "LLAMA_GALAXY2_FFN_SP_LAYERS", "LLAMA_GALAXY_PROFILE_DIR",
     "LLAMA_GALAXY_LAYER_DUMP", "LLAMA_GALAXY_LAYER_DUMP_DIR",
     "LLAMA_GALAXY_STAGE_DUMP", "LLAMA_GALAXY_STAGE_DUMP_DIR",
+    "LLAMA_GALAXY_FFN_OP_DUMP", "LLAMA_GALAXY_FFN_OP_DUMP_DIR",
     "LLAMA_GALAXY_COLLECTIVE_TILE_TOKENS", "LLAMA_GALAXY_RS_FUSED_READ", "LLAMA_GALAXY_SP_SEQ_WEIGHTS",
     "LLAMA_GALAXY_SP_FINAL_LAYER")
 $old = @{}
@@ -100,6 +102,12 @@ try {
         $stageDir = Join-Path (Resolve-Path -LiteralPath $dir).Path "stages"
         New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
         $stageDir
+    } else { $null }
+    $env:LLAMA_GALAXY_FFN_OP_DUMP = if ($DumpFfnOps) { $DumpFfnOps } else { $null }
+    $env:LLAMA_GALAXY_FFN_OP_DUMP_DIR = if ($DumpFfnOps) {
+        $ffnOpDir = Join-Path (Resolve-Path -LiteralPath $dir).Path "ffn_ops"
+        New-Item -ItemType Directory -Force -Path $ffnOpDir | Out-Null
+        $ffnOpDir
     } else { $null }
     $env:LLAMA_GALAXY_FIRST_LOGITS_PATH = if ($DumpLogits) { $dumpPath } else { $null }
 
@@ -164,6 +172,20 @@ try {
             }
         }
         Write-Host "[GALAXY_STAGE_DUMP] layers=$DumpStages dir=$($env:LLAMA_GALAXY_STAGE_DUMP_DIR)"
+    }
+    if ($DumpFfnOps) {
+        if ($DumpFfnOps -ne "all") {
+            foreach ($layer in $DumpFfnOps.Split(",")) {
+                foreach ($stage in @("ffn_up", "ffn_gate", "ffn_gate_par")) {
+                    $snapshot = Join-Path $env:LLAMA_GALAXY_FFN_OP_DUMP_DIR "$stage-$layer.f32"
+                    if (-not (Test-Path -LiteralPath $snapshot) -or
+                            (Get-Item -LiteralPath $snapshot).Length -le 8) {
+                        throw "Missing Galaxy FFN operator snapshot: $snapshot"
+                    }
+                }
+            }
+        }
+        Write-Host "[GALAXY_FFN_OP_DUMP] layers=$DumpFfnOps dir=$($env:LLAMA_GALAXY_FFN_OP_DUMP_DIR)"
     }
     $spEvidence = if ($PureTP) { "N/A" } elseif ($spWitness) { "CONFIRMED" } else { "UNVERIFIED" }
     Write-Host "[GALAXY_SP_SMOKE] PASS mode=$mode inference=PASS sp_collectives=$spEvidence"
