@@ -12,6 +12,8 @@ param(
     [string]$Exe = ".\build-galaxy\bin\Release\llama-cli.exe",
     [string]$Comparator = ".\build-galaxy\bin\Release\galaxy-logits-compare.exe",
     [string]$OutputDir = ".\galaxy-sp-results",
+    # Resume an interrupted four-run sweep; completed cases are reused.
+    [string]$ResumeDir = "",
     [string]$Devices = "CUDA0,RPC0",
     [string]$HeadSplit = "20,20",
     [string]$FfnSplit = "8704,8704",
@@ -33,9 +35,17 @@ if ($CollectiveTileTokens -lt 1 -or $CollectiveTileTokens -gt 1024) {
 if (-not (Test-Path -LiteralPath $Exe)) { throw "Missing llama-cli: $Exe" }
 if (-not (Test-Path -LiteralPath $Comparator)) { throw "Missing comparator: $Comparator" }
 
-$root = Join-Path $OutputDir ("rs-fused-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
-New-Item -ItemType Directory -Path $root -Force | Out-Null
-$root = (Resolve-Path -LiteralPath $root).Path
+if ($ResumeDir) {
+    if (-not (Test-Path -LiteralPath $ResumeDir -PathType Container)) {
+        throw "ResumeDir does not exist: $ResumeDir"
+    }
+    $root = (Resolve-Path -LiteralPath $ResumeDir).Path
+    Write-Host "[GALAXY_RS_FUSED_SWEEP] resume=$root"
+} else {
+    $root = Join-Path $OutputDir ("rs-fused-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    $root = (Resolve-Path -LiteralPath $root).Path
+}
 $smoke = Join-Path $PSScriptRoot "run_galaxy_sp_smoke.ps1"
 $opts = @{
     Model = $Model
@@ -64,15 +74,47 @@ foreach ($mode in @("sp", "galaxy2")) {
     foreach ($enabled in @($false, $true)) {
         $state = if ($enabled) { "on" } else { "off" }
         Write-Host "[GALAXY_RS_FUSED_SWEEP] mode=$mode fused=$state tile=$CollectiveTileTokens profile=$([bool]$Profile)"
-        if ($mode -eq "galaxy2") {
-            & $smoke @opts -Galaxy2 -Galaxy2FfnSpLayers $Galaxy2FfnSpLayers -RsFusedRead:$enabled
-        } else {
-            & $smoke @opts -RsFusedRead:$enabled
+        $folder = $null
+        if ($ResumeDir) {
+            # Match the collective witness, not merely the directory name.
+            # This also prevents mixing Profile-on and Profile-off runs.
+            $expected = if ($enabled) { "1" } else { "0" }
+            $candidates = @(Get-ChildItem -LiteralPath $root -Directory -Filter "$mode-*" |
+                Sort-Object LastWriteTime -Descending)
+            foreach ($candidate in $candidates) {
+                $log = Join-Path $candidate.FullName "stderr.log"
+                $dump = Join-Path $candidate.FullName "first_logits.f32"
+                $profileCsv = Join-Path $candidate.FullName "profile\communication_timeline.csv"
+                if (-not (Test-Path -LiteralPath $log) -or
+                        -not (Test-Path -LiteralPath $dump) -or
+                        (Get-Item -LiteralPath $dump).Length -le 8) { continue }
+                if ($Profile -and -not (Test-Path -LiteralPath $profileCsv)) { continue }
+                $summaryLine = @(Select-String -LiteralPath $log -Pattern
+                    '\[GALAXY_SP_SUM\].*tile_tokens=(?<tile>\d+)\s+rs_fused_requested=(?<fused>[01])' -ErrorAction SilentlyContinue |
+                    Where-Object {
+                        $_.Matches[0].Groups["tile"].Value -eq "$CollectiveTileTokens" -and
+                        $_.Matches[0].Groups["fused"].Value -eq $expected
+                    })
+                $hasTiming = Select-String -LiteralPath $log -Pattern 'prompt eval time\s*=\s*[0-9.]+\s*ms\s*/' -Quiet -ErrorAction SilentlyContinue
+                if ($summaryLine.Count -gt 0 -and $hasTiming) {
+                    $folder = $candidate
+                    Write-Host "[GALAXY_RS_FUSED_SWEEP] REUSE mode=$mode fused=$state dir=$($folder.FullName)"
+                    break
+                }
+            }
         }
-        if (-not $?) { throw "Smoke failed for $mode/$state" }
-        $folder = Get-ChildItem -LiteralPath $root -Directory -Filter "$mode-*" |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 1
-        if (-not $folder) { throw "No results folder for $mode/$state" }
+        if (-not $folder) {
+            if ($mode -eq "galaxy2") {
+                # Galaxy2FfnSpLayers is already included in @opts.
+                & $smoke @opts -Galaxy2 -RsFusedRead:$enabled
+            } else {
+                & $smoke @opts -RsFusedRead:$enabled
+            }
+            if (-not $?) { throw "Smoke failed for $mode/$state" }
+            $folder = Get-ChildItem -LiteralPath $root -Directory -Filter "$mode-*" |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if (-not $folder) { throw "No results folder for $mode/$state" }
+        }
         $key = "$mode/$state"
         $folders[$key] = $folder.FullName
 
@@ -165,6 +207,7 @@ $manifest = @{
     galaxy2_sp_ffn_layers = $Galaxy2FfnSpLayers
     collective_tile_tokens = $CollectiveTileTokens
     profile_forced_sync = [bool]$Profile
+    resumed_from = if ($ResumeDir) { $root } else { $null }
     rpc_call_count_summary = $profileSummary
     profiles = $records
     fused_vs_tiled_parity = $comparison
