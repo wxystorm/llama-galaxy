@@ -2444,7 +2444,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // The 4D tensor is [head_dim, n_heads, n_tokens, n_stream].
         // Only the explicitly selected dense-Llama prefill layer is pinned.
         if (arch == LLM_ARCH_LLAMA && n_tokens > 1 &&
-                llama_galaxy_tp::qkv_probe_enabled(il)) {
+                (llama_galaxy_tp::qkv_probe_enabled(il) ||
+                 llama_galaxy_tp::causal_live_shadow_enabled(il))) {
             cb(cur, "fattn_raw", il);
             ggml_set_output(cur);
         }
@@ -2701,7 +2702,8 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
     if (arch == LLM_ARCH_LLAMA && n_tokens > 1 &&
-            llama_galaxy_tp::qkv_probe_enabled(il)) {
+            (llama_galaxy_tp::qkv_probe_enabled(il) ||
+                 llama_galaxy_tp::causal_live_shadow_enabled(il))) {
         // Before W_o: the true GQA Attention value from the GGUF graph.
         // Pin without changing the graph's subsequent computation.
         ggml_set_output(cur);
