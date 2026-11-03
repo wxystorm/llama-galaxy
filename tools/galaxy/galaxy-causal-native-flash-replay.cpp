@@ -319,6 +319,11 @@ void execute(const options & c, const devices_t & backends) {
     native_graph * ranks[2] = {&pc,&phone};
     for (int i = 0; i < 2; ++i) {
         ranks[i]->upload(backends[i],c,q,k_half,v_half);
+        std::cout << "[GALAXY_CAUSAL_NATIVE_INIT] rank=" << i
+                  << " backend=" << ggml_backend_name(backends[i])
+                  << " padded_tokens=" << ranks[i]->kv_padded
+                  << " kv_bytes=" << ggml_nbytes(ranks[i]->k_storage)
+                  << " zero_method=HOST_TENSOR_SET status=PASS\n";
     }
 
     const input_t local_k = {pc.k_local,phone.k_local};
@@ -331,6 +336,9 @@ void execute(const options & c, const devices_t & backends) {
     all_gather_attention_kv(backends, local_k, local_v, full_k, full_v, counts,
                             static_cast<size_t>(c.tile));
     const double gather_ms = elapsed_ms(t);
+    std::cout << "[GALAXY_CAUSAL_NATIVE_GATHER] tokens=" << c.tokens
+              << " tile=" << c.tile << " gather_ms=" << gather_ms
+              << " status=PASS\n";
 
     // Exact byte-level verification of all gathered F16 Key/Value buffers.
     // This is an intentional diagnostic readback and NOT an optimized path.
@@ -348,6 +356,9 @@ void execute(const options & c, const devices_t & backends) {
     double compute_ms[2] = {0,0};
     for (int rank = 0; rank < 2; ++rank) {
         t = clock_type::now();
+        std::cout << "[GALAXY_CAUSAL_NATIVE_DISPATCH] rank=" << rank
+                  << " backend=" << ggml_backend_name(backends[rank])
+                  << " kernel=FLASH_ATTN_EXT status=BEGIN\n" << std::flush;
         const auto status = ggml_backend_graph_compute(backends[rank], ranks[rank]->graph);
         demand(status == GGML_STATUS_SUCCESS,
                 "FLASH_ATTN_EXT graph execution failed on rank "+std::to_string(rank));
