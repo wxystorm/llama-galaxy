@@ -217,8 +217,10 @@ struct native_graph {
         key = ggml_permute(ctx, key, 0, 2, 1, 3);
         ggml_tensor * value = ggml_reshape_3d(ctx, v_full, c.dim, c.kv_heads, c.tokens);
         value = ggml_permute(ctx, value, 0, 2, 1, 3);
-        // Llama's v_trans path with flash-attn uses transpose after permute.
-        value = ggml_transpose(ctx, value);
+        // For Flash Attention with a non-transposed contiguous V cache,
+        // Llama's v_trans is FALSE before permute, so the kernel expects
+        // [head_dim, all_key_tokens, kv_heads]. Do not transpose to
+        // [all_key_tokens, head_dim, kv_heads] (that is the other cache path).
 
         attention = ggml_flash_attn_ext(ctx, query, key, value, mask,
                                         1.0f/std::sqrt(float(c.dim)), 0.0f, 0.0f);
