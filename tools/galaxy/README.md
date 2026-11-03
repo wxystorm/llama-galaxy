@@ -560,3 +560,29 @@ The missing Galaxy2 OFF/ON cases will then execute; afterwards the
 comparator and timing summary are computed from all four runs.
 Resume does not require recompiling either endpoint since this patch
 changes only PowerShell orchestration.
+
+
+### Profile smoke: Windows relative log paths
+
+When a user launches PowerShell from a different drive than the .NET
+process current directory, \`New-Item .\galaxy-sp-results\...\` can create
+the run directory on E: while \`System.IO.File.Create\` interprets
+\`.\galaxy-sp-results\...\stdout.log\` under C:\Users\<account>, causing
+DirectoryNotFoundException BEFORE any inference launches.
+
+Both paths are now normalized to absolute PowerShell provider paths:
+\`run_galaxy_sp_smoke.ps1\` resolves its new run directory immediately
+and \`galaxy-process.ps1\` resolves both log streams and creates their
+parent directories before opening the files. The independent
+\`test_galaxy_process.ps1\` checks a nested *relative* log output path
+and reports \`relative_path=PASS\` on success.
+
+Run (no rebuild required):
+
+    git pull --ff-only origin feat/galaxy-baseline
+    .\tools\galaxy\test_galaxy_process.ps1
+    .\tools\galaxy\run_galaxy_sp_smoke.ps1 -Model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" -Rpc "10.39.52.114:50052" -PromptFile "D:\prima.cpp\prompts\prompt_64.txt" -CollectiveTileTokens 256 -RsFusedRead -Profile -TimeoutSec 300
+
+For old scripts, passing
+\`-OutputDir "E:\llama\llama-galaxy\galaxy-sp-results"\`
+also avoids this particular path mismatch.
