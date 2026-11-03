@@ -52,6 +52,14 @@ int main() {
     must_throw([] { llama_galaxy_tp::galaxy2_parse_ffn_layers("-1", 39); });
     must_throw([] { llama_galaxy_tp::galaxy2_parse_ffn_layers("40", 39); });
     must_throw([] { llama_galaxy_tp::galaxy2_parse_ffn_layers("18446744073709551615", 39); });
+    // Stage and final-layer snapshot selection share the exact same parser.
+    require_test(llama_galaxy_tp::layer_selection_contains("0,1", 0), "stage selected 0");
+    require_test(llama_galaxy_tp::layer_selection_contains("0,1", 1), "stage selected 1");
+    require_test(!llama_galaxy_tp::layer_selection_contains("0,1", 2), "stage excludes 2");
+    require_test(!llama_galaxy_tp::layer_selection_contains("10,11", 1), "exact layer token");
+    require_test(llama_galaxy_tp::layer_selection_contains("all", 26), "stage select all");
+    require_test(!llama_galaxy_tp::layer_selection_contains(nullptr, 0), "stage off");
+    require_test(!llama_galaxy_tp::layer_selection_contains("0,1", -1), "negative layer");
     std::cout << "GALAXY_TP_SELFTEST PASS\n";
     return 0;
 }
