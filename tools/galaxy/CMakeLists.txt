@@ -24,3 +24,13 @@ target_compile_features(galaxy-source-plan-selftest PRIVATE cxx_std_17)
 # This target does not activate the unfinished GPU/RPC SP Attention graph.
 add_executable(galaxy-causal-attention-selftest galaxy-causal-attention-selftest.cpp)
 target_compile_features(galaxy-causal-attention-selftest PRIVATE cxx_std_17)
+
+# Real-backend correctness test for local causal Q, global KV with canonical
+# cached prefix, and CPU-host staging. Can use CPU+CPU or CUDA+Phone RPC.
+# Does not yet activate the Qwen3/Llama inference graph's SP Attention.
+add_executable(galaxy-causal-backend-selftest galaxy-causal-backend-selftest.cpp)
+target_link_libraries(galaxy-causal-backend-selftest PRIVATE ggml)
+target_compile_features(galaxy-causal-backend-selftest PRIVATE cxx_std_17)
+if (GGML_RPC)
+    target_compile_definitions(galaxy-causal-backend-selftest PRIVATE GALAXY_CAUSAL_HAVE_RPC=1)
+endif()
