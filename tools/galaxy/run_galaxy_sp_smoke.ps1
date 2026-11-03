@@ -25,6 +25,7 @@ param(
     [string]$DumpStages = "",
     [string]$DumpFfnOps = "",
     [string]$ProbeQkvLayers = "",
+    [int]$LiveCausalLayer = -1,
     [switch]$Trace,
     [switch]$DumpLogits,
     [int]$TimeoutSec = 0,
@@ -42,6 +43,12 @@ if (-not (Test-Path -LiteralPath $Model)) { throw "Missing model: $Model" }
 if (-not (Test-Path -LiteralPath $PromptFile)) { throw "Missing prompt: $PromptFile" }
 if ($Devices.Split(",").Count -ne 2) { throw "Devices must contain exactly PC,RPC" }
 if ($PureTP -and $Galaxy2) { throw "PureTP and Galaxy2 cannot both be enabled" }
+if ($LiveCausalLayer -lt -1 -or $LiveCausalLayer -gt 0) {
+    throw "LiveCausalLayer currently supports only 0; omit it to disable"
+}
+if ($LiveCausalLayer -eq 0 -and -not $PureTP) {
+    throw "LiveCausalLayer 0 currently requires -PureTP, not Galaxy or Galaxy2"
+}
 if ($Galaxy2FfnSpLayerSet -and -not $Galaxy2) {
     throw "Galaxy2FfnSpLayerSet requires -Galaxy2"
 }
@@ -73,6 +80,7 @@ $keys = @("LLAMA_GALAXY_TP", "LLAMA_GALAXY_TP_HEADS", "LLAMA_GALAXY_TP_FFN", "LL
     "LLAMA_GALAXY_STAGE_DUMP", "LLAMA_GALAXY_STAGE_DUMP_DIR",
     "LLAMA_GALAXY_FFN_OP_DUMP", "LLAMA_GALAXY_FFN_OP_DUMP_DIR",
     "LLAMA_GALAXY_QKV_PROBE_LAYERS", "LLAMA_GALAXY_QKV_PROBE_DIR",
+    "LLAMA_GALAXY_CAUSAL_LIVE_LAYER",
     "LLAMA_GALAXY_COLLECTIVE_TILE_TOKENS", "LLAMA_GALAXY_RS_FUSED_READ", "LLAMA_GALAXY_SP_SEQ_WEIGHTS",
     "LLAMA_GALAXY_SP_FINAL_LAYER")
 $old = @{}
@@ -124,6 +132,7 @@ try {
         New-Item -ItemType Directory -Force -Path $ffnOpDir | Out-Null
         $ffnOpDir
     } else { $null }
+    $env:LLAMA_GALAXY_CAUSAL_LIVE_LAYER = if ($LiveCausalLayer -eq 0) { "0" } else { $null }
     $env:LLAMA_GALAXY_QKV_PROBE_LAYERS = if ($ProbeQkvLayers) { $ProbeQkvLayers } else { $null }
     $env:LLAMA_GALAXY_QKV_PROBE_DIR = if ($ProbeQkvLayers) {
         $probeDir = Join-Path $dir "real-qkv"
@@ -164,7 +173,7 @@ try {
     $exitCode = $result.ExitCode
     Write-Host "[GALAXY_SP_SMOKE] exit=$exitCode logs=$dir"
 
-    $hits = @(Select-String -Path $stderr, $stdout -Pattern "GALAXY_META_TRACE","GALAXY_SP_LAYOUT_FAIL","GALAXY_SP_LAYOUT_SRC","GALAXY_SP_SUM","GALAXY_SP]","GALAXY_TP]","prompt eval time","eval time","ERROR","failed" -ErrorAction SilentlyContinue)
+    $hits = @(Select-String -Path $stderr, $stdout -Pattern "GALAXY_META_TRACE","GALAXY_SP_LAYOUT_FAIL","GALAXY_SP_LAYOUT_SRC","GALAXY_SP_SUM","GALAXY_SP]","GALAXY_TP]","GALAXY_CAUSAL_LIVE","prompt eval time","eval time","ERROR","failed" -ErrorAction SilentlyContinue)
     # Keep the full trace in stderr.log, but print only the last 80
     # matching lines on the terminal to avoid flooding a long SP run.
     $displayHits = if ($Trace) { @($hits | Select-Object -Last 80) } else { $hits }
@@ -180,6 +189,15 @@ try {
     }).Count -gt 0)
     if (-not $PureTP -and -not $spWitness) {
         Write-Warning "SP run exited normally but no positive ReduceScatter count was logged. Continue numerical comparison; actual SP collective execution remains UNVERIFIED."
+    }
+    if ($LiveCausalLayer -eq 0) {
+        $livePassed = @($hits | Where-Object {
+            $_.Line -match '\[GALAXY_CAUSAL_LIVE\].*mode=SHADOW.*status=PASS'
+        })
+        if ($livePassed.Count -eq 0) {
+            throw "No successful live causal SP shadow witness. Inspect $stderr"
+        }
+        Write-Host "[GALAXY_CAUSAL_LIVE] layer=0 mode=SHADOW reference=IN_FLIGHT result=CONFIRMED"
     }
     if ($Profile) { Write-Host "[GALAXY_PROFILE] directory=$($env:LLAMA_GALAXY_PROFILE_DIR)" }
     if ($DumpLayers) { Write-Host "[GALAXY_LAYER_DUMP] layers=$DumpLayers dir=$($env:LLAMA_GALAXY_LAYER_DUMP_DIR)" }
