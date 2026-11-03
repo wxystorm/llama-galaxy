@@ -2870,6 +2870,85 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
+        // In REPLACE, the original TP Flash node was intentionally
+        // removed from the submitted graph. Its exact output tensor must
+        // now be filled with the native SP result, *before* the next
+        // reshape and W_o nodes can run. The original KV-cache store
+        // predecessor nodes have already been dispatched normally.
+        if (is_replace_raw_boundary) {
+            try {
+                const auto work=build_live_request(nullptr);
+                if (work.tokens!=original_last->ne[2] ||
+                        work.head_dim!=original_last->ne[0] ||
+                        work.q.heads[0]+work.q.heads[1]!=original_last->ne[1]) {
+                    throw std::invalid_argument(
+                            "native SP replacement does not match Flash raw tensor shape");
+                }
+                const ggml_galaxy_collectives::devices_t devs={
+                        backend_ctx->backend_configs[0].backend,
+                        backend_ctx->backend_configs[1].backend
+                };
+                std::array<std::vector<uint8_t>,2> outputs;
+                const auto measured=ggml_galaxy_causal_live::replace(devs,work,outputs);
+                for (int rank=0;rank<2;++rank) {
+                    const ggml_tensor * local=
+                            ggml_backend_meta_buffer_simple_tensor(original_last,rank);
+                    if (!local || !local->buffer ||
+                            local->op!=GGML_OP_FLASH_ATTN_EXT ||
+                            !ggml_is_contiguous(local) ||
+                            local->type!=GGML_TYPE_F32 ||
+                            local->ne[0]!=work.head_dim ||
+                            local->ne[1]!=work.q.heads[rank] ||
+                            local->ne[2]!=work.tokens || local->ne[3]!=1 ||
+                            outputs[rank].size()!=ggml_nbytes(local)) {
+                        throw std::invalid_argument(
+                                "native SP TP shard does not match destination Flash buffer");
+                    }
+                    // The raw Flash output and following 2D kqv_out
+                    // share the production GGML allocation. Do not
+                    // modify the symbolic graph or allocate fake W_o
+                    // input nodes: set bytes on the ACTUAL backend buffer.
+                    ggml_backend_tensor_set(const_cast<ggml_tensor *>(local),
+                            outputs[rank].data(),0,outputs[rank].size());
+                    ggml_backend_synchronize(devs[rank]);
+                    uint32_t observed=0,expected=0;
+                    ggml_backend_tensor_get(local,&observed,0,sizeof(observed));
+                    std::memcpy(&expected,outputs[rank].data(),sizeof(expected));
+                    if(observed!=expected) {
+                        throw std::invalid_argument(
+                                "native SP raw Flash destination readback mismatch");
+                    }
+                }
+                live_replaced_shards=std::move(outputs);
+                live_replaced_pending=true;
+                std::fprintf(stderr,
+                        "[GALAXY_CAUSAL_LIVE] layer=%d tokens=%" PRId64
+                        " mode=REPLACE tp_heads=%" PRId64 "+%" PRId64
+                        " kv_heads=%" PRId64 "+%" PRId64
+                        " first_token_rmse=%.9g"
+                        " tp_sp_ms=%.3f kv_gather_ms=%.3f"
+                        " native_ready_wall_ms=%.3f sp_tp_ms=%.3f"
+                        " tp_flash_skipped=1 kv_store_preserved=1"
+                        " injected_into=FATTN_RAW"
+                        " reference=SEPARATE_BASELINE_REQUIRED"
+                        " status=INJECTED\n",
+                        live_shadow_layer,work.tokens,
+                        work.q.heads[0],work.q.heads[1],
+                        work.k.heads[0],work.k.heads[1],
+                        measured.first_token_rmse,
+                        measured.head_to_token_ms,measured.kv_gather_ms,
+                        measured.native_ready_wall_ms,measured.token_to_head_ms);
+                std::fflush(stderr);
+            } catch (const std::exception & e) {
+                std::fprintf(stderr,
+                        "[GALAXY_CAUSAL_LIVE] layer=%d mode=REPLACE"
+                        " status=FAIL reason=%s\n",
+                        live_shadow_layer,e.what());
+                std::fflush(stderr);
+                return GGML_STATUS_FAILED;
+            }
+        }
+
         // Capture the producing node NOW, immediately after both backend
         // submissions have completed. The normal end-of-model buffer may
         // be reused by later graph nodes, especially for V and reshape
