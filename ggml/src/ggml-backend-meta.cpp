@@ -3105,7 +3105,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             const bool is_k = std::strncmp(node->name, "Kcur-", 5) == 0;
             const bool is_v = std::strncmp(node->name, "Vcur-", 5) == 0;
             const bool is_out = std::strncmp(node->name, "kqv_out-", 8) == 0;
-            if (!is_q && !is_k && !is_v && !is_out) {
+            const bool is_flash_raw = std::strncmp(node->name, "fattn_raw-", 10) == 0;
+            if (!is_q && !is_k && !is_v && !is_out && !is_flash_raw) {
                 continue;
             }
             const bool three_dimensional = !is_out;
@@ -3161,6 +3162,23 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 ggml_backend_synchronize(backend_ctx->backend_configs[rank].backend);
                 std::vector<uint8_t> raw(ggml_nbytes(local));
                 ggml_backend_tensor_get(local, raw.data(), 0, raw.size());
+                if (is_out || is_flash_raw) {
+                    // Hash the *actual rank-local source buffer* before
+                    // reconstructing any global output. This separates
+                    // duplicated device results from a faulty 2D exporter.
+                    uint64_t hash = UINT64_C(14695981039346656037);
+                    for (const uint8_t byte : raw) {
+                        hash ^= static_cast<uint64_t>(byte);
+                        hash *= UINT64_C(1099511628211);
+                    }
+                    GGML_LOG_INFO("[GALAXY_REAL_QKV_RANK] name=%s op=%s rank=%d"
+                            " backend=%s local_features=%" PRId64
+                            " tokens=%" PRId64 " bytes=%zu fnv1a64=%016" PRIx64
+                            " status=READ\n",
+                            node->name, ggml_op_name(node->op), rank,
+                            ggml_backend_name(backend_ctx->backend_configs[rank].backend),
+                            local_width, local_tokens, raw.size(), hash);
+                }
                 for (int64_t t = 0; t < tokens; ++t) {
                     for (int64_t f = 0; f < local_width; ++f) {
                         const size_t src_index = static_cast<size_t>(t*local_width+f);
