@@ -132,6 +132,12 @@ inline bool dump_stage_enabled(int64_t il) {
     return layer_selection_contains(std::getenv("LLAMA_GALAXY_STAGE_DUMP"), il);
 }
 
+// Opt-in: capture the first dense-Llama FFN projection/activation stages.
+// Disabled by default because the 8192-feature snapshots are relatively large.
+inline bool dump_ffn_op_enabled(int64_t il) {
+    return layer_selection_contains(std::getenv("LLAMA_GALAXY_FFN_OP_DUMP"), il);
+}
+
 inline std::vector<int64_t> parse_counts(const char * text, const char * key, size_t n_devices) {
     if (text == nullptr || text[0] == '\0') {
         throw std::invalid_argument(std::string(key) + " is required in Galaxy TP mode");
