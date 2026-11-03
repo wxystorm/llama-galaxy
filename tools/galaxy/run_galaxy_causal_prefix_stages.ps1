@@ -22,12 +22,12 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-if (-not [double]::IsFinite($MaxAbs) -or $MaxAbs -lt 0 -or
-        -not [double]::IsFinite($MaxRmse) -or $MaxRmse -lt 0) {
+if ([double]::IsNaN($MaxAbs) -or [double]::IsInfinity($MaxAbs) -or $MaxAbs -lt 0 -or
+        [double]::IsNaN($MaxRmse) -or [double]::IsInfinity($MaxRmse) -or $MaxRmse -lt 0) {
     throw "MaxAbs and MaxRmse must be finite nonnegative numbers"
 }
 foreach ($required in @("Model","PromptFile","Rpc")) {
-    if (-not $Common.Contains($required) -and -not $Common.ContainsKey($required)) {
+    if (@($Common.Keys) -notcontains $required) {
         throw "Common must include $required"
     }
 }
@@ -42,7 +42,7 @@ if (-not (Test-Path -LiteralPath $smoke)) {
     throw "Missing smoke runner: $smoke"
 }
 
-$root = Join-Path $OutputDir ("prefix-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
+$root = Join-Path $OutputDir ("prefix-" + (Get-Date -Format "yyyyMMdd-HHmmss-fff"))
 New-Item -ItemType Directory -Force -Path $root | Out-Null
 $root = (Resolve-Path -LiteralPath $root).Path
 
@@ -52,7 +52,7 @@ foreach ($key in $Common.Keys) { $shared[$key] = $Common[$key] }
 foreach ($name in @("PureTP","LiveCausalLayer","LiveCausalPrefixLayers",
                     "LiveCausalReplace","OutputDir","DumpLogits",
                     "ProbeQkvLayers","Profile","Trace")) {
-    $shared.Remove($name)
+    [void]$shared.Remove($name)
 }
 $shared["DumpLogits"] = $true
 $shared["ProbeQkvLayers"] = ""
@@ -109,14 +109,14 @@ Write-Host "[GALAXY_PREFIX_STAGE] stage=TP_BASELINE event=PASS logits=$tpLogits"
 function Invoke-Prefix([int]$count, [bool]$replace) {
     $mode = if ($replace) { "REPLACE" } else { "SHADOW" }
     $name = "$mode-$count"
-    $args = @{}; foreach ($key in $shared.Keys) { $args[$key] = $shared[$key] }
-    $args["LiveCausalLayer"] = -1
-    $args["LiveCausalPrefixLayers"] = $count
-    $args["LiveCausalReplace"] = $replace
-    $args["OutputDir"] = Join-Path $root $name
+    $stageParams = @{}; foreach ($key in $shared.Keys) { $stageParams[$key] = $shared[$key] }
+    $stageParams["LiveCausalLayer"] = -1
+    $stageParams["LiveCausalPrefixLayers"] = $count
+    $stageParams["LiveCausalReplace"] = $replace
+    $stageParams["OutputDir"] = Join-Path $root $name
     Write-Host "[GALAXY_PREFIX_STAGE] stage=$name event=START layers=0..$($count-1)"
-    & $smoke @args -PureTP
-    $run = Latest-Run $args["OutputDir"]
+    & $smoke @stageParams -PureTP
+    $run = Latest-Run $stageParams["OutputDir"]
     $candidate = Join-Path $run.FullName "first_logits.f32"
     $json = Join-Path $run.FullName "logits-to-tp.json"
     & $compare --tp $tpLogits --sp $candidate --max-abs $MaxAbs --max-rmse $MaxRmse --json $json
