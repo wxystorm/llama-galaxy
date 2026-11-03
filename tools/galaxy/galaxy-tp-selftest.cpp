@@ -52,6 +52,39 @@ int main() {
     must_throw([] { llama_galaxy_tp::galaxy2_parse_ffn_layers("-1", 39); });
     must_throw([] { llama_galaxy_tp::galaxy2_parse_ffn_layers("40", 39); });
     must_throw([] { llama_galaxy_tp::galaxy2_parse_ffn_layers("18446744073709551615", 39); });
+    // Arbitrary Galaxy2 layer ownership, shared by model weight placement
+    // and graph building, including holes and inclusive ranges.
+    const auto layer_set = llama_galaxy_tp::galaxy2_parse_layer_set("0,3,5-7", 27);
+    require_test(layer_set.size() == 27 &&
+            layer_set[0] && layer_set[3] && layer_set[5] && layer_set[6] &&
+            layer_set[7] && !layer_set[1] && !layer_set[4] && !layer_set[8],
+            "Galaxy2 noncontiguous FFN mask");
+    const auto all_selected = llama_galaxy_tp::galaxy2_parse_layer_set("all", 27);
+    const auto none_selected = llama_galaxy_tp::galaxy2_parse_layer_set("none", 27);
+    require_test(all_selected.size() == 27 && none_selected.size() == 27,
+            "Galaxy2 set dimension");
+    for (size_t i = 0; i < 27; ++i) {
+        require_test(all_selected[i] == 1 && none_selected[i] == 0,
+                "Galaxy2 all/none FFN schedule");
+    }
+    require_test(llama_galaxy_tp::galaxy2_parse_layer_set("27", 28)[27] == 1,
+            "Galaxy2 optional final FFN layer");
+    must_throw([] { (void) llama_galaxy_tp::galaxy2_parse_layer_set("27", 27); });
+    must_throw([] { (void) llama_galaxy_tp::galaxy2_parse_layer_set("", 27); });
+    must_throw([] { (void) llama_galaxy_tp::galaxy2_parse_layer_set(nullptr, 27); });
+    must_throw([] { (void) llama_galaxy_tp::galaxy2_parse_layer_set("0,0", 27); });
+    must_throw([] { (void) llama_galaxy_tp::galaxy2_parse_layer_set("1-3,3", 27); });
+    must_throw([] { (void) llama_galaxy_tp::galaxy2_parse_layer_set("0,", 27); });
+    must_throw([] { (void) llama_galaxy_tp::galaxy2_parse_layer_set(",0", 27); });
+    must_throw([] { (void) llama_galaxy_tp::galaxy2_parse_layer_set("0,,1", 27); });
+    must_throw([] { (void) llama_galaxy_tp::galaxy2_parse_layer_set("8-6", 27); });
+    must_throw([] { (void) llama_galaxy_tp::galaxy2_parse_layer_set("8-", 27); });
+    must_throw([] { (void) llama_galaxy_tp::galaxy2_parse_layer_set("-1", 27); });
+    must_throw([] { (void) llama_galaxy_tp::galaxy2_parse_layer_set("1a", 27); });
+    must_throw([] { (void) llama_galaxy_tp::galaxy2_parse_layer_set("18446744073709551615", 27); });
+    require_test(llama_galaxy_tp::galaxy2_parse_layer_set("none", 0).empty(),
+            "no eligible FFN layers allows none");
+    must_throw([] { (void) llama_galaxy_tp::galaxy2_parse_layer_set("0", 0); });
     // Stage and final-layer snapshot selection share the exact same parser.
     require_test(llama_galaxy_tp::layer_selection_contains("0,1", 0), "stage selected 0");
     require_test(llama_galaxy_tp::layer_selection_contains("0,1", 1), "stage selected 1");
