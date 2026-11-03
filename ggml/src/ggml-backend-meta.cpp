@@ -2139,6 +2139,26 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // the final decode graph (which contains no SP markers).
     const char * trace_value = std::getenv("LLAMA_GALAXY_SP_TRACE");
     const bool trace = trace_value != nullptr && trace_value[0] == '1' && trace_value[1] == '\0';
+    // QKV snapshots must be captured at their producing Meta subgraph's
+    // completion. Reading graph-temporary tensors after the whole model
+    // finishes is unsafe even when diagnostic OUTPUT flags are present.
+    const char * qkv_probe_dir = std::getenv("LLAMA_GALAXY_QKV_PROBE_DIR");
+    const bool qkv_probe_enabled = qkv_probe_dir != nullptr && qkv_probe_dir[0] != '\0';
+    const auto is_qkv_probe_node = [qkv_probe_enabled](const ggml_tensor * node) -> bool {
+        if (!qkv_probe_enabled || node == nullptr ||
+                (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 ||
+                node->ne[1] <= 0) {
+            return false;
+        }
+        return std::strncmp(node->name, "Qcur-", 5) == 0 ||
+               std::strncmp(node->name, "Kcur-", 5) == 0 ||
+               std::strncmp(node->name, "Vcur-", 5) == 0 ||
+               std::strncmp(node->name, "fattn_raw-", 10) == 0 ||
+               std::strncmp(node->name, "kqv_out-", 8) == 0;
+    };
+    // Per invocation only. Once captured, the independent host copy
+    // survives subsequent backend buffer reuse and next-layer execution.
+    std::map<const ggml_tensor *, std::vector<std::vector<uint8_t>>> qkv_live_snapshots;
     if (trace) {
         GGML_LOG_INFO("[GALAXY_META_TRACE] event=GRAPH_BEGIN nodes=%d backends=%zu sp=%d uid=%" PRIu64 "\n",
                 cgraph->n_nodes, n_backends, int(has_galaxy_markers), cgraph->uid);
@@ -2209,7 +2229,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 // A Galaxy layout transition must immediately follow the
                 // original PARTIAL output. Delaying the AllReduce would
                 // incorrectly consume/overwrite one of its partial inputs.
-                if (has_galaxy_markers) {
+                if (has_galaxy_markers || qkv_probe_enabled) {
+                    // Never delay a reduction across an opt-in diagnostic
+                    // boundary: the producing tensor must remain last.
                     return i;
                 }
                 int id = i; // i_delayed
@@ -2323,7 +2345,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 const bool new_subgraph = i + 1 == cgraph->n_nodes ||
                         split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL ||
-                        galaxy_sp_get_transition(node) != galaxy_sp_transition::none;
+                        galaxy_sp_get_transition(node) != galaxy_sp_transition::none ||
+                        is_qkv_probe_node(node);
                 if (!new_subgraph) {
                     continue;
                 }
