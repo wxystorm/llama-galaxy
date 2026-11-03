@@ -909,3 +909,73 @@ inspect fused activation; if all three agree within measurement noise
 but `FFN_contribution` diverges, investigate Down projection/TP
 ReduceScatter precision. This is a numerical diagnostic, not a proof
 of correctness or exact output equivalence.
+
+
+## Framework: noncontiguous per-layer FFN TP/SP schedule
+
+Galaxy2 previously supported only the leading `N` SP-FFN layers, via
+`LLAMA_GALAXY2_FFN_SP_LAYERS=N|all`. The framework now supports an
+**explicit zero-based layer set**:
+
+- Environment: `LLAMA_GALAXY2_FFN_SP_LAYER_SET=0,2,5-7`
+- Smoke runner: `-Galaxy2 -Galaxy2FfnSpLayerSet "0,2,5-7"`
+- Three-mode runner: `-Galaxy2FfnSpLayerSet "0,2,5-7"`
+- `all` selects all eligible layers; `none` selects none.
+- An explicit set must not be combined with the legacy leading-N option.
+- The final layer is not eligible unless `-FinalLayerSP` is supplied.
+- Decode remains on the existing one-token TP graph (unchanged).
+
+Layer selection is resolved by one shared policy in
+`src/llama-galaxy-tp.h`. Both model-weight placement and transformer
+graph construction call `galaxy2_ffn_is_sp(il, n_layers)`, so an
+explicit SP layer always mirrors its Up/Gate/Down FFN weights and avoids
+its FFN-side AllGather/ReduceScatter, while every unselected layer uses
+the original FFN-TP path. Attention-TP and connection collectives are
+unchanged. This is not yet a pure-SP Attention implementation.
+
+Example on Llama-3.2-3B with 28 layers and final-layer SP disabled:
+
+```powershell
+git pull --ff-only origin feat/galaxy-baseline
+cmake --build build-galaxy --config Release --target llama-cli galaxy-tp-selftest -j 8
+.\build-galaxy\bin\Release\galaxy-tp-selftest.exe
+
+$common = @{
+  Model = "E:\llama\models\Llama-3.2-3B-Instruct-Q4_K_M.gguf"
+  Rpc = "10.39.52.114:50052"
+  PromptFile = "D:\prima.cpp\prompts\prompt_64.txt"
+  HeadSplit = "12,12"
+  FfnSplit = "4096,4096"
+  SeqWeights = "1,1"
+  OutputDir = ".\galaxy-sp-results\layer-schedule"
+  TimeoutSec = 300
+}
+.\tools\galaxy\run_galaxy_sp_smoke.ps1 @common -Galaxy2 -Galaxy2FfnSpLayerSet "0,2,5-7"
+```
+
+On each complete multi-token prefill graph, with 27 eligible layers
+and five chosen SP FFN layers, expected counts are:
+
+- Attention RS = 27; FFN TP RS = 22; total RS = 49.
+- Attention/connection-2 gathers = 27; FFN-TP input AG = 22;
+  total AG = 49.
+- Residual scatter = 27.
+
+Multiple `[GALAXY_SP_SUM]` lines may be printed because the runtime
+constructs multiple prefill graphs. These counts apply per full graph,
+not to an aggregate over the process.
+
+Cross-mode equivalence smoke: `-Galaxy2FfnSpLayerSet "0"` must choose
+the same layer assignment as `-Galaxy2FfnSpLayers 1`. Both branches
+should produce the same logits under identical execution settings.
+Use the established first-logits dumps for comparison, rather than
+assuming an ordinary PASS exit proves numerical correctness.
+Selecting `"2"` instead also removes exactly one FFN-side RS and AG,
+but selects a different layer with a different computation path.
+There is no automatic performance planner in this patch; profiles
+will be needed before choosing an optimal layer set.
+
+The added tests cover noncontiguous sets, ranges, duplicates, bad
+syntax, out-of-range layers, final-layer eligibility, `all`/`none`,
+and compatibility with the original N-layer behavior.
+
