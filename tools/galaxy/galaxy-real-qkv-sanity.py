@@ -134,6 +134,52 @@ def main():
                       f"rmse={h_rmse:.9g} max_abs={h_max:.9g} "
                       f"cosine={h_cos:.9g} exact={sum(x == y for x, y in zip(va, vb))}/{len(va)}")
 
+    # The raw FLASH_ATTN_EXT output is four-dimensional before its
+    # kqv_out 2D reshape. The Meta exporter reconstructs both into the
+    # same logical [heads*head_dim, tokens] F32 order. This source-level
+    # identity test distinguishes faulty reshape/export from upstream
+    # Flash Attention output duplication. The raw snapshot is optional,
+    # so historical probes remain readable without rerunning the model.
+    raw_path = args.probe_dir / f"fattn_raw-{args.layer}.f32"
+    if raw_path.is_file():
+        raw_attn = load(raw_path, args.tokens * qwidth)
+        final_attn = snapshots["kqv_out"]
+        rmse_all, maxabs_all, cosine_all = metrics(raw_attn, final_attn)
+        matches = sum(a == b for a, b in zip(raw_attn, final_attn))
+        print(f"[GALAXY_QKV_RAW_RESHAPE] all rmse={rmse_all:.9g} "
+              f"max_abs={maxabs_all:.9g} cosine={cosine_all:.9g} "
+              f"exact={matches}/{len(raw_attn)}")
+        per_head = args.head_dim
+        half_width = qwidth // 2
+        for rank in (0, 1):
+            a = []
+            b = []
+            for token in range(args.tokens):
+                start = token*qwidth + rank*half_width
+                a.extend(raw_attn[start:start+half_width])
+                b.extend(final_attn[start:start+half_width])
+            r, m, cos = metrics(a, b)
+            print(f"[GALAXY_QKV_RAW_RESHAPE] rank={rank} rmse={r:.9g} "
+                  f"max_abs={m:.9g} cosine={cos:.9g} "
+                  f"exact={sum(x == y for x, y in zip(a, b))}/{len(a)}")
+        a, b = [], []
+        for token in range(args.tokens):
+            start = token*qwidth
+            a.extend(raw_attn[start:start+half_width])
+            b.extend(raw_attn[start+half_width:start+qwidth])
+        r, m, cos = metrics(a, b)
+        print(f"[GALAXY_QKV_RAW_DUPLICATE] halves=12+12 rmse={r:.9g} "
+              f"max_abs={m:.9g} cosine={cos:.9g} "
+              f"exact={sum(x == y for x, y in zip(a, b))}/{len(a)}")
+        if matches == len(raw_attn):
+            print("[GALAXY_QKV_RAW_VERDICT] reshape_preserves_raw_data=YES")
+        else:
+            print("[GALAXY_QKV_RAW_VERDICT] reshape_preserves_raw_data=NO "
+                  "inspect_meta_view_or_export=YES")
+    else:
+        print("[GALAXY_QKV_RAW_RESHAPE] unavailable=1 "
+              "reason=previous_probe_without_raw_flash_snapshot")
+
     original = as_row(snapshots["kqv_out"], 0, qwidth)
     v0 = as_row(snapshots["Vcur"], 0, kvwidth)
     ratio = args.heads // args.kv_heads
