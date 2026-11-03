@@ -34,3 +34,13 @@ target_compile_features(galaxy-causal-backend-selftest PRIVATE cxx_std_17)
 if (GGML_RPC)
     target_compile_definitions(galaxy-causal-backend-selftest PRIVATE GALAXY_CAUSAL_HAVE_RPC=1)
 endif()
+
+# Replays real GGUF Q/K/V exported by a TP Llama graph on CPU+CPU or
+# CUDA+Phone RPC using the causal SP backend. Reports numerical error
+# versus the model's pre-Wo kqv_out without claiming exact parity.
+add_executable(galaxy-causal-model-replay galaxy-causal-model-replay.cpp)
+target_link_libraries(galaxy-causal-model-replay PRIVATE ggml)
+target_compile_features(galaxy-causal-model-replay PRIVATE cxx_std_17)
+if (GGML_RPC)
+    target_compile_definitions(galaxy-causal-model-replay PRIVATE GALAXY_CAUSAL_HAVE_RPC=1)
+endif()
