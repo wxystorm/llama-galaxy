@@ -1248,3 +1248,78 @@ Interpretation:
 `galaxy-causal-model-replay` also prints
 `check=first_token_v_identity` and a severe mismatch warning after
 rebuilding, but the Python check works immediately on existing files.
+
+
+## TP Attention raw-vs-reshape duplication boundary (98-token Llama 3.2)
+
+A later real-QKV experiment found that **every element** of the second
+12-head half of the exported `kqv_out-0` was exactly equal to the
+corresponding element in its first half, over all 98 tokens:
+`exact=150528/150528`, RMSE=0, cosine=1.
+The real projected `Qcur`, `Kcur`, and `Vcur` halves were *not*
+repeated. The first-token causal V identity was also clearly violated
+(grouped-GQA RMSE=0.0918303923, cosine=0.00513757887).
+
+This is **not** numerical parity, and is incompatible with treating
+the exported `kqv_out` as a trusted full-head Attention reference.
+It does not yet prove whether the duplicate originated in the device
+`FLASH_ATTN_EXT` output, its reshape/view, or the Meta exporter.
+
+An opt-in five-tensor probe now preserves `fattn_raw-<layer>` just after
+the `FLASH_ATTN_EXT` node (logical 4D `[v_head_dim,q_heads,tokens,1]`)
+and before `ggml_reshape_2d` produces `kqv_out`. Both exports are
+reassembled in logical `[heads*dim,tokens]` order. Meta additionally
+logs `[GALAXY_REAL_QKV_RANK]` for each rank-local **raw** Flash Attention
+and reshaped tensor, including backend, local dimensions, bytes and a
+separate 64-bit FNV-1a hash of the bytes read from that backend.
+
+The same `galaxy-real-qkv-sanity.py` now prints:
+
+- `GALAXY_QKV_RAW_RESHAPE` for bitwise/raw-vs-2D equality and per-rank error
+- `GALAXY_QKV_RAW_DUPLICATE` for whether *raw* Flash Attention halves repeat
+- `GALAXY_QKV_DUPLICATE` for existing Q/K/V/output comparisons
+
+This diagnostic change only runs with the existing `-ProbeQkvLayers`
+option, does not change model Attention math or the Phone RPC protocol,
+and may change allocation lifetimes when pinning the Flash Attention
+node. Never use the timing from a probe run for performance claims.
+
+One targeted rerun using the existing 98-token prompt:
+
+```powershell
+git pull --ff-only origin feat/galaxy-baseline
+cmake --build build-galaxy --config Release --target llama-cli -j 8
+$common.ProbeQkvLayers = "0"
+$common.DumpLayers = ""
+$common.DumpStages = ""
+$common.DumpFfnOps = ""
+$common.OutputDir = ".\galaxy-sp-results\raw-attn-boundary"
+.\tools\galaxy\run_galaxy_sp_smoke.ps1 @common -PureTP
+
+$run = Get-ChildItem $common.OutputDir -Directory -Filter "tp-*" |
+    Sort-Object CreationTime -Descending | Select-Object -First 1
+$probe = Join-Path $run.FullName "real-qkv\tokens-98"
+python .\tools\galaxy\galaxy-real-qkv-sanity.py `
+    --probe-dir $probe --layer 0 --tokens 98 `
+    --heads 24 --kv-heads 8 --head-dim 128 |
+    Select-String "GALAXY_QKV_RAW|GALAXY_QKV_DUPLICATE"
+Select-String -Path (Join-Path $run.FullName "stderr.log") `
+    -Pattern "\[GALAXY_REAL_QKV_RANK\]"
+```
+
+Interpretation:
+
+- Raw halves **not duplicated**, but reshaped output duplicated:
+  isolate the reshape/view/Meta per-rank source mapping. Check FNV hashes.
+- Raw halves **already duplicated** and per-rank FNV hashes match:
+  investigate Flash Attention execution or pre-reshape local tensor
+  memory, rather than the 2D exporter.
+- Raw and reshaped values do not match within the same rank:
+  investigate tensor pinning/lifetimes and wrong/aliased buffer reads.
+- All five snapshots become nonduplicated with the new pin:
+  suspect temporary tensor lifetime/reuse previously masked by the
+  unpinned raw intermediate. Verify again without the diagnostic
+  before accepting a production fix.
+
+Stop before enabling production SP-Attention until this boundary is
+understood and the reference Attention is trustworthy.
