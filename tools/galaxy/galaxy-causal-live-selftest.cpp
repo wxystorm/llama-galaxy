@@ -43,7 +43,10 @@ struct fixtures {
 
     fixtures() {
         r.tokens=17;
-        r.head_dim=16;
+        // CUDA FLASH_ATTN_EXT has NO head_dim=16 native kernel. The real
+        // Llama-3.2-3B workload uses 128, which is already supported by
+        // CUDA0 and Phone RPC0 in the standalone native replay.
+        r.head_dim=128;
         r.layer=0;
         r.tile_tokens=5;
         r.max_rmse=0.001;
