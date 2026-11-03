@@ -308,6 +308,17 @@ inline measurement shadow(const devices_t & devices, const request & r) {
     }
     for (int rank=0;rank<2;++rank) {
         ggml_backend_synchronize(devices[rank]);
+        // The RPC graph-compute command is fire-and-forget and RPC sync
+        // is not a completion barrier. Reading the first output element
+        // through that same RPC connection forces command-order
+        // completion BEFORE we record the observed-ready wall interval.
+        // This measurement includes launch, RPC round trips and readback:
+        // it is NOT the Phone's exclusive GPU kernel time.
+        float completion_sample=0.0f;
+        ggml_backend_tensor_get(ranks[rank]->sp_output,
+                &completion_sample,0,sizeof(completion_sample));
+        require(std::isfinite(completion_sample),
+                "nonfinite native Flash completion sample");
     }
     m.native_phase_ms=ms(start);
 
