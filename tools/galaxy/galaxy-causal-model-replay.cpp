@@ -198,6 +198,27 @@ void run(const settings & c, const backend_pair & devices) {
     const auto v = read_glg1(c.probe_dir/("Vcur-"+std::to_string(c.layer)+".f32"), kvw*l.new_tokens);
     const auto model = read_glg1(c.probe_dir/("kqv_out-"+std::to_string(c.layer)+".f32"), qw*l.new_tokens);
 
+    // For a FRESH single-sequence causal prefill the first token can
+    // see exactly one key. Its pre-Wo Attention output must therefore
+    // equal Vcur token 0 repeated by GQA head groups, regardless of Q/K,
+    // RoPE, softmax scale or Flash Attention implementation.
+    // This is a source-probe sanity check, not an arbitrary tolerance gate.
+    stats first_token_identity;
+    const int64_t group = l.query_heads / l.kv_heads;
+    for (int64_t h = 0; h < l.query_heads; ++h) {
+        for (int64_t d = 0; d < l.head_dim; ++d) {
+            const size_t source = static_cast<size_t>((h/group)*l.head_dim+d);
+            const size_t target = static_cast<size_t>(h*l.head_dim+d);
+            first_token_identity.add(v[source], model[target], 0, h*l.head_dim+d);
+        }
+    }
+    std::cout << "[GALAXY_REAL_REPLAY] check=first_token_v_identity rmse="
+              << first_token_identity.rmse()
+              << " max_abs=" << first_token_identity.maximum
+              << " cosine=" << first_token_identity.cosine()
+              << " expectation=fresh_single_sequence_causal_prefill"
+              << " status=MEASURED\\n";
+
     buffers rank0(devices[0],l,0);
     buffers rank1(devices[1],l,1);
     buffers * ranks[2]={&rank0,&rank1};
@@ -239,6 +260,11 @@ void run(const settings & c, const backend_pair & devices) {
                   << " max_abs=" << per_rank.maximum
                   << " cosine=" << per_rank.cosine()
                   << " status=KV_EXACT_ATTENTION_MEASURED\n";
+    }
+    if (entire.cosine() < 0.9) {
+        std::cerr << "[GALAXY_REAL_REPLAY] WARNING numerical_reference_is_unrelated"
+                  << " cosine=" << entire.cosine()
+                  << " action=inspect_first_token_v_identity_and_attention_mask\\n";
     }
     std::cout << "[GALAXY_REAL_REPLAY] layer=" << c.layer
               << " tokens=" << c.tokens << " split=" << c.rank0 << ","
