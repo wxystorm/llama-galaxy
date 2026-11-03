@@ -15,6 +15,8 @@ param(
     [string]$HeadSplit = "20,20",
     [string]$FfnSplit = "8704,8704",
     [string]$Galaxy2FfnSpLayers = "1",
+    [string]$SeqWeights = "1,1",
+    [switch]$FinalLayerSP,
     [int]$BaselineTile = 32,
     [int]$OptimizedTile = 256,
     [switch]$Profile,
@@ -48,6 +50,8 @@ $opts = @{
     HeadSplit = $HeadSplit
     FfnSplit = $FfnSplit
     Galaxy2FfnSpLayers = $Galaxy2FfnSpLayers
+    SeqWeights = $SeqWeights
+    FinalLayerSP = $FinalLayerSP
     OutputDir = $root
     Profile = $Profile
     DumpLogits = $true
@@ -130,6 +134,8 @@ $manifest = @{
     baseline_tile = $BaselineTile
     optimized_tile = $OptimizedTile
     galaxy2_sp_ffn_layers = $Galaxy2FfnSpLayers
+    seq_weights = $SeqWeights
+    final_layer_sp = [bool]$FinalLayerSP
     profiling_forced_sync = [bool]$Profile
     results = $records
     tile_parity = $parity
