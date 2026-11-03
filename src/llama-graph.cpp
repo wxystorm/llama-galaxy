@@ -2690,6 +2690,12 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
+    if (arch == LLM_ARCH_LLAMA && n_tokens > 1 &&
+            llama_galaxy_tp::qkv_probe_enabled(il)) {
+        // Before W_o: the true GQA Attention value from the GGUF graph.
+        // Pin without changing the graph's subsequent computation.
+        ggml_set_output(cur);
+    }
 
     if (inp->self_v_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
