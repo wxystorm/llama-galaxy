@@ -92,12 +92,14 @@ def main():
     parser.add_argument("--candidate", type=Path, required=True, help="cap=1 or Galaxy2 run directory")
     parser.add_argument("--layers", default="0,1", help="comma-separated layer indices")
     parser.add_argument("--hidden", type=int, default=3072, help="hidden width (Llama 3.2 3B is 3072)")
+    parser.add_argument("--ffn-ops", action="store_true", help="compare Up/Gate/activated FFN operator snapshots")
+    parser.add_argument("--ffn-width", type=int, default=8192, help="FFN feature width (Llama 3.2 3B is 8192)")
     parser.add_argument("--seq-weights", default="1,1", help="rank 0/1 token weights")
     parser.add_argument("--output", type=Path, help="optional JSON output path")
     args = parser.parse_args()
     weights = tuple(int(x) for x in args.seq_weights.split(","))
-    if len(weights) != 2 or min(weights) <= 0 or args.hidden <= 0:
-        parser.error("need positive --hidden and --seq-weights a,b")
+    if len(weights) != 2 or min(weights) <= 0 or args.hidden <= 0 or args.ffn_width <= 0:
+        parser.error("need positive --hidden, --ffn-width and --seq-weights a,b")
     layers = sorted(set(int(v) for v in args.layers.split(",")))
     if not layers or layers[0] < 0:
         parser.error("need nonnegative --layers")
@@ -109,6 +111,12 @@ def main():
             a, b = (read_state(run, layer, stage) for run in (args.reference, args.candidate))
             states[(layer, stage)] = (a, b)
             rows.append({"layer": layer, "stage": stage, **metrics(a, b, args.hidden, weights)})
+        if args.ffn_ops:
+            for op in ("ffn_up", "ffn_gate", "ffn_gate_par"):
+                op_path = f"ffn_ops/{op}-{layer}.f32"
+                a, b = (read_snapshot(run / op_path) for run in (args.reference, args.candidate))
+                rows.append({"layer": layer, "stage": op,
+                             **metrics(a, b, args.ffn_width, weights)})
         in_a, in_b = states[(layer, "ffn_inp")]
         out_a, out_b = states[(layer, "l_out")]
         rows.append({"layer": layer, "stage": "FFN_contribution",
@@ -129,6 +137,7 @@ def main():
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps({"reference": str(args.reference),
             "candidate": str(args.candidate), "layers": layers,
+            "ffn_ops": args.ffn_ops, "ffn_width": args.ffn_width,
             "results": rows}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print(f"[GALAXY_STAGE_COMPARE] output={args.output}")
     print("[GALAXY_STAGE_COMPARE] PASS (diagnostics only, not a numerical-parity verdict)")
