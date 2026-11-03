@@ -1365,3 +1365,71 @@ A later probe run now emits `[GALAXY_REAL_QKV_RANK]` with explicit
 `stderr` writes instead of verbosity-filtered INFO logs. Both
 `stderr.log` and `stdout.log` can be searched for older runs, but
 missing entries in an old log are not evidence of equal device hashes.
+
+
+## Fix: capture QKV at the producing Meta subgraph (not graph completion)
+
+The old/new 98-token diagnostic captures established that `Qcur`
+and `Kcur` are **bitwise identical** across runs (0 differences), while
+`Vcur` differs massively (cross-run RMSE=2.26481915, token-0
+RMSE=3.77976845) and `kqv_out` also changes (RMSE=0.188672215).
+Previous end-of-model snapshots were therefore **not trustworthy as a
+numerical reference**. These measurements alone do not prove whether
+the V computation or an overwritten temporary caused the change.
+
+The Meta QKV probe has now been corrected to:
+
+1. Treat `Qcur`, `Kcur`, `Vcur`, `fattn_raw`, and `kqv_out`
+   (only when marked OUTPUT by the opt-in layer selector) as producer
+   boundaries in the Meta execution partitioner.
+2. When a boundary completes, synchronize both CUDA/RPC backends and
+   immediately copy each rank's *actual local tensor bytes* to its own
+   host-owned vector. Print one `[GALAXY_QKV_CAPTURE]` line per rank,
+   including the producing subgraph and FNV-1a hash. No per-element
+   logging or permanent changes to the runtime model buffers.
+3. Skip TP AllReduce at the new diagnostic boundaries when their split
+   state is a normal feature/head shard, not PARTIAL. Disable the
+   pure-TP delayed-partial boundary optimization while probing, to
+   avoid accidentally moving a requested capture point.
+4. At the end of the run, reconstruct GLG1 snapshots **only from
+   producer-time host copies**. If any required snapshot is missing or
+   its length differs from the underlying rank-local shape, fail
+   explicitly instead of silently reading a reused backend buffer.
+5. Emit `[GALAXY_QKV_CAPTURE_SUM]` with `late_backend_reads=0`.
+   Without `-ProbeQkvLayers` no diagnostic boundaries or readbacks
+   are inserted.
+
+Build only the PC client; Phone RPC is unchanged:
+
+```powershell
+git pull --ff-only origin feat/galaxy-baseline
+cmake --build build-galaxy --config Release --target llama-cli -j 8
+
+$common.DumpLayers = ""
+$common.DumpStages = ""
+$common.DumpFfnOps = ""
+$common.ProbeQkvLayers = "0"
+$common.OutputDir = ".\galaxy-sp-results\qkv-producer-capture"
+.\tools\galaxy\run_galaxy_sp_smoke.ps1 @common -PureTP
+
+$run = Get-ChildItem $common.OutputDir -Directory -Filter "tp-*" |
+    Sort-Object CreationTime -Descending | Select-Object -First 1
+$probe = Join-Path $run.FullName "real-qkv\tokens-98"
+
+Get-Content (Join-Path $run.FullName "stderr.log") |
+    Select-String "GALAXY_QKV_CAPTURE"
+python .\tools\galaxy\galaxy-real-qkv-sanity.py `
+    --probe-dir $probe --layer 0 --tokens 98 `
+    --heads 24 --kv-heads 8 --head-dim 128 |
+    Select-String "GALAXY_QKV_DUPLICATE|GALAXY_QKV_RAW|grouped_GQA|interleaved_GQA"
+```
+
+One diagnostic 98-token TP run is sufficient to check whether the
+capture-time V/Attention outputs are stable and satisfy the
+first-token invariant. These runs deliberately add backend fences and
+additional subgraphs, so their `tok/s` must not be used in performance
+comparisons. **This does not itself prove production Attention numerical
+parity.** If the model still violates the causal token-0 V identity with
+producer-time copies, proceed to the true Flash Attention mask, source
+KV-cache placement and per-rank GQA indexing before enabling SP
+Attention in the inference graph.
