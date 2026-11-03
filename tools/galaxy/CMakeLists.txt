@@ -55,3 +55,12 @@ target_compile_features(galaxy-causal-native-flash-replay PRIVATE cxx_std_17)
 if (GGML_RPC)
     target_compile_definitions(galaxy-causal-native-flash-replay PRIVATE GALAXY_CAUSAL_HAVE_RPC=1)
 endif()
+
+# Bidirectional TP head <-> SP token exchange, byte-for-byte correctness
+# for 2D/3D F16/F32 on CPU+CPU or CUDA+Phone RPC.
+add_executable(galaxy-layout-selftest galaxy-layout-selftest.cpp)
+target_link_libraries(galaxy-layout-selftest PRIVATE ggml)
+target_compile_features(galaxy-layout-selftest PRIVATE cxx_std_17)
+if (GGML_RPC)
+    target_compile_definitions(galaxy-layout-selftest PRIVATE GALAXY_LAYOUT_HAVE_RPC=1)
+endif()
