@@ -26,6 +26,7 @@ param(
     [string]$DumpFfnOps = "",
     [string]$ProbeQkvLayers = "",
     [int]$LiveCausalLayer = -1,
+    [switch]$LiveCausalReplace,
     [switch]$Trace,
     [switch]$DumpLogits,
     [int]$TimeoutSec = 0,
@@ -48,6 +49,12 @@ if ($LiveCausalLayer -lt -1 -or $LiveCausalLayer -gt 0) {
 }
 if ($LiveCausalLayer -eq 0 -and -not $PureTP) {
     throw "LiveCausalLayer 0 currently requires -PureTP, not Galaxy or Galaxy2"
+}
+if ($LiveCausalReplace -and $LiveCausalLayer -ne 0) {
+    throw "LiveCausalReplace requires -LiveCausalLayer 0"
+}
+if ($LiveCausalReplace -and -not $DumpLogits) {
+    throw "LiveCausalReplace v1 requires -DumpLogits for independent TP baseline comparison"
 }
 if ($Galaxy2FfnSpLayerSet -and -not $Galaxy2) {
     throw "Galaxy2FfnSpLayerSet requires -Galaxy2"
@@ -80,7 +87,7 @@ $keys = @("LLAMA_GALAXY_TP", "LLAMA_GALAXY_TP_HEADS", "LLAMA_GALAXY_TP_FFN", "LL
     "LLAMA_GALAXY_STAGE_DUMP", "LLAMA_GALAXY_STAGE_DUMP_DIR",
     "LLAMA_GALAXY_FFN_OP_DUMP", "LLAMA_GALAXY_FFN_OP_DUMP_DIR",
     "LLAMA_GALAXY_QKV_PROBE_LAYERS", "LLAMA_GALAXY_QKV_PROBE_DIR",
-    "LLAMA_GALAXY_CAUSAL_LIVE_LAYER",
+    "LLAMA_GALAXY_CAUSAL_LIVE_LAYER", "LLAMA_GALAXY_CAUSAL_LIVE_MODE",
     "LLAMA_GALAXY_COLLECTIVE_TILE_TOKENS", "LLAMA_GALAXY_RS_FUSED_READ", "LLAMA_GALAXY_SP_SEQ_WEIGHTS",
     "LLAMA_GALAXY_SP_FINAL_LAYER")
 $old = @{}
@@ -133,6 +140,7 @@ try {
         $ffnOpDir
     } else { $null }
     $env:LLAMA_GALAXY_CAUSAL_LIVE_LAYER = if ($LiveCausalLayer -eq 0) { "0" } else { $null }
+    $env:LLAMA_GALAXY_CAUSAL_LIVE_MODE = if ($LiveCausalReplace) { "REPLACE" } elseif ($LiveCausalLayer -eq 0) { "SHADOW" } else { $null }
     $env:LLAMA_GALAXY_QKV_PROBE_LAYERS = if ($ProbeQkvLayers) { $ProbeQkvLayers } else { $null }
     $env:LLAMA_GALAXY_QKV_PROBE_DIR = if ($ProbeQkvLayers) {
         $probeDir = Join-Path $dir "real-qkv"
@@ -173,7 +181,7 @@ try {
     $exitCode = $result.ExitCode
     Write-Host "[GALAXY_SP_SMOKE] exit=$exitCode logs=$dir"
 
-    $hits = @(Select-String -Path $stderr, $stdout -Pattern "GALAXY_META_TRACE","GALAXY_SP_LAYOUT_FAIL","GALAXY_SP_LAYOUT_SRC","GALAXY_SP_SUM","GALAXY_SP]","GALAXY_TP]","GALAXY_CAUSAL_LIVE","prompt eval time","eval time","ERROR","failed" -ErrorAction SilentlyContinue)
+    $hits = @(Select-String -Path $stderr, $stdout -Pattern "GALAXY_META_TRACE","GALAXY_SP_LAYOUT_FAIL","GALAXY_SP_LAYOUT_SRC","GALAXY_SP_SUM","GALAXY_SP]","GALAXY_TP]","GALAXY_CAUSAL_LIVE","GALAXY_CAUSAL_REPLACE","prompt eval time","eval time","ERROR","failed" -ErrorAction SilentlyContinue)
     # Keep the full trace in stderr.log, but print only the last 80
     # matching lines on the terminal to avoid flooding a long SP run.
     $displayHits = if ($Trace) { @($hits | Select-Object -Last 80) } else { $hits }
@@ -191,13 +199,37 @@ try {
         Write-Warning "SP run exited normally but no positive ReduceScatter count was logged. Continue numerical comparison; actual SP collective execution remains UNVERIFIED."
     }
     if ($LiveCausalLayer -eq 0) {
-        $livePassed = @($hits | Where-Object {
-            $_.Line -match '\[GALAXY_CAUSAL_LIVE\].*mode=SHADOW.*status=PASS'
+        $anyFailure = @($hits | Where-Object {
+            $_.Line -match '\[GALAXY_CAUSAL_(LIVE|REPLACE)(_|\])' -and
+            $_.Line -match 'status=FAIL'
         })
-        if ($livePassed.Count -eq 0) {
-            throw "No successful live causal SP shadow witness. Inspect $stderr"
+        if ($anyFailure.Count -gt 0) {
+            throw "Causal live execution reported failures. Inspect $stderr"
         }
-        Write-Host "[GALAXY_CAUSAL_LIVE] layer=0 mode=SHADOW reference=IN_FLIGHT result=CONFIRMED"
+        if ($LiveCausalReplace) {
+            $livePassed = @($hits | Where-Object {
+                $_.Line -match '\[GALAXY_CAUSAL_LIVE\].*mode=REPLACE.*tp_flash_skipped=1.*pre_wo_identity=BYTE_EXACT status=PASS'
+            })
+            $skipProof = @($hits | Where-Object {
+                $_.Line -match '\[GALAXY_CAUSAL_REPLACE_DISPATCH\].*tp_flash_skipped=1 status=PASS'
+            })
+            $verifyProof = @($hits | Where-Object {
+                $_.Line -match '\[GALAXY_CAUSAL_REPLACE_VERIFY\].*pre_wo_identity=BYTE_EXACT status=PASS'
+            })
+            if ($livePassed.Count -eq 0 -or $skipProof.Count -lt 2 -or
+                    $verifyProof.Count -lt 2) {
+                throw "Missing verified native SP replacement (2 ranks, Flash skipped, W_o input exact). Inspect $stderr"
+            }
+            Write-Host "[GALAXY_CAUSAL_LIVE] layer=0 mode=REPLACE reference=SEPARATE_TP_BASELINE_REQUIRED result=PRODUCTION_WO_SP_INPUT_CONFIRMED"
+        } else {
+            $livePassed = @($hits | Where-Object {
+                $_.Line -match '\[GALAXY_CAUSAL_LIVE\].*mode=SHADOW.*status=PASS'
+            })
+            if ($livePassed.Count -eq 0) {
+                throw "No successful live causal SP shadow witness. Inspect $stderr"
+            }
+            Write-Host "[GALAXY_CAUSAL_LIVE] layer=0 mode=SHADOW reference=IN_FLIGHT result=CONFIRMED"
+        }
     }
     if ($Profile) { Write-Host "[GALAXY_PROFILE] directory=$($env:LLAMA_GALAXY_PROFILE_DIR)" }
     if ($DumpLayers) { Write-Host "[GALAXY_LAYER_DUMP] layers=$DumpLayers dir=$($env:LLAMA_GALAXY_LAYER_DUMP_DIR)" }
