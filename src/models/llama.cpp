@@ -202,6 +202,15 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
         }
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, residual_attn);
         cb(ffn_inp, "ffn_inp", il);
+        // Diagnostic only: preserve the comparable post-attention residual
+        // activation. TP produces a mirrored tensor; Galaxy uses SP shards.
+        // The Meta dump reconstructs the original sequence for comparison.
+        const bool galaxy_stage_dump = !embed && n_tokens > 1 &&
+                model.layers[il].ffn_gate_inp == nullptr &&
+                llama_galaxy_tp::dump_stage_enabled(il);
+        if (galaxy_stage_dump) {
+            ggml_set_output(ffn_inp);
+        }
         // 残差连接
         // feed-forward network (non-MoE)
         if (model.layers[il].ffn_gate_inp == nullptr) {
@@ -210,6 +219,9 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                     model.layers[il].ffn_norm, NULL,
                     LLM_NORM_RMS, il);
             cb(cur, "ffn_norm", il);
+            if (galaxy_stage_dump) {
+                ggml_set_output(cur);
+            }
 
             if (galaxy_sp_layer && !galaxy2_ffn_sp) {
                 // Galaxy Scheme-1 keeps FFN tensor-parallel.
