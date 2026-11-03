@@ -2795,7 +2795,47 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         i, j, ggml_backend_name(bcj.backend), simple_graph->n_nodes);
             }
             dispatch_start[j] = ggml_galaxy_profile::clock::now();
-            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, simple_graph);
+            // REPLACE executes every predecessor node (including the
+            // persistent KV-cache writes) but deliberately omits the
+            // original TP FLASH_ATTN_EXT kernel. The output will be
+            // supplied by native PC+Phone SP Attention before any
+            // downstream kqv_out reshape / W_o graph can execute.
+            //
+            // Use a shallow graph copy, never mutate the stored Meta
+            // cgraph. Force uid=0: RPC graph reuse MUST hash the actual
+            // trimmed node sequence, not use the old complete graph UID.
+            ggml_cgraph without_flash = *simple_graph;
+            ggml_cgraph * run_graph = simple_graph;
+            if (is_replace_raw_boundary) {
+                ggml_tensor * source_last =
+                        ggml_backend_meta_buffer_simple_tensor(original_last,j);
+                if (simple_graph->n_nodes<1 ||
+                        simple_graph->nodes[simple_graph->n_nodes-1]!=source_last ||
+                        source_last->op!=GGML_OP_FLASH_ATTN_EXT) {
+                    GGML_LOG_ERROR("[GALAXY_CAUSAL_REPLACE] rank=%zu final kernel identity mismatch\n",j);
+                    return GGML_STATUS_FAILED;
+                }
+                for(int k=0;k<simple_graph->n_nodes-1;++k) {
+                    if (simple_graph->nodes[k]->op==GGML_OP_FLASH_ATTN_EXT) {
+                        GGML_LOG_ERROR("[GALAXY_CAUSAL_REPLACE] unexpected preceding Flash op\n");
+                        return GGML_STATUS_FAILED;
+                    }
+                }
+                --without_flash.n_nodes;
+                without_flash.uid=0;
+                run_graph=&without_flash;
+                std::fprintf(stderr,
+                        "[GALAXY_CAUSAL_REPLACE_DISPATCH] rank=%zu"
+                        " subgraph=%zu nodes_total=%d nodes_run=%d"
+                        " skipped_node=%s skipped_op=%s"
+                        " tp_flash_skipped=1 status=PASS\n",
+                        j,i,simple_graph->n_nodes,without_flash.n_nodes,
+                        original_last->name,ggml_op_name(source_last->op));
+                std::fflush(stderr);
+            }
+            const ggml_status status=run_graph->n_nodes>0 ?
+                    ggml_backend_graph_compute_async(bcj.backend,run_graph) :
+                    GGML_STATUS_SUCCESS;
             if (profiling) {
                 dispatch_ms[j] = ggml_galaxy_profile::ms(dispatch_start[j],
                         ggml_galaxy_profile::clock::now());
