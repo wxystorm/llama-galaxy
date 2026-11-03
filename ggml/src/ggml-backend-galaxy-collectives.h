@@ -317,6 +317,26 @@ inline void all_gather(const devices_t & devices, const input_t & shard,
     measure.finish("AG", replicated[0], counts[0] + counts[1], tile_tokens);
 }
 
+// Source Galaxy-LM SPBertAttention computes Q locally on a sequence
+// shard but explicitly gathers K and V across the complete sequence
+// before the QK/softmax/V attention. These two gathers are independent
+// but must use exactly the same token ownership (no implicit padding).
+// For Qwen3, K/V are typically 3D; callers must provide contiguous 2D
+// [head_features, local_tokens] tensors and restore head dimensions after
+// gathering. This primitive does not by itself enable Qwen3 SP Attention:
+// causal mask, KV-cache ownership and rank-local Q shape remain separate.
+inline void all_gather_attention_kv(const devices_t & devices,
+        const input_t & local_keys, const input_t & local_values,
+        const output_t & complete_keys, const output_t & complete_values,
+        counts_t counts, size_t tile_tokens = 32) {
+    if (local_keys[0] == local_values[0] || local_keys[1] == local_values[1] ||
+            complete_keys[0] == complete_values[0] || complete_keys[1] == complete_values[1]) {
+        throw std::invalid_argument("SP Attention K/V require distinct input and output tensor storage");
+    }
+    all_gather(devices, local_keys, complete_keys, counts, tile_tokens);
+    all_gather(devices, local_values, complete_values, counts, tile_tokens);
+}
+
 // Copy the sequence interval owned by each rank out of an already mirrored
 // full activation. This is needed for the residual path before an SP addition.
 // Rank 0's mirror is the canonical source. No arithmetic takes place.

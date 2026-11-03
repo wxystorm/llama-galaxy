@@ -142,6 +142,8 @@ struct tensors {
     ggml_tensor * partial = nullptr;
     ggml_tensor * slice = nullptr;
     ggml_tensor * complete = nullptr;
+    ggml_tensor * value_slice = nullptr;
+    ggml_tensor * value_complete = nullptr;
 
     tensors(ggml_backend_t backend, ggml_type type, int64_t hidden, int64_t total, int64_t local) {
         const ggml_init_params params = {1024*1024, nullptr, true};
@@ -150,6 +152,8 @@ struct tensors {
         partial  = ggml_new_tensor_2d(ctx, type, hidden, total);
         slice    = ggml_new_tensor_2d(ctx, type, hidden, local);
         complete = ggml_new_tensor_2d(ctx, type, hidden, total);
+        value_slice = ggml_new_tensor_2d(ctx, type, hidden, local);
+        value_complete = ggml_new_tensor_2d(ctx, type, hidden, total);
         buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
         require_test(buffer != nullptr, "alloc_ctx_tensors failed");
     }
@@ -218,6 +222,31 @@ static void run_case(devices_t devices, ggml_type type,
     all_gather(devices, shards, full, counts, tile);
     check_equals(unpack(rank0.complete), expected, "AG rank0");
     check_equals(unpack(rank1.complete), expected, "AG rank1");
+
+    // Mirror the source-defined SP Attention K/V AllGather. Values differ
+    // from keys to catch accidental K/V aliasing or out-of-order gathering.
+    const std::vector<float> key_full = expected;
+    std::vector<float> value_full(key_full.size());
+    for (size_t i = 0; i < value_full.size(); ++i) {
+        value_full[i] = key_full[i]*0.5f - 0.125f;
+    }
+    const auto v0 = pack(type, std::vector<float>(value_full.begin(), value_full.begin()+edge));
+    const auto v1 = pack(type, std::vector<float>(value_full.begin()+edge, value_full.end()));
+    ggml_backend_tensor_set(rank0.value_slice, v0.data(), 0, v0.size());
+    ggml_backend_tensor_set(rank1.value_slice, v1.data(), 0, v1.size());
+    const input_t kv_keys = {rank0.slice, rank1.slice};
+    const input_t kv_values = {rank0.value_slice, rank1.value_slice};
+    const output_t gathered_k = {rank0.complete, rank1.complete};
+    const output_t gathered_v = {rank0.value_complete, rank1.value_complete};
+    all_gather_attention_kv(devices, kv_keys, kv_values, gathered_k, gathered_v, counts, tile);
+    check_equals(unpack(rank0.complete), key_full, "SP attention K rank0");
+    check_equals(unpack(rank1.complete), key_full, "SP attention K rank1");
+    check_equals(unpack(rank0.value_complete), value_full, "SP attention V rank0");
+    check_equals(unpack(rank1.value_complete), value_full, "SP attention V rank1");
+    expect_reject([&] { all_gather_attention_kv(devices, kv_keys, kv_keys,
+            gathered_k, gathered_v, counts, tile); }, "K/V cannot alias");
+    std::cout << "[GALAXY_SP_ATT_KV] tokens=" << total << " split="
+              << counts[0] << "," << counts[1] << " status=PASS\n";
 
     // The independently gathered complete activation is the canonical
     // residual input; splitting it must return exactly the old intervals.

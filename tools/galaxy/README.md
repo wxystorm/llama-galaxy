@@ -641,3 +641,21 @@ the switch is explicitly enabled.
 Example:
 
     .\tools\galaxy\run_galaxy_sp_smoke.ps1 -Model "E:\llama\models\Qwen3-0.6B-Q4_K_M.gguf" -Rpc "10.39.52.114:50052" -PromptFile "D:\prima.cpp\prompts\prompt_64.txt" -Galaxy2 -Galaxy2FfnSpLayers all -FinalLayerSP -SeqWeights "20,12" -TimeoutSec 300
+
+
+## SP Attention K/V collective from source Galaxy-LM
+
+The original \`SPBertAttention.forward\` runs Q/K/V projections on a
+per-rank sequence shard, then separately AllGathers K and V to full
+sequence tensors before computing local-query attention. The fork now
+includes \`all_gather_attention_kv\` as an independent backend/RPC
+primitive, with F16/F32 unequal-shard and distinct-K/V tests in
+\`galaxy-collectives-selftest\`. Unlike general SP connection AG, this
+pair always gathers **both** K and V.
+
+IMPORTANT: This is a primitive-level port, NOT an enabled Qwen3
+pure-SP Attention mode. Qwen3 uses grouped-query causal attention,
+rotary positions and a stateful KV cache; SP Q ownership and the causal
+mask must be adapted as well. The existing TP, Galaxy and Galaxy2
+Qwen3 paths do not call this new primitive. The test provides an
+independent transport baseline for implementing that remaining mode.
