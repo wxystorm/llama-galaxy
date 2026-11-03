@@ -16,6 +16,7 @@ param(
     [switch]$Galaxy2,
     [string]$Galaxy2FfnSpLayers = "1",
     [int]$CollectiveTileTokens = 32,
+    [string]$SeqWeights = "1,1",
     [switch]$RsFusedRead,
     [switch]$Profile,
     [string]$DumpLayers = "",
@@ -36,6 +37,9 @@ if (-not (Test-Path -LiteralPath $Model)) { throw "Missing model: $Model" }
 if (-not (Test-Path -LiteralPath $PromptFile)) { throw "Missing prompt: $PromptFile" }
 if ($Devices.Split(",").Count -ne 2) { throw "Devices must contain exactly PC,RPC" }
 if ($PureTP -and $Galaxy2) { throw "PureTP and Galaxy2 cannot both be enabled" }
+if ($SeqWeights -notmatch '^[1-9][0-9]*,[1-9][0-9]*$') {
+    throw "SeqWeights must be two positive integers such as 20,12"
+}
 if ($CollectiveTileTokens -lt 1 -or $CollectiveTileTokens -gt 1024) {
     throw "CollectiveTileTokens must be 1..1024"
 }
@@ -49,7 +53,7 @@ if ($Ctx -le 0 -or $Batch -le 0 -or $UBatch -le 0 -or $Threads -le 0 -or $NPredi
 $keys = @("LLAMA_GALAXY_TP", "LLAMA_GALAXY_TP_HEADS", "LLAMA_GALAXY_TP_FFN", "LLAMA_GALAXY_SP", "LLAMA_GALAXY_SP_TRACE", "LLAMA_GALAXY_FIRST_LOGITS_PATH",
     "LLAMA_GALAXY2", "LLAMA_GALAXY2_FFN_SP_LAYERS", "LLAMA_GALAXY_PROFILE_DIR",
     "LLAMA_GALAXY_LAYER_DUMP", "LLAMA_GALAXY_LAYER_DUMP_DIR",
-    "LLAMA_GALAXY_COLLECTIVE_TILE_TOKENS", "LLAMA_GALAXY_RS_FUSED_READ")
+    "LLAMA_GALAXY_COLLECTIVE_TILE_TOKENS", "LLAMA_GALAXY_RS_FUSED_READ", "LLAMA_GALAXY_SP_SEQ_WEIGHTS")
 $old = @{}
 foreach ($key in $keys) { $old[$key] = [Environment]::GetEnvironmentVariable($key, "Process") }
 
@@ -59,6 +63,7 @@ try {
     $env:LLAMA_GALAXY_TP_FFN   = $FfnSplit
     $env:LLAMA_GALAXY_SP       = if ($PureTP) { "0" } else { "1" }
     $env:LLAMA_GALAXY_SP_TRACE = if ($Trace) { "1" } else { "0" }
+    $env:LLAMA_GALAXY_SP_SEQ_WEIGHTS = $SeqWeights
     $env:LLAMA_GALAXY_COLLECTIVE_TILE_TOKENS = $CollectiveTileTokens.ToString()
     $env:LLAMA_GALAXY_RS_FUSED_READ = if ($RsFusedRead) { "1" } else { "0" }
     $env:LLAMA_GALAXY2 = if ($Galaxy2) { "1" } else { "0" }
@@ -97,7 +102,7 @@ try {
         "-ub", $UBatch.ToString(), "-t", $Threads.ToString(),
         "-n", $NPredict.ToString(), "--temp", "0", "-f", $promptArg
     )
-    Write-Host "[GALAXY_SP_SMOKE] mode=$mode devices=$Devices rpc=$Rpc profiling=$([bool]$Profile) tile_tokens=$CollectiveTileTokens rs_fused=$([bool]$RsFusedRead)"
+    Write-Host "[GALAXY_SP_SMOKE] mode=$mode devices=$Devices rpc=$Rpc profiling=$([bool]$Profile) tile_tokens=$CollectiveTileTokens rs_fused=$([bool]$RsFusedRead) seq_weights=$SeqWeights"
     if ($Galaxy2 -and $Galaxy2FfnSpLayers -ne "all") {
         Write-Host "[GALAXY2] hybrid_layer_cap=$Galaxy2FfnSpLayers (not full Galaxy2)"
     }

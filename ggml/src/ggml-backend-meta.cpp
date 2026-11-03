@@ -874,8 +874,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             if (transition == galaxy_sp_transition::all_gather) {
                 return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
             }
-            const int64_t pc_tokens = (tensor->ne[1] + 1)/2;
-            return {GGML_BACKEND_SPLIT_AXIS_1, {pc_tokens, tensor->ne[1] - pc_tokens}, {1}, 1};
+            const auto seq = ggml_galaxy::configured_sequence_split(tensor->ne[1]);
+            return {GGML_BACKEND_SPLIT_AXIS_1, {seq[0], seq[1]}, {1}, 1};
         }
 
         std::vector<ggml_backend_meta_split_state> src_ss(GGML_MAX_SRC, {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1});

@@ -34,6 +34,29 @@ static std::vector<uint8_t> copy_tensor_bytes(const ggml_tensor * tensor) {
     return result;
 }
 
+static void verify_sequence_weighting() {
+    require_test(ggml_galaxy::parse_seq_weights(nullptr) == ggml_galaxy::parse_seq_weights("1,1"),
+            "default SP sequence weights");
+    require_test(ggml_galaxy::configured_sequence_split(2) == ggml_galaxy::split_sequence(2, {1,1}),
+            "two-token warmup split");
+    require_test(ggml_galaxy::split_sequence(72, {20,12}) ==
+            (std::array<int64_t, 2>{45,27}), "72-token 20:12 split");
+    require_test(ggml_galaxy::split_sequence(32, {20,12}) ==
+            (std::array<int64_t, 2>{20,12}), "source seq_scatter_list 20:12");
+    require_test(ggml_galaxy::split_sequence(72, {1,1}) ==
+            (std::array<int64_t, 2>{36,36}), "balanced split");
+    require_test(ggml_galaxy::split_sequence(2, {20,12}) ==
+            (std::array<int64_t, 2>{1,1}), "small warmup");
+    require_test(ggml_galaxy::split_sequence(3, {10000,1}) ==
+            (std::array<int64_t, 2>{2,1}), "nonzero shard");
+    expect_reject([] { (void) ggml_galaxy::parse_seq_weights(""); }, "empty weights");
+    expect_reject([] { (void) ggml_galaxy::parse_seq_weights("1,0"); }, "zero weight");
+    expect_reject([] { (void) ggml_galaxy::parse_seq_weights("3,2,1"); }, "three ranks");
+    expect_reject([] { (void) ggml_galaxy::parse_seq_weights("-1,2"); }, "negative weight");
+    expect_reject([] { (void) ggml_galaxy::parse_seq_weights("1,9223372036854775808"); }, "overflow");
+    std::cout << "GALAXY_SEQ_WEIGHTS_SELFTEST PASS\n";
+}
+
 static void verify_rs_fused_config() {
     require_test(!parse_rs_fused_read(nullptr), "unset RS prefetch must be off");
     require_test(!parse_rs_fused_read("0"), "disabled RS prefetch");
@@ -231,6 +254,7 @@ int main(int argc, char ** argv) {
         }
         verify_marker_identity_survives_callback_rename();
         verify_tile_parser();
+        verify_sequence_weighting();
         verify_rs_fused_config();
         ggml_backend_load_all();
         ggml_backend_t pc = pc_name.empty()

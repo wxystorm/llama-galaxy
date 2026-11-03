@@ -586,3 +586,28 @@ Run (no rebuild required):
 For old scripts, passing
 \`-OutputDir "E:\llama\llama-galaxy\galaxy-sp-results"\`
 also avoids this particular path mismatch.
+
+
+## Phase 5: source-defined asymmetric sequence allocation
+
+The upstream Galaxy-LM BERT configuration exposes \`seq_scatter_list\`
+(e.g. [20,12]) alongside static attention-head and FFN split lists.
+Previous Qwen3 Meta graphs hard-coded balanced (ceil(N/2),floor(N/2))
+ownership. Asymmetric sequence ownership is now configurable through
+\`LLAMA_GALAXY_SP_SEQ_WEIGHTS\`, exposed on the smoke runner as
+\`-SeqWeights "20,12"\` (defaults to 1,1).
+
+The values are **weights**, not fixed absolute token counts, because
+llama.cpp also executes two-token warmup graphs. For an N-token graph,
+the split is round(N*w0/(w0+w1)), clamped to [1,N-1].
+Examples: N=72 with 20,12 -> [45,27]; N=32 -> [20,12]; N=2 ->
+[1,1]. The same function is used for all SP transitions in each graph.
+The existing attention-head and FFN splits are independent of these
+sequence weights; this matches the distinct configuration dimensions
+in the upstream implementation.
+
+This does not add SP Attention with global K/V Gather. Upstream
+Galaxy-LM defines that path for encoder-only BERT, but Qwen3's causal
+KV-cache model needs separate masking, position and cache-ownership
+handling. Until implemented, the Qwen3 modes remain TP, Galaxy,
+Galaxy2 (full or per-layer-capped).
