@@ -21,6 +21,7 @@ param(
     [switch]$RsFusedRead,
     [switch]$Profile,
     [string]$DumpLayers = "",
+    [string]$DumpStages = "",
     [switch]$Trace,
     [switch]$DumpLogits,
     [int]$TimeoutSec = 0,
@@ -55,6 +56,7 @@ if ($Ctx -le 0 -or $Batch -le 0 -or $UBatch -le 0 -or $Threads -le 0 -or $NPredi
 $keys = @("LLAMA_GALAXY_TP", "LLAMA_GALAXY_TP_HEADS", "LLAMA_GALAXY_TP_FFN", "LLAMA_GALAXY_SP", "LLAMA_GALAXY_SP_TRACE", "LLAMA_GALAXY_FIRST_LOGITS_PATH",
     "LLAMA_GALAXY2", "LLAMA_GALAXY2_FFN_SP_LAYERS", "LLAMA_GALAXY_PROFILE_DIR",
     "LLAMA_GALAXY_LAYER_DUMP", "LLAMA_GALAXY_LAYER_DUMP_DIR",
+    "LLAMA_GALAXY_STAGE_DUMP", "LLAMA_GALAXY_STAGE_DUMP_DIR",
     "LLAMA_GALAXY_COLLECTIVE_TILE_TOKENS", "LLAMA_GALAXY_RS_FUSED_READ", "LLAMA_GALAXY_SP_SEQ_WEIGHTS",
     "LLAMA_GALAXY_SP_FINAL_LAYER")
 $old = @{}
@@ -93,6 +95,12 @@ try {
     $stdout = Join-Path $dir "stdout.log"
     $stderr = Join-Path $dir "stderr.log"
     $dumpPath = Join-Path (Resolve-Path -LiteralPath $dir).Path "first_logits.f32"
+    $env:LLAMA_GALAXY_STAGE_DUMP = if ($DumpStages) { $DumpStages } else { $null }
+    $env:LLAMA_GALAXY_STAGE_DUMP_DIR = if ($DumpStages) {
+        $stageDir = Join-Path (Resolve-Path -LiteralPath $dir).Path "stages"
+        New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+        $stageDir
+    } else { $null }
     $env:LLAMA_GALAXY_FIRST_LOGITS_PATH = if ($DumpLogits) { $dumpPath } else { $null }
 
     $modelArg = '"' + (Resolve-Path -LiteralPath $Model).Path + '"'
@@ -144,6 +152,19 @@ try {
     }
     if ($Profile) { Write-Host "[GALAXY_PROFILE] directory=$($env:LLAMA_GALAXY_PROFILE_DIR)" }
     if ($DumpLayers) { Write-Host "[GALAXY_LAYER_DUMP] layers=$DumpLayers dir=$($env:LLAMA_GALAXY_LAYER_DUMP_DIR)" }
+    if ($DumpStages) {
+        $stageNames = @("ffn_inp", "ffn_norm")
+        foreach ($layer in $DumpStages.Split(",")) {
+            foreach ($stage in $stageNames) {
+                $snapshot = Join-Path $env:LLAMA_GALAXY_STAGE_DUMP_DIR "$stage-$layer.f32"
+                if ($DumpStages -ne "all" -and (-not (Test-Path -LiteralPath $snapshot) -or
+                        (Get-Item -LiteralPath $snapshot).Length -le 8)) {
+                    throw "Missing Galaxy diagnostic stage snapshot: $snapshot"
+                }
+            }
+        }
+        Write-Host "[GALAXY_STAGE_DUMP] layers=$DumpStages dir=$($env:LLAMA_GALAXY_STAGE_DUMP_DIR)"
+    }
     $spEvidence = if ($PureTP) { "N/A" } elseif ($spWitness) { "CONFIRMED" } else { "UNVERIFIED" }
     Write-Host "[GALAXY_SP_SMOKE] PASS mode=$mode inference=PASS sp_collectives=$spEvidence"
 }
