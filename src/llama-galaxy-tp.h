@@ -255,6 +255,18 @@ inline bool qkv_probe_enabled(int64_t il) {
     return layer_selection_contains(std::getenv("LLAMA_GALAXY_QKV_PROBE_LAYERS"), il);
 }
 
+// Real-model causal SP SHADOW: pass the actual in-flight TP Q/K/V through
+// native CUDA+Phone Flash Attention, then compare its TP-form output to the
+// original model's pre-Wo Attention tensor. This does NOT replace W_o input.
+// For this first integration gate, require an explicit single layer index;
+// no default and no implicit "all" selection.
+inline bool causal_live_shadow_enabled(int64_t il) {
+    const char * raw=std::getenv("LLAMA_GALAXY_CAUSAL_LIVE_LAYER");
+    if (raw == nullptr || raw[0] == '\0' || il < 0) return false;
+    const std::string spec(raw);
+    return spec == std::to_string(il);
+}
+
 inline std::vector<int64_t> parse_counts(const char * text, const char * key, size_t n_devices) {
     if (text == nullptr || text[0] == '\0') {
         throw std::invalid_argument(std::string(key) + " is required in Galaxy TP mode");
