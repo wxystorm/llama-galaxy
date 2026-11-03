@@ -1433,3 +1433,61 @@ parity.** If the model still violates the causal token-0 V identity with
 producer-time copies, proceed to the true Flash Attention mask, source
 KV-cache placement and per-rank GQA indexing before enabling SP
 Attention in the inference graph.
+
+
+## Native CUDA + Phone Flash Attention replay: first real device-kernel SP stage
+
+The producer-time Q/K/V correction is now numerically verified for
+Llama-3.2-3B Layer 0, 98 fresh prefill tokens (split 49/49).
+On CUDA0 + RPC0 the reference HOST-SOFTMAX replay produced:
+
+- Rank 0 RMSE 6.18443e-6, MaxAbs 2.48551e-4
+- Rank 1 RMSE 5.71072e-6, MaxAbs 1.9154e-4
+- Overall RMSE 5.95229e-6, MaxAbs 2.48551e-4, Cosine approximately 1
+- Both K/V transfers were byte-exact, but host softmax is not device-local execution.
+
+The new galaxy-causal-native-flash-replay executable uses the same
+already verified GLG1 activation snapshots, but performs real native
+device Attention computation rather than the host softmax:
+
+1. PC and Phone own distinct contiguous Query TOKEN intervals, with
+   all query heads on each device, unlike existing TP head splitting.
+   The input is the existing post-RoPE model Q snapshot.
+2. F32 K/V are converted to F16, split by the same token intervals,
+   then transferred with all_gather_attention_kv to BOTH backends.
+   Each backend's gathered F16 K/V is checked byte for byte.
+3. Each device's full K/V tensor has 256-token-padded cache capacity,
+   matching the first model prefill cache convention. The populated
+   prefix is gathered, the remaining padding is zero-filled and masked.
+4. Each backend builds its own GGML FLASH_ATTN_EXT graph: Q is
+   [dim,local_tokens,query_heads]; K/V use
+   [dim,kv_tokens_padded,kv_heads]. The causal F16 mask uses GLOBAL
+   Query positions. V follows the non-transposed F16 Flash cache path.
+5. PC CUDA and Phone RPC independently run native Flash Attention.
+   The combined outputs are compared to producer-time kqv_out-0.f32,
+   reporting RMSE, MaxAbs, cosine, gather and kernel timings.
+
+No new GGUF model run is required. Phone RPC needs no new server
+build because the new executable uses existing standard GGML ops.
+
+Windows build and run:
+
+    git pull --ff-only origin feat/galaxy-baseline
+    cmake --build build-galaxy --config Release --target galaxy-causal-native-flash-replay -j 8
+    $probe = "E:\llama\llama-galaxy\galaxy-sp-results\qkv-producer-capture\tp-20261103-210405\real-qkv\tokens-98"
+    .\build-galaxy\bin\Release\galaxy-causal-native-flash-replay.exe --probe-dir $probe --layer 0 --tokens 98 --heads 24 --kv-heads 8 --head-dim 128 --rank0 49 --pc CUDA0 --rpc 10.39.52.114:50052
+
+For fail-closed numerical parity after observing backend differences,
+optionally add --require-rmse 0.01. Without that flag, a final
+PASS kernel_executed=1 production_graph_enabled=0 means K/V
+transport, native graph execution and numerical MEASUREMENT completed,
+not that numerical parity was asserted.
+
+If RPC reports unsupported FLASH_ATTN_EXT, record the status and
+retain the original host-softmax replay as the correctness baseline.
+Never silently calculate the Phone output on CPU.
+
+SCOPE: this is a native-kernel stage, NOT the full transformer graph.
+Full GGUF QKV weight mirroring, rank-local QKV projection, absolute
+RoPE positions, dynamic cache ownership, output/FFN transitions,
+multi-sequence scheduling and decode remain unimplemented.
