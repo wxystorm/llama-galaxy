@@ -2742,6 +2742,140 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
+        // The live causal path is a SHADOW of a single TP layer: it consumes
+        // the actual Q/K/V producer-time bytes from THIS Meta graph and
+        // compares the native PC/Phone Flash result against THIS graph's
+        // kqv_out. No GLG1 file, re-tokenization, model reload, or mutation
+        // of the original kqv_out / W_o is permitted.
+        if (live_shadow_requested &&
+                std::strcmp(original_last->name,
+                        ("kqv_out-"+std::to_string(live_shadow_layer)).c_str()) == 0) {
+            const auto find_stage = [&](const char * stage) -> const ggml_tensor * {
+                const std::string expected = std::string(stage)+"-"+
+                        std::to_string(live_shadow_layer);
+                const ggml_tensor * match = nullptr;
+                for (int node_id=0;node_id<cgraph->n_nodes;++node_id) {
+                    const ggml_tensor * node=cgraph->nodes[node_id];
+                    if (node && expected == node->name) {
+                        if (match) throw std::invalid_argument(
+                                "duplicate model QKV node "+expected);
+                        match=node;
+                    }
+                }
+                if (!match) throw std::invalid_argument(
+                        "missing producer-time model node "+expected);
+                return match;
+            };
+            try {
+                const ggml_tensor * q_model=find_stage("Qcur");
+                const ggml_tensor * k_model=find_stage("Kcur");
+                const ggml_tensor * v_model=find_stage("Vcur");
+                const ggml_tensor * out_model=find_stage("kqv_out");
+                const int64_t head_dim=q_model->ne[0];
+                const int64_t tokens=q_model->ne[2];
+                if (tokens < 8) {
+                    std::fprintf(stderr,
+                            "[GALAXY_CAUSAL_LIVE] layer=%d tokens=%" PRId64
+                            " mode=SHADOW status=SKIP reason=WARMUP_BELOW_8\n",
+                            live_shadow_layer,tokens);
+                    std::fflush(stderr);
+                } else {
+                    if (q_model->ne[3] != 1 || head_dim <= 0 ||
+                            head_dim > 256 || tokens > 512 ||
+                            k_model->ne[0] != head_dim ||
+                            v_model->ne[0] != head_dim ||
+                            k_model->ne[2] != tokens || v_model->ne[2] != tokens ||
+                            out_model->ne[1] != tokens || out_model->ne[2] != 1 ||
+                            out_model->ne[0] != q_model->ne[0]*q_model->ne[1]) {
+                        throw std::invalid_argument(
+                                "unsupported model QKV dimensions (only first 8..512 token prefill)");
+                    }
+                    const auto get_input = [&](const ggml_tensor * node, bool headed,
+                                               const char * stage)
+                            -> ggml_galaxy_causal_live::head_shards {
+                        ggml_galaxy_causal_live::head_shards result;
+                        result.type=node->type;
+                        if (node->type != GGML_TYPE_F32 ||
+                                !ggml_backend_buffer_is_meta(node->buffer) ||
+                                !ggml_is_contiguous(node)) {
+                            throw std::invalid_argument(std::string(stage)+
+                                    " must be dense F32 Meta tensor");
+                        }
+                        auto found=qkv_live_snapshots.find(node);
+                        if (found == qkv_live_snapshots.end() ||
+                                found->second.size() != 2) {
+                            throw std::invalid_argument(std::string(stage)+
+                                    " has no matching producer-time copy");
+                        }
+                        for (int rank=0;rank<2;++rank) {
+                            const ggml_tensor * local=
+                                    ggml_backend_meta_buffer_simple_tensor(node,rank);
+                            if (!local || !local->buffer || !ggml_is_contiguous(local) ||
+                                    local->type != GGML_TYPE_F32 ||
+                                    (headed ? (local->ne[0] != head_dim ||
+                                        local->ne[2] != tokens || local->ne[3] != 1)
+                                    : (local->ne[1] != tokens ||
+                                        local->ne[2] != 1 || local->ne[3] != 1 ||
+                                        local->ne[0] % head_dim != 0))) {
+                                throw std::invalid_argument(std::string(stage)+
+                                        " rank tensor shape or layout mismatch");
+                            }
+                            result.heads[rank]=headed?local->ne[1]:
+                                    local->ne[0]/head_dim;
+                            result.bytes[rank]=&found->second[rank];
+                            if (result.heads[rank] <= 0 ||
+                                    found->second[rank].size() != ggml_nbytes(local)) {
+                                throw std::invalid_argument(std::string(stage)+
+                                        " missing head shard or mismatched captured bytes");
+                            }
+                        }
+                        return result;
+                    };
+                    ggml_galaxy_causal_live::request work;
+                    work.q=get_input(q_model,true,"Qcur");
+                    work.k=get_input(k_model,true,"Kcur");
+                    work.v=get_input(v_model,true,"Vcur");
+                    work.reference=get_input(out_model,false,"kqv_out");
+                    work.head_dim=head_dim;
+                    work.tokens=tokens;
+                    work.layer=live_shadow_layer;
+                    work.tile_tokens=ggml_galaxy_collectives::configured_tile_tokens();
+                    work.max_rmse=0.001;
+                    const ggml_galaxy_collectives::devices_t devs={
+                            backend_ctx->backend_configs[0].backend,
+                            backend_ctx->backend_configs[1].backend
+                    };
+                    const auto measured=ggml_galaxy_causal_live::shadow(devs,work);
+                    std::fprintf(stderr,
+                            "[GALAXY_CAUSAL_LIVE] layer=%d tokens=%" PRId64
+                            " mode=SHADOW tp_heads=%" PRId64 "+%" PRId64
+                            " kv_heads=%" PRId64 "+%" PRId64
+                            " first_token_rmse=%.9g rmse=%.9g max_abs=%.9g"
+                            " cosine=%.9g"
+                            " tp_sp_ms=%.3f kv_gather_ms=%.3f"
+                            " native_phase_ms=%.3f sp_tp_ms=%.3f"
+                            " threshold=%.3g production_output_unchanged=1"
+                            " status=PASS\n",
+                            live_shadow_layer,tokens,
+                            work.q.heads[0],work.q.heads[1],
+                            work.k.heads[0],work.k.heads[1],
+                            measured.first_token_rmse,measured.rmse,
+                            measured.max_abs,measured.cosine,
+                            measured.head_to_token_ms,measured.kv_gather_ms,
+                            measured.native_phase_ms,measured.token_to_head_ms,
+                            work.max_rmse);
+                    std::fflush(stderr);
+                }
+            } catch (const std::exception & e) {
+                std::fprintf(stderr,
+                        "[GALAXY_CAUSAL_LIVE] layer=%d mode=SHADOW"
+                        " status=FAIL reason=%s\n",
+                        live_shadow_layer,e.what());
+                std::fflush(stderr);
+                return GGML_STATUS_FAILED;
+            }
+        }
+
         const galaxy_sp_transition transition = galaxy_sp_get_transition(original_last);
         if (transition != galaxy_sp_transition::none) {
             if (original_last->src[0] == nullptr ||
