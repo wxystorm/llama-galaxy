@@ -89,13 +89,14 @@ foreach ($mode in @("sp", "galaxy2")) {
                         -not (Test-Path -LiteralPath $dump) -or
                         (Get-Item -LiteralPath $dump).Length -le 8) { continue }
                 if ($Profile -and -not (Test-Path -LiteralPath $profileCsv)) { continue }
-                $summaryLine = @(Select-String -LiteralPath $log -Pattern
-                    '\[GALAXY_SP_SUM\].*tile_tokens=(?<tile>\d+)\s+rs_fused_requested=(?<fused>[01])' -ErrorAction SilentlyContinue |
+                if (-not $Profile -and (Test-Path -LiteralPath $profileCsv)) { continue }
+                $summaryLine = @(Select-String -LiteralPath $log -Pattern '\[GALAXY_SP_SUM\].*tile_tokens=(?<tile>\d+)\s+rs_fused_requested=(?<fused>[01])' -ErrorAction SilentlyContinue |
                     Where-Object {
                         $_.Matches[0].Groups["tile"].Value -eq "$CollectiveTileTokens" -and
                         $_.Matches[0].Groups["fused"].Value -eq $expected
                     })
-                $hasTiming = Select-String -LiteralPath $log -Pattern 'prompt eval time\s*=\s*[0-9.]+\s*ms\s*/' -Quiet -ErrorAction SilentlyContinue
+                $logPaths = @($log, (Join-Path $candidate.FullName "stdout.log"))
+                $hasTiming = Select-String -LiteralPath $logPaths -Pattern 'prompt eval time\s*=\s*[0-9.]+\s*ms\s*/' -Quiet -ErrorAction SilentlyContinue
                 if ($summaryLine.Count -gt 0 -and $hasTiming) {
                     $folder = $candidate
                     Write-Host "[GALAXY_RS_FUSED_SWEEP] REUSE mode=$mode fused=$state dir=$($folder.FullName)"
