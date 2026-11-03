@@ -767,3 +767,73 @@ This port is **not yet Windows/Phone runtime validated**. Compilation,
 correctness witnesses and output logits still need live checks on the
 user's hardware. The upstream independent SP Attention/Q-KV strategy
 remains separate work, not silently supported by the Llama port.
+
+
+## Dense Llama FFN TP/SP stage numerical diagnosis (opt-in)
+
+The cap=0/1/2 experiment on Llama-3.2-3B isolated the earliest discrepancy:
+cap=0 matches Galaxy; cap=1 already differs at layer 0, and that difference
+persists into layer 1. To distinguish FFN output discrepancies from
+next-layer Attention amplification, `run_galaxy_sp_smoke.ps1` now accepts
+`-DumpStages "0,1"`. It pins **only** `ffn_inp` (post-Attention residual)
+and `ffn_norm` (normalized FFN input) of selected dense Llama layers,
+and writes `stages/ffn_inp-N.f32` and `stages/ffn_norm-N.f32`.
+Use it with the existing `-DumpLayers "0,1"` to also obtain
+`layers/l_out-N.f32`.
+
+Stage dumps use GLG1/F32 and reassemble both rank-local SP sequence shards
+into logical `[hidden,tokens]` order. Pure TP's MIRRORED activations are
+copied from rank 0. Unsupported layouts or incomplete shards cause a
+**diagnostic failure** instead of emitting misleading values. No extra
+Collective is introduced. The extra output pins, synchronization, and
+readbacks are invasive: do not benchmark performance with `-DumpStages`.
+The phone RPC server protocol is unchanged; only the Windows PC binary
+needs rebuilding. These stage snapshots are currently enabled for the
+dense Llama graph, not MoE.
+
+For Llama 3.2 3B, with PC+Phone RPC running, from the repository root:
+
+```powershell
+git pull --ff-only origin feat/galaxy-baseline
+cmake --build build-galaxy --config Release --target llama-cli -j 8
+$common = @{
+  Model = "E:\llama\models\Llama-3.2-3B-Instruct-Q4_K_M.gguf"
+  Rpc = "10.39.52.114:50052"
+  PromptFile = "D:\prima.cpp\prompts\prompt_64.txt"
+  HeadSplit = "12,12"
+  FfnSplit = "4096,4096"
+  SeqWeights = "1,1"
+  DumpStages = "0,1"
+  DumpLayers = "0,1"
+  OutputDir = ".\galaxy-sp-results\stage-diagnostic"
+  TimeoutSec = 300
+}
+.\tools\galaxy\run_galaxy_sp_smoke.ps1 @common -Galaxy2 -Galaxy2FfnSpLayers 0
+.\tools\galaxy\run_galaxy_sp_smoke.ps1 @common -Galaxy2 -Galaxy2FfnSpLayers 1
+```
+
+Use the run directories printed by the wrapper:
+
+```powershell
+python .\tools\galaxy\galaxy-stage-compare.py `
+  --reference ".\galaxy-sp-results\stage-diagnostic\galaxy2-<CAP0_RUN>" `
+  --candidate ".\galaxy-sp-results\stage-diagnostic\galaxy2-<CAP1_RUN>" `
+  --layers "0,1" --hidden 3072 --seq-weights "1,1" `
+  --output ".\galaxy-sp-results\stage-diagnostic\stage-compare.json"
+```
+
+The analyzer reports FFN input and normalized input RMSE, plus two derived
+logical contributions:
+
+- `FFN_contribution[N] = l_out[N] - ffn_inp[N]`. This avoids comparing the
+  TP per-rank partial FFN tensor against the SP complete local FFN output.
+  Use this for layer 0 when deciding whether FFN TP/SP differ.
+- `Attention_contribution[1] = ffn_inp[1] - l_out[0]`. This uses the
+  previous full layer output and isolates the logical Attention addition
+  in layer 1. Both run modes must use the same prompt/model settings.
+
+All derived quantities are post-residual logical activations, not raw
+operator dumps. The subtraction adds minor float32 rounding. Large
+differences in `ffn_norm-0` would implicate inputs/normalization before
+the FFN rather than the FFN itself. The stage comparator does not use
+the logits Top-1 threshold as a correctness criterion.
