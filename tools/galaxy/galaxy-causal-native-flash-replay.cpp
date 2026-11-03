@@ -17,6 +17,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -352,18 +353,58 @@ void execute(const options & c, const devices_t & backends) {
     }
     const double verify_ms = elapsed_ms(t)-gather_ms;
 
-    comparison total;
-    double compute_ms[2] = {0,0};
+    // RPC GRAPH_COMPUTE is send-only: there is no server-completion ACK.
+    // Accordingly ggml_backend_graph_compute( RPC ) can return after a
+    // sub-millisecond socket submission, NOT after device computation.
+    // Dispatch both native graphs before consuming either output, allowing
+    // the CUDA and Phone work to overlap. The subsequent RPC tensor_get
+    // synchronizes by command ordering on the server's RPC connection.
+    const auto phase_begin = clock_type::now();
+    std::array<clock_type::time_point,2> submitted_at;
+    std::array<clock_type::time_point,2> dispatch_begin;
+    std::array<double,2> submit_ms = {0,0};
+    std::array<double,2> readback_wait_ms = {0,0};
+    std::array<double,2> observed_ready_ms = {0,0};
+    std::array<std::vector<float>,2> local_outputs;
     for (int rank = 0; rank < 2; ++rank) {
-        t = clock_type::now();
         std::cout << "[GALAXY_CAUSAL_NATIVE_DISPATCH] rank=" << rank
                   << " backend=" << ggml_backend_name(backends[rank])
                   << " kernel=FLASH_ATTN_EXT status=BEGIN\n" << std::flush;
-        const auto status = ggml_backend_graph_compute(backends[rank], ranks[rank]->graph);
+        dispatch_begin[rank] = clock_type::now();
+        const auto status = ggml_backend_graph_compute_async(backends[rank],ranks[rank]->graph);
         demand(status == GGML_STATUS_SUCCESS,
-                "FLASH_ATTN_EXT graph execution failed on rank "+std::to_string(rank));
-        compute_ms[rank] = elapsed_ms(t);
-        const auto result = ranks[rank]->read_result(backends[rank]);
+                "FLASH_ATTN_EXT graph submission failed on rank "+std::to_string(rank));
+        submitted_at[rank] = clock_type::now();
+        submit_ms[rank] = std::chrono::duration<double,std::milli>(
+                submitted_at[rank] - dispatch_begin[rank]).count();
+    }
+    // The PC readback synchronizes CUDA; the RPC readback waits for the
+    // remote GRAPH_COMPUTE in FIFO order on the same RPC connection.
+    // The observed-ready time is the end-to-end wall interval from the
+    // initial dispatch through the successful result read, NOT a kernel
+    // execution duration. If the graph finished earlier it is an upper
+    // bound on how long the caller had to wait for usable output.
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto read_begin = clock_type::now();
+        local_outputs[rank] = ranks[rank]->read_result(backends[rank]);
+        const auto ready = clock_type::now();
+        readback_wait_ms[rank] = std::chrono::duration<double,std::milli>(
+                ready - read_begin).count();
+        observed_ready_ms[rank] = std::chrono::duration<double,std::milli>(
+                ready - dispatch_begin[rank]).count();
+        std::cout << "[GALAXY_CAUSAL_NATIVE_COMPLETION] rank=" << rank
+                  << " backend=" << ggml_backend_name(backends[rank])
+                  << " submit_ms=" << submit_ms[rank]
+                  << " readback_wait_ms=" << readback_wait_ms[rank]
+                  << " observed_ready_wall_ms=" << observed_ready_ms[rank]
+                  << " actual_kernel_ms=SERVER_PROFILE_REQUIRED"
+                  << " status=PASS\n";
+    }
+    const double compute_phase_wall_ms = elapsed_ms(phase_begin);
+
+    comparison total;
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto & result = local_outputs[rank];
         const int64_t local = ranks[rank]->q_count;
         const int64_t begin = ranks[rank]->q_begin;
         demand(result.size() == static_cast<size_t>(qw*local),"native result shape");
@@ -379,7 +420,8 @@ void execute(const options & c, const devices_t & backends) {
         std::cout << "[GALAXY_CAUSAL_NATIVE] rank=" << rank
                   << " q_range=" << begin << ".." << begin+local-1
                   << " kernel=FLASH_ATTN_EXT"
-                  << " compute_ms=" << compute_ms[rank]
+                  << " submit_ms=" << submit_ms[rank]
+                  << " observed_ready_wall_ms=" << observed_ready_ms[rank]
                   << " rmse=" << each.rmse()
                   << " max_abs=" << each.maximum
                   << " cosine=" << each.cosine()
@@ -393,6 +435,8 @@ void execute(const options & c, const devices_t & backends) {
               << " mask=GLOBAL_CAUSAL"
               << " gather_ms=" << gather_ms
               << " verify_ms=" << verify_ms
+              << " compute_phase_wall_ms=" << compute_phase_wall_ms
+              << " execution_timing=DISPATCH_PLUS_RESULT_READY"
               << " rmse=" << total.rmse()
               << " max_abs=" << total.maximum
               << " cosine=" << total.cosine()
