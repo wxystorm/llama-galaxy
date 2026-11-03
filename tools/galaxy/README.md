@@ -1111,3 +1111,89 @@ the Meta graph must support mirrored full Q/K/V projection weights,
 rank-local Q/K/V sequence inputs, global absolute positions and
 mask rows, and validated KV-cache physical-to-logical ownership.
 Until then the existing TP/Galaxy/Galaxy2 graph is unchanged.
+
+
+## Real GGUF QKV -> causal SP backend replay (graph-to-backend bridge)
+
+After `GALAXY_CAUSAL_BACKEND_SELFTEST PASS mode=PC_RPC`, the next
+integration gate captures **actual** Llama-3.2 3B graph activations and
+replays them on the independent PC+Phone SP backend. This is a diagnostic
+bridge, not an activated SP-Attention decoder.
+
+The opt-in `-ProbeQkvLayers "0"` parameter captures four real tensors:
+
+- `Qcur-0`: real post-RoPE query tensor
+- `Kcur-0`: real post-RoPE key tensor
+- `Vcur-0`: real projected value tensor
+- `kqv_out-0`: original model's Attention output **before W_o**
+
+The Meta backend reconstructs TP head shards from both ranks, in
+canonical `[head_dim*heads, tokens]` order. It accepts only its
+expected 3D head-sharded Q/K/V or 2D feature-sharded pre-Wo Attention
+output, aborting the *diagnostic run* if shape/layout assumptions fail.
+Each prefill token count is isolated under `real-qkv/tokens-N/` so
+the warmup graph cannot overwrite the 98-token snapshot. No Q/K/V
+capture is performed unless `-ProbeQkvLayers` is explicitly enabled.
+
+The replay program reads the snapshots, splits each canonical tensor by
+Token, and invokes the **real CUDA+RPC** host-staged causal Attention
+executor. It asserts that both ranks received byte-exact K/V and prints
+the RMSE, MaxAbs, cosine and worst token/channel compared with the
+model's own `kqv_out`. Full attention arithmetic may differ because
+the model uses Flash Attention and F16 cached K/V, whereas this replay
+uses input F32 values and host F64 softmax; the replay's final PASS
+means transport and execution succeeded, **not** numerical equivalence.
+
+Build (only the Windows PC executable needs recompilation):
+
+```powershell
+git pull --ff-only origin feat/galaxy-baseline
+cmake --build build-galaxy --config Release --target llama-cli galaxy-causal-model-replay -j 8
+```
+
+Run the real model in its existing pure-TP mode, with diagnostics only:
+
+```powershell
+$common.DumpLayers = ""
+$common.DumpStages = ""
+$common.DumpFfnOps = ""
+$common.ProbeQkvLayers = "0"
+$common.OutputDir = ".\galaxy-sp-results\real-qkv-replay"
+
+.\tools\galaxy\run_galaxy_sp_smoke.ps1 @common -PureTP
+
+$run = Get-ChildItem $common.OutputDir -Directory -Filter "tp-*" |
+    Sort-Object CreationTime -Descending | Select-Object -First 1
+$probe = Get-ChildItem (Join-Path $run.FullName "real-qkv") -Directory |
+    Where-Object Name -match '^tokens-[0-9]+$' |
+    Sort-Object @{Expression = { [int]($_.Name.Substring(7)) }; Descending = $true} |
+    Select-Object -First 1
+$tokens = [int]$probe.Name.Substring(7)
+$rank0 = [int][math]::Ceiling($tokens / 2)
+```
+
+Run the independent cross-backend replay with the Llama 3.2 3B
+24/8 GQA head configuration (128 channels per head):
+
+```powershell
+.\build-galaxy\bin\Release\galaxy-causal-model-replay.exe `
+    --probe-dir $probe.FullName --layer 0 --tokens $tokens `
+    --heads 24 --kv-heads 8 --head-dim 128 --rank0 $rank0 `
+    --pc CUDA0 --rpc 10.39.52.114:50052
+```
+
+Expected end marker:
+`GALAXY_CAUSAL_REAL_REPLAY PASS transport_verified numerical_parity_not_asserted`.
+Inspect the preceding `[GALAXY_REAL_REPLAY]` lines to establish
+whether actual GGUF Q/K/V agree with the standalone SP executor at the
+pre-Wo boundary. If the probe logs `unexpected shape/type` or
+`expected axis`, do not remove the layout guard blindly: capture the
+actual Meta source states before extending the probe.
+
+Restrictions: supported initial experiment is dense Llama without
+Q/K RMSNorm, first prefill, a *logical* contiguous KV sequence with
+no historic cache in replay, single sequence, and no positional bias
+or soft-capping. This bypasses the model's *physical* KV cache on
+purpose; it does not prove continuation/decode parity and does not
+change the existing TP/Galaxy/Galaxy2 inference path. The final graph
+integration remains separate.
