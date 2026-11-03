@@ -3166,8 +3166,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // (2D [heads*head_dim, tokens]) as logical F32 [width, tokens].
     // The production Attention and cache path are untouched. Each token
     // count gets its own directory so warmup graphs cannot overwrite prefill.
-    const char * qkv_probe_dir = std::getenv("LLAMA_GALAXY_QKV_PROBE_DIR");
-    if (qkv_probe_dir != nullptr && qkv_probe_dir[0] != '\0') {
+    if (qkv_probe_enabled) {
         if (n_backends != 2) {
             GGML_LOG_ERROR("[GALAXY_REAL_QKV] requires exactly 2 backends\n");
             return GGML_STATUS_FAILED;
@@ -3213,6 +3212,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
             const size_t bytes_per_item = node->type == GGML_TYPE_F32
                     ? sizeof(float) : sizeof(ggml_fp16_t);
+            // These are host-owned copies read when each node finished,
+            // NOT views of memory that might have been reused later.
+            const auto captured = qkv_live_snapshots.find(node);
+            if (captured == qkv_live_snapshots.end() ||
+                    captured->second.size() != n_backends) {
+                GGML_LOG_ERROR("[GALAXY_REAL_QKV] name=%s no producer-time snapshot\n",
+                        node->name);
+                return GGML_STATUS_FAILED;
+            }
             std::vector<float> values(static_cast<size_t>(width*tokens));
             int64_t done_features = 0;
             for (int rank = 0; rank < 2; ++rank) {
@@ -3236,9 +3244,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             node->name, rank);
                     return GGML_STATUS_FAILED;
                 }
-                ggml_backend_synchronize(backend_ctx->backend_configs[rank].backend);
-                std::vector<uint8_t> raw(ggml_nbytes(local));
-                ggml_backend_tensor_get(local, raw.data(), 0, raw.size());
+                const std::vector<uint8_t> & raw = captured->second[rank];
+                if (raw.size() != ggml_nbytes(local)) {
+                    GGML_LOG_ERROR("[GALAXY_REAL_QKV] name=%s rank=%d capture length mismatch\n",
+                            node->name, rank);
+                    return GGML_STATUS_FAILED;
+                }
                 if (is_out || is_flash_raw) {
                     // Hash the *actual rank-local source buffer* before
                     // reconstructing any global output. This separates
@@ -3255,7 +3266,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             "[GALAXY_REAL_QKV_RANK] name=%s op=%s rank=%d"
                             " backend=%s local_features=%" PRId64
                             " tokens=%" PRId64 " bytes=%zu fnv1a64=%016" PRIx64
-                            " status=READ\n",
+                            " status=PRODUCER_SNAPSHOT\n",
                             node->name, ggml_op_name(node->op), rank,
                             ggml_backend_name(backend_ctx->backend_configs[rank].backend),
                             local_width, local_tokens, raw.size(), hash);
