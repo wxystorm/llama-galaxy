@@ -25,6 +25,7 @@ struct layout {
     int64_t query_heads    = 0;
     int64_t kv_heads       = 0;
     int64_t head_dim       = 0;
+    int64_t sequences      = 1;   // Phase 1 supports one logical sequence
 };
 
 struct interval {
@@ -44,6 +45,7 @@ inline void validate(const layout & l) {
             "Galaxy causal SP: invalid new_tokens or KV extent overflow");
     require(l.rank0_queries >= 0 && l.rank0_queries <= l.new_tokens,
             "Galaxy causal SP: rank0 query count out of range");
+    require(l.sequences == 1, "Galaxy causal SP: multi-sequence cache layout unsupported");
     require(l.query_heads > 0 && l.kv_heads > 0 && l.head_dim > 0,
             "Galaxy causal SP: positive query_heads/kv_heads/head_dim required");
     require(l.query_heads % l.kv_heads == 0,
