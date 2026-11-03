@@ -11,6 +11,7 @@
 #include "ggml-backend-galaxy-markers.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <exception>
 #include <cmath>
@@ -3713,6 +3714,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     if (live_replace_requested && live_replaced_pending) {
         GGML_LOG_ERROR("[GALAXY_CAUSAL_REPLACE] output was not consumed by kqv_out\n");
         return GGML_STATUS_FAILED;
+    }
+    if (live_replaced_verified) {
+        std::fprintf(stderr,
+                "[GALAXY_CAUSAL_REPLACE_SUM] layer=%d"
+                " tp_flash_skipped=1 pre_wo_input=SP"
+                " tp_head_restore=BYTE_EXACT"
+                " mode=REPLACE status=PASS\n",live_shadow_layer);
+        std::fflush(stderr);
     }
     if (has_galaxy_markers) {
         // A required correctness witness, not a verbose debug message.
