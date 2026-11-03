@@ -24,6 +24,7 @@ param(
     [string]$DumpLayers = "",
     [string]$DumpStages = "",
     [string]$DumpFfnOps = "",
+    [string]$ProbeQkvLayers = "",
     [switch]$Trace,
     [switch]$DumpLogits,
     [int]$TimeoutSec = 0,
@@ -71,6 +72,7 @@ $keys = @("LLAMA_GALAXY_TP", "LLAMA_GALAXY_TP_HEADS", "LLAMA_GALAXY_TP_FFN", "LL
     "LLAMA_GALAXY_LAYER_DUMP", "LLAMA_GALAXY_LAYER_DUMP_DIR",
     "LLAMA_GALAXY_STAGE_DUMP", "LLAMA_GALAXY_STAGE_DUMP_DIR",
     "LLAMA_GALAXY_FFN_OP_DUMP", "LLAMA_GALAXY_FFN_OP_DUMP_DIR",
+    "LLAMA_GALAXY_QKV_PROBE_LAYERS", "LLAMA_GALAXY_QKV_PROBE_DIR",
     "LLAMA_GALAXY_COLLECTIVE_TILE_TOKENS", "LLAMA_GALAXY_RS_FUSED_READ", "LLAMA_GALAXY_SP_SEQ_WEIGHTS",
     "LLAMA_GALAXY_SP_FINAL_LAYER")
 $old = @{}
@@ -121,6 +123,12 @@ try {
         $ffnOpDir = Join-Path (Resolve-Path -LiteralPath $dir).Path "ffn_ops"
         New-Item -ItemType Directory -Force -Path $ffnOpDir | Out-Null
         $ffnOpDir
+    } else { $null }
+    $env:LLAMA_GALAXY_QKV_PROBE_LAYERS = if ($ProbeQkvLayers) { $ProbeQkvLayers } else { $null }
+    $env:LLAMA_GALAXY_QKV_PROBE_DIR = if ($ProbeQkvLayers) {
+        $probeDir = Join-Path $dir "real-qkv"
+        New-Item -ItemType Directory -Force -Path $probeDir | Out-Null
+        (Resolve-Path -LiteralPath $probeDir).Path
     } else { $null }
     $env:LLAMA_GALAXY_FIRST_LOGITS_PATH = if ($DumpLogits) { $dumpPath } else { $null }
 
@@ -201,6 +209,28 @@ try {
             }
         }
         Write-Host "[GALAXY_FFN_OP_DUMP] layers=$DumpFfnOps dir=$($env:LLAMA_GALAXY_FFN_OP_DUMP_DIR)"
+    }
+    if ($ProbeQkvLayers) {
+        $probeRoot = $env:LLAMA_GALAXY_QKV_PROBE_DIR
+        $tokenRuns = @(Get-ChildItem -LiteralPath $probeRoot -Directory -Filter "tokens-*" |
+            Where-Object { $_.Name -match '^tokens-([0-9]+)$' } |
+            Sort-Object @{Expression = { [int64]$_.Name.Substring(7) }; Descending = $true})
+        if ($tokenRuns.Count -eq 0) {
+            throw "No multi-token QKV snapshots found: $probeRoot"
+        }
+        $latest = $tokenRuns[0].FullName
+        if ($ProbeQkvLayers -ne "all") {
+            foreach ($layer in $ProbeQkvLayers.Split(",")) {
+                foreach ($stage in @("Qcur", "Kcur", "Vcur", "kqv_out")) {
+                    $snap = Join-Path $latest "$stage-$layer.f32"
+                    if (-not (Test-Path -LiteralPath $snap) -or
+                            (Get-Item -LiteralPath $snap).Length -le 8) {
+                        throw "Missing real-model QKV probe snapshot: $snap"
+                    }
+                }
+            }
+        }
+        Write-Host "[GALAXY_REAL_QKV] layers=$ProbeQkvLayers largest_tokens=$($tokenRuns[0].Name) dir=$latest"
     }
     $spEvidence = if ($PureTP) { "N/A" } elseif ($spWitness) { "CONFIRMED" } else { "UNVERIFIED" }
     Write-Host "[GALAXY_SP_SMOKE] PASS mode=$mode inference=PASS sp_collectives=$spEvidence"
