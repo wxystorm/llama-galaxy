@@ -2167,6 +2167,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         GGML_LOG_ERROR("[GALAXY_SP] graph transitions need exactly two Meta backends\n");
         return GGML_STATUS_FAILED;
     }
+    if (qkv_probe_enabled && n_backends != 2) {
+        GGML_LOG_ERROR("[GALAXY_QKV_CAPTURE] producer-time capture requires two Meta backends\n");
+        return GGML_STATUS_FAILED;
+    }
 
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
     const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
@@ -3321,6 +3325,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     node->name, width, tokens,
                     ggml_backend_meta_split_axis_name(split.axis),
                     ggml_type_name(node->type), done_features);
+        }
+        if (!qkv_live_snapshots.empty()) {
+            std::fprintf(stderr,
+                    "[GALAXY_QKV_CAPTURE_SUM] tensors=%zu phase=PRODUCER_DONE"
+                    " late_backend_reads=0 status=PASS\n",
+                    qkv_live_snapshots.size());
+            std::fflush(stderr);
         }
     }
     if (has_galaxy_markers) {
