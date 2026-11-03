@@ -2866,6 +2866,106 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         std::fflush(stderr);
     }
+    // Diagnostic-only intermediate activations for dense Llama. Unlike the
+    // legacy final-layer snapshots, these may be sequence-sharded (AXIS_1).
+    // Reconstruct the logical [hidden, tokens] matrix in rank/token order.
+    // Every requested tensor has GGML_TENSOR_FLAG_OUTPUT set when the graph
+    // is built, so its backing storage survives graph execution.
+    const char * stage_dir = std::getenv("LLAMA_GALAXY_STAGE_DUMP_DIR");
+    if (stage_dir != nullptr && stage_dir[0] != '\0') {
+        const std::filesystem::path folder(stage_dir);
+        std::error_code directory_error;
+        std::filesystem::create_directories(folder, directory_error);
+        if (directory_error) {
+            GGML_LOG_ERROR("[GALAXY_STAGE_DUMP] cannot create directory: %s\n", stage_dir);
+            return GGML_STATUS_FAILED;
+        }
+        for (int node_id = 0; node_id < cgraph->n_nodes; ++node_id) {
+            const ggml_tensor * node = cgraph->nodes[node_id];
+            if (node == nullptr || (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 ||
+                    !ggml_backend_buffer_is_meta(node->buffer)) {
+                continue;
+            }
+            const bool selected = std::strncmp(node->name, "ffn_inp-", 8) == 0 ||
+                    std::strncmp(node->name, "ffn_norm-", 9) == 0;
+            if (!selected) {
+                continue;
+            }
+            if ((node->type != GGML_TYPE_F16 && node->type != GGML_TYPE_F32) ||
+                    !ggml_is_contiguous(node) || node->ne[0] <= 0 || node->ne[1] <= 0 ||
+                    node->ne[2] != 1 || node->ne[3] != 1 ||
+                    ggml_nelements(node) > std::numeric_limits<int32_t>::max()) {
+                GGML_LOG_ERROR("[GALAXY_STAGE_DUMP] name=%s invalid_type_or_shape\n", node->name);
+                return GGML_STATUS_FAILED;
+            }
+            const auto state = ggml_backend_meta_get_split_state(node, false);
+            if (state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                    state.axis != GGML_BACKEND_SPLIT_AXIS_1) {
+                GGML_LOG_ERROR("[GALAXY_STAGE_DUMP] name=%s unsupported_layout=%s\n",
+                        node->name, ggml_backend_meta_split_axis_name(state.axis));
+                return GGML_STATUS_FAILED;
+            }
+            const size_t element_bytes = node->type == GGML_TYPE_F32 ? sizeof(float) : sizeof(ggml_fp16_t);
+            const size_t row_bytes = static_cast<size_t>(node->ne[0]) * element_bytes;
+            const size_t expected_bytes = static_cast<size_t>(ggml_nelements(node)) * element_bytes;
+            std::vector<uint8_t> raw(expected_bytes);
+            const int n_sources = state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED ? 1 : 2;
+            int64_t copied_tokens = 0;
+            for (int rank = 0; rank < n_sources; ++rank) {
+                const ggml_tensor * source = ggml_backend_meta_buffer_simple_tensor(node, rank);
+                if (source == nullptr || source->buffer == nullptr ||
+                        source->type != node->type || !ggml_is_contiguous(source) ||
+                        source->ne[0] != node->ne[0] || source->ne[1] <= 0 ||
+                        source->ne[2] != 1 || source->ne[3] != 1 ||
+                        source->ne[1] > node->ne[1] - copied_tokens ||
+                        ggml_nbytes(source) != row_bytes * static_cast<size_t>(source->ne[1])) {
+                    GGML_LOG_ERROR("[GALAXY_STAGE_DUMP] name=%s rank=%d invalid_source_shape\n",
+                            node->name, rank);
+                    return GGML_STATUS_FAILED;
+                }
+                ggml_backend_synchronize(backend_ctx->backend_configs[rank].backend);
+                ggml_backend_tensor_get(source, raw.data() + static_cast<size_t>(copied_tokens)*row_bytes,
+                        0, ggml_nbytes(source));
+                copied_tokens += source->ne[1];
+            }
+            if (copied_tokens != node->ne[1]) {
+                GGML_LOG_ERROR("[GALAXY_STAGE_DUMP] name=%s tokens=%" PRId64 " copied=%" PRId64 "\n",
+                        node->name, node->ne[1], copied_tokens);
+                return GGML_STATUS_FAILED;
+            }
+            const size_t elements = static_cast<size_t>(ggml_nelements(node));
+            std::vector<float> values(elements);
+            if (node->type == GGML_TYPE_F32) {
+                std::memcpy(values.data(), raw.data(), raw.size());
+            } else {
+                for (size_t i = 0; i < elements; ++i) {
+                    ggml_fp16_t half;
+                    std::memcpy(&half, raw.data() + i*sizeof(ggml_fp16_t), sizeof(half));
+                    values[i] = ggml_fp16_to_fp32(half);
+                }
+            }
+            const std::filesystem::path path = folder / (std::string(node->name) + ".f32");
+            std::ofstream out(path, std::ios::binary | std::ios::trunc);
+            const int32_t count = static_cast<int32_t>(elements);
+            if (!out) {
+                GGML_LOG_ERROR("[GALAXY_STAGE_DUMP] name=%s open_failed\n", node->name);
+                return GGML_STATUS_FAILED;
+            }
+            out.write("GLG1", 4);
+            out.write(reinterpret_cast<const char *>(&count), sizeof(count));
+            out.write(reinterpret_cast<const char *>(values.data()), values.size()*sizeof(float));
+            out.flush();
+            if (!out.good()) {
+                GGML_LOG_ERROR("[GALAXY_STAGE_DUMP] name=%s write_failed\n", node->name);
+                return GGML_STATUS_FAILED;
+            }
+            std::fprintf(stderr,
+                    "[GALAXY_STAGE_DUMP] name=%s layout=%s hidden=%" PRId64 " tokens=%" PRId64 " status=PASS\n",
+                    node->name, ggml_backend_meta_split_axis_name(state.axis),
+                    node->ne[0], node->ne[1]);
+        }
+        std::fflush(stderr);
+    }
     if (has_galaxy_markers) {
         // A required correctness witness, not a verbose debug message.
         // The common CLI logger maps GGML_LOG_INFO to verbosity 4 (TRACE),
