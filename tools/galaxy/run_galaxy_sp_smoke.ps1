@@ -15,6 +15,7 @@ param(
     [switch]$PureTP,
     [switch]$Galaxy2,
     [string]$Galaxy2FfnSpLayers = "1",
+    [string]$Galaxy2FfnSpLayerSet = "",
     [int]$CollectiveTileTokens = 32,
     [string]$SeqWeights = "1,1",
     [switch]$FinalLayerSP,
@@ -40,6 +41,17 @@ if (-not (Test-Path -LiteralPath $Model)) { throw "Missing model: $Model" }
 if (-not (Test-Path -LiteralPath $PromptFile)) { throw "Missing prompt: $PromptFile" }
 if ($Devices.Split(",").Count -ne 2) { throw "Devices must contain exactly PC,RPC" }
 if ($PureTP -and $Galaxy2) { throw "PureTP and Galaxy2 cannot both be enabled" }
+if ($Galaxy2FfnSpLayerSet -and -not $Galaxy2) {
+    throw "Galaxy2FfnSpLayerSet requires -Galaxy2"
+}
+if ($Galaxy2FfnSpLayerSet -and $PSBoundParameters.ContainsKey("Galaxy2FfnSpLayers")) {
+    throw "Specify Galaxy2FfnSpLayerSet OR Galaxy2FfnSpLayers, not both"
+}
+if ($Galaxy2FfnSpLayerSet -and $Galaxy2FfnSpLayerSet -ne "all" -and
+        $Galaxy2FfnSpLayerSet -ne "none" -and
+        $Galaxy2FfnSpLayerSet -notmatch '^[0-9,-]+$') {
+    throw "Galaxy2FfnSpLayerSet must use zero-based indices/ranges, all, or none"
+}
 if ($PureTP -and $FinalLayerSP) { throw "FinalLayerSP requires Galaxy or Galaxy2" }
 if ($SeqWeights -notmatch '^[1-9][0-9]*,[1-9][0-9]*$') {
     throw "SeqWeights must be two positive integers such as 20,12"
@@ -55,7 +67,7 @@ if ($Ctx -le 0 -or $Batch -le 0 -or $UBatch -le 0 -or $Threads -le 0 -or $NPredi
 }
 
 $keys = @("LLAMA_GALAXY_TP", "LLAMA_GALAXY_TP_HEADS", "LLAMA_GALAXY_TP_FFN", "LLAMA_GALAXY_SP", "LLAMA_GALAXY_SP_TRACE", "LLAMA_GALAXY_FIRST_LOGITS_PATH",
-    "LLAMA_GALAXY2", "LLAMA_GALAXY2_FFN_SP_LAYERS", "LLAMA_GALAXY_PROFILE_DIR",
+    "LLAMA_GALAXY2", "LLAMA_GALAXY2_FFN_SP_LAYERS", "LLAMA_GALAXY2_FFN_SP_LAYER_SET", "LLAMA_GALAXY_PROFILE_DIR",
     "LLAMA_GALAXY_LAYER_DUMP", "LLAMA_GALAXY_LAYER_DUMP_DIR",
     "LLAMA_GALAXY_STAGE_DUMP", "LLAMA_GALAXY_STAGE_DUMP_DIR",
     "LLAMA_GALAXY_FFN_OP_DUMP", "LLAMA_GALAXY_FFN_OP_DUMP_DIR",
@@ -75,7 +87,8 @@ try {
     $env:LLAMA_GALAXY_COLLECTIVE_TILE_TOKENS = $CollectiveTileTokens.ToString()
     $env:LLAMA_GALAXY_RS_FUSED_READ = if ($RsFusedRead) { "1" } else { "0" }
     $env:LLAMA_GALAXY2 = if ($Galaxy2) { "1" } else { "0" }
-    $env:LLAMA_GALAXY2_FFN_SP_LAYERS = if ($Galaxy2) { $Galaxy2FfnSpLayers } else { $null }
+    $env:LLAMA_GALAXY2_FFN_SP_LAYERS = if ($Galaxy2 -and -not $Galaxy2FfnSpLayerSet) { $Galaxy2FfnSpLayers } else { $null }
+    $env:LLAMA_GALAXY2_FFN_SP_LAYER_SET = if ($Galaxy2 -and $Galaxy2FfnSpLayerSet) { $Galaxy2FfnSpLayerSet } else { $null }
 
     $mode = if ($PureTP) { "tp" } elseif ($Galaxy2) { "galaxy2" } else { "sp" }
     $dir = Join-Path $OutputDir "$mode-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
@@ -123,7 +136,9 @@ try {
         "-n", $NPredict.ToString(), "--temp", "0", "-f", $promptArg
     )
     Write-Host "[GALAXY_SP_SMOKE] mode=$mode devices=$Devices rpc=$Rpc profiling=$([bool]$Profile) tile_tokens=$CollectiveTileTokens rs_fused=$([bool]$RsFusedRead) seq_weights=$SeqWeights final_layer_sp=$([bool]$FinalLayerSP)"
-    if ($Galaxy2 -and $Galaxy2FfnSpLayers -ne "all") {
+    if ($Galaxy2FfnSpLayerSet) {
+        Write-Host "[GALAXY2] mode=explicit_layer_set schedule=$Galaxy2FfnSpLayerSet final_layer_sp=$([bool]$FinalLayerSP)"
+    } elseif ($Galaxy2 -and $Galaxy2FfnSpLayers -ne "all") {
         Write-Host "[GALAXY2] hybrid_layer_cap=$Galaxy2FfnSpLayers (not full Galaxy2)"
     }
     $result = Invoke-GalaxyProcess `
