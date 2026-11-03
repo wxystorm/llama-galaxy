@@ -1930,3 +1930,115 @@ layers, or real SP Decode. The original persistent TP KV-cache is
 maintained for conventional Decode; it is NOT yet partitioned into
 a new SP cache design. Do not infer SP KV-cache ownership or timing
 speedup from this single-layer replacement.
+
+
+## Incremental multi-layer causal SP rollout: 1 -> 2 -> 4
+
+**Evidence at the time of implementation:** only the REAL Layer-0
+in-graph **SHADOW** was measured on CUDA0 + Phone RPC0:
+98-token Llama-3.2-3B prefill, RMSE=9.37426762e-6,
+max_abs=0.00088454783, cosine=0.999999803,
+production output unchanged. The first real REPLACE implementation
+has been committed but its independent whole-model logits parity
+result has NOT yet been provided. Multi-layer code must therefore
+be rolled out as an experiment, not treated as already validated.
+
+The Meta runtime and the Llama graph now use a **single shared**
+prefix selector in ggml/include/ggml-backend-galaxy-causal-layers.h:
+
+- Existing LLAMA_GALAXY_CAUSAL_LIVE_LAYER=0 still means ONLY layer 0.
+- New LLAMA_GALAXY_CAUSAL_LIVE_PREFIX_LAYERS accepts EXACTLY 1, 2 or 4:
+  1 -> [0], 2 -> [0,1], 4 -> [0,1,2,3].
+- Neither variable is set by default; simultaneously setting both,
+  selecting a sparse range, choosing 3, or selecting "all" is rejected.
+- New smoke argument -LiveCausalPrefixLayers 1|2|4; do NOT combine
+  it with the legacy -LiveCausalLayer 0.
+- -LiveCausalReplace is a distinct, opt-in mode and requires
+  -PureTP and -DumpLogits. Without this switch the selected layers
+  are **SHADOW** (no production Attention replacement).
+
+Meta now has separate SP temporary output bytes and pending/verified
+states for EACH selected layer. The next selected layer cannot begin
+REPLACE until every earlier selected layer was byte-verified at its
+own pre-Wo kqv_out boundary. SHADOW also enforces ordered, per-layer
+numerical parity. A graph with only part of the requested prefix
+verified is rejected, and an all-layer success emits:
+
+    [GALAXY_CAUSAL_PREFIX_SUM] mode=SHADOW layers=0,1 completed=2 expected=2 all_layers_verified=1 status=PASS
+    [GALAXY_CAUSAL_PREFIX_SUM] mode=REPLACE layers=0,1 completed=2 expected=2 all_layers_verified=1 status=PASS
+
+Every REPLACE layer ALSO must show on BOTH ranks:
+
+    [GALAXY_CAUSAL_REPLACE_DISPATCH] layer=N rank=0/1 ... tp_flash_skipped=1 status=PASS
+    [GALAXY_CAUSAL_REPLACE_VERIFY] layer=N rank=0/1 ... pre_wo_identity=BYTE_EXACT status=PASS
+    [GALAXY_CAUSAL_REPLACE_SUM] layer=N ... status=PASS
+
+**Fresh-prefill restriction:** for EVERY processed layer, Meta reads
+the real post-RoPE position input from the live graph and requires
+exactly [0,1,...,n_tokens-1] on each rank (or the single host input).
+It prints GALAXY_CAUSAL_FRESH_PREFIX status=PASS if this is proven.
+Later prefill chunks with cached history, nonzero positions,
+interleaved/multiple sequences, and decode are NOT eligible for this
+standalone native SP KV path. They continue in TP (if fewer than
+8 tokens) or fail closed instead of incorrectly omitting old KV.
+Persistent TP KV writes are retained on selected layers.
+
+### Build and verify the shared selection contract
+
+    git pull --ff-only origin feat/galaxy-baseline
+    cmake --build build-galaxy --config Release --target llama-cli galaxy-causal-live-selftest galaxy-logits-compare -j 8
+    .\build-galaxy\bin\Release\galaxy-causal-live-selftest.exe --pc CUDA0 --rpc 10.39.52.114:50052
+
+Selftest must include:
+
+    [GALAXY_CAUSAL_PREFIX_TEST] prefixes=1,2,4 legacy=0 fail_closed=1 status=PASS
+    GALAXY_CAUSAL_LIVE_SELFTEST PASS mode=PC_RPC
+
+### Recommended staged experiment (PowerShell)
+
+Reuse the known-good 98-token Llama-3.2-3B `$common` hashtable.
+The new script always runs one independent *pure TP* baseline,
+then, with IDENTICAL model, PromptFile, HeadSplit, FfnSplit, RPC,
+Batch/UBatch, and other settings, runs selected stages.
+It requires BOTH full per-layer witnesses AND the existing
+full-vocabulary first generated-token logits comparison (Top1
+equal, MaxAbs<=0.10, RMSE<=0.02) after EVERY stage.
+A failure immediately stops rollout. All logs, logits,
+per-stage JSON comparisons and a manifest are saved.
+
+Start safely with Shadow of the first two layers:
+
+    .\tools\galaxy\run_galaxy_causal_prefix_stages.ps1 -Common $common -MaxPrefix 2
+
+After a successful Shadow run, opt into REPLACE 1 -> 2:
+
+    .\tools\galaxy\run_galaxy_causal_prefix_stages.ps1 -Common $common -MaxPrefix 2 -IncludeReplace
+
+Only AFTER both first-two-layer REPLACE experiments pass full logits
+parity, attempt the next prefix (layers 0,1,2,3):
+
+    .\tools\galaxy\run_galaxy_causal_prefix_stages.ps1 -Common $common -MaxPrefix 4 -IncludeReplace
+
+Each `-IncludeReplace` run executes TP baseline, then SHADOW 1,
+REPLACE 1, SHADOW 2, REPLACE 2, and (if -MaxPrefix 4) SHADOW 4,
+REPLACE 4. It cannot skip ahead after a failed earlier stage.
+
+To run a single direct multi-layer Shadow using the prior smoke
+wrapper instead:
+
+    $common["LiveCausalLayer"] = -1
+    $common["LiveCausalPrefixLayers"] = 2
+    $common["LiveCausalReplace"] = $false
+    $common["ProbeQkvLayers"] = ""
+    $common["OutputDir"] = ".\galaxy-sp-results\causal-shadow-2"
+    .\tools\galaxy\run_galaxy_sp_smoke.ps1 @common -PureTP
+
+For REPLACE, explicitly enable LiveCausalReplace and DumpLogits, then
+compare `first_logits.f32` against an independent pure TP run with
+galaxy-logits-compare. A per-layer native parity witness or successful
+kqv_out byte injection alone is NOT enough to certify the whole model.
+
+**Limits:** first prefill only, pure TP source QKV Head layout,
+host-staged TP/SP/KV collectives, F16 gathered K/V,
+no KV-context continuation, no SP Decode, no multiple sequences,
+no model-wide all-layer replacement or throughput speedup claim.
