@@ -2188,6 +2188,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         GGML_LOG_ERROR("[GALAXY_SP] graph transitions need exactly two Meta backends\n");
         return GGML_STATUS_FAILED;
     }
+    if (live_shadow_requested && has_galaxy_markers) {
+        GGML_LOG_ERROR("[GALAXY_CAUSAL_LIVE] v1 shadow requires pure TP Attention (no SP markers)\n");
+        return GGML_STATUS_FAILED;
+    }
     if (qkv_capture_enabled && n_backends != 2) {
         GGML_LOG_ERROR("[GALAXY_QKV_CAPTURE] producer-time capture requires two Meta backends\n");
         return GGML_STATUS_FAILED;
