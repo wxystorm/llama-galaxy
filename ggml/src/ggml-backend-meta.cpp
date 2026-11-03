@@ -3007,79 +3007,94 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
-        // Check the NEXT production boundary after replacement. This is
-        // a hard byte-for-byte proof that the existing kqv_out reshape
-        // sees the injected Flash tensor instead of stale/original TP
-        // output. W_o is in a later Meta subgraph and cannot execute
-        // until this test succeeds.
-        if (live_replace_requested &&
-                std::strcmp(original_last->name,
-                        ("kqv_out-"+std::to_string(live_shadow_layer)).c_str())==0 &&
-                original_last->ne[1]>=8) {
-            if (!live_replaced_pending ||
+        // Boundary names are non-unique inside llama-graph; only the
+        // pinned, producer-captured terminal is eligible. Each selected
+        // Layer N owns a distinct pending/output/verified state.
+        const int kqv_layer = live_shadow_requested ?
+                selected_layer(original_last->name,"kqv_out") : -1;
+        if (live_replace_requested && kqv_layer>=0 && original_last->ne[1]>=8) {
+            auto it=live_states.find(kqv_layer);
+            if(it==live_states.end() || !it->second.pending ||
+                    it->second.verified ||
                     original_last->op!=GGML_OP_RESHAPE ||
                     original_last->type!=GGML_TYPE_F32 ||
                     !ggml_is_contiguous(original_last) ||
                     ggml_backend_meta_get_split_state(original_last,false).axis!=
                             GGML_BACKEND_SPLIT_AXIS_0) {
-                GGML_LOG_ERROR("[GALAXY_CAUSAL_REPLACE] no compatible injected Flash output\n");
+                GGML_LOG_ERROR("[GALAXY_CAUSAL_REPLACE] layer=%d missing matching pending Flash output\n",
+                        kqv_layer);
+                return GGML_STATUS_FAILED;
+            }
+            auto & state=it->second;
+            if(state.tokens!=original_last->ne[1]) {
+                GGML_LOG_ERROR("[GALAXY_CAUSAL_REPLACE] layer=%d token count changed between Flash and Wo\n",
+                        kqv_layer);
                 return GGML_STATUS_FAILED;
             }
             const auto captured=qkv_live_snapshots.find(original_last);
-            if (captured==qkv_live_snapshots.end() || captured->second.size()!=2) {
-                GGML_LOG_ERROR("[GALAXY_CAUSAL_REPLACE] missing reshaped producer snapshot\n");
+            if(captured==qkv_live_snapshots.end() || captured->second.size()!=2) {
+                GGML_LOG_ERROR("[GALAXY_CAUSAL_REPLACE] layer=%d missing reshaped producer snapshot\n",
+                        kqv_layer);
                 return GGML_STATUS_FAILED;
             }
             for(int rank=0;rank<2;++rank) {
-                if(captured->second[rank].size()!=live_replaced_shards[rank].size() ||
+                if(captured->second[rank].size()!=state.tp_heads[rank].size() ||
                         std::memcmp(captured->second[rank].data(),
-                                    live_replaced_shards[rank].data(),
-                                    live_replaced_shards[rank].size())!=0) {
+                                    state.tp_heads[rank].data(),
+                                    state.tp_heads[rank].size())!=0) {
                     std::fprintf(stderr,
                             "[GALAXY_CAUSAL_REPLACE_VERIFY] layer=%d rank=%d"
                             " pre_wo_identity=FAIL status=FAIL\n",
-                            live_shadow_layer,rank);
+                            kqv_layer,rank);
                     return GGML_STATUS_FAILED;
                 }
                 std::fprintf(stderr,
                         "[GALAXY_CAUSAL_REPLACE_VERIFY] layer=%d rank=%d"
                         " bytes=%zu pre_wo_identity=BYTE_EXACT status=PASS\n",
-                        live_shadow_layer,rank,live_replaced_shards[rank].size());
+                        kqv_layer,rank,state.tp_heads[rank].size());
             }
-            live_replaced_pending=false;
-            live_replaced_verified=true;
+            state.pending=false;
+            state.verified=true;
+            for(auto & bytes:state.tp_heads) bytes.clear();
             std::fprintf(stderr,
                     "[GALAXY_CAUSAL_LIVE] layer=%d tokens=%" PRId64
                     " mode=REPLACE tp_flash_skipped=1"
                     " production_wo_input=SP_ATTENTION"
                     " pre_wo_identity=BYTE_EXACT status=PASS\n",
-                    live_shadow_layer,original_last->ne[1]);
+                    kqv_layer,original_last->ne[1]);
             std::fflush(stderr);
         }
 
-        // The live causal path is a SHADOW of a single TP layer: it consumes
-        // the actual Q/K/V producer-time bytes from THIS Meta graph and
-        // compares the native PC/Phone Flash result against THIS graph's
-        // kqv_out. No GLG1 file, re-tokenization, model reload, or mutation
-        // of the original kqv_out / W_o is permitted.
-        if (live_shadow_requested && !live_replace_requested &&
-                std::strcmp(original_last->name,
-                        ("kqv_out-"+std::to_string(live_shadow_layer)).c_str()) == 0) {
+        // SHADOW runs original model Attention, reconstructs identical
+        // per-layer native SP output, and leaves the production W_o input
+        // untouched. Never mix snapshots from separate model layers.
+        if (live_shadow_requested && !live_replace_requested && kqv_layer>=0) {
             try {
                 const int64_t tokens=original_last->ne[1];
                 if(tokens<8) {
                     std::fprintf(stderr,
                             "[GALAXY_CAUSAL_LIVE] layer=%d tokens=%" PRId64
                             " mode=SHADOW status=SKIP reason=WARMUP_BELOW_8\n",
-                            live_shadow_layer,tokens);
+                            kqv_layer,tokens);
                     std::fflush(stderr);
                 } else {
-                    const auto work=build_live_request(original_last);
+                    if(live_shadow_verified.count(kqv_layer)) {
+                        throw std::invalid_argument("duplicate in-graph layer Shadow verification");
+                    }
+                    for(const int preceding:live_plan.layers) {
+                        if(preceding>=kqv_layer) break;
+                        if(!live_shadow_verified.count(preceding)) {
+                            throw std::invalid_argument(
+                                    "previous selected layer has no Shadow verification");
+                        }
+                    }
+                    const auto work=build_live_request(kqv_layer,original_last);
                     const ggml_galaxy_collectives::devices_t devs={
                             backend_ctx->backend_configs[0].backend,
                             backend_ctx->backend_configs[1].backend
                     };
                     const auto measured=ggml_galaxy_causal_live::shadow(devs,work);
+                    live_shadow_verified.insert(kqv_layer);
                     std::fprintf(stderr,
                             "[GALAXY_CAUSAL_LIVE] layer=%d tokens=%" PRId64
                             " mode=SHADOW tp_heads=%" PRId64 "+%" PRId64
@@ -3090,7 +3105,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             " native_ready_wall_ms=%.3f sp_tp_ms=%.3f"
                             " threshold=%.3g production_output_unchanged=1"
                             " status=PASS\n",
-                            live_shadow_layer,tokens,
+                            kqv_layer,tokens,
                             work.q.heads[0],work.q.heads[1],
                             work.k.heads[0],work.k.heads[1],
                             measured.first_token_rmse,measured.rmse,
@@ -3104,7 +3119,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 std::fprintf(stderr,
                         "[GALAXY_CAUSAL_LIVE] layer=%d mode=SHADOW"
                         " status=FAIL reason=%s\n",
-                        live_shadow_layer,e.what());
+                        kqv_layer,e.what());
                 std::fflush(stderr);
                 return GGML_STATUS_FAILED;
             }
