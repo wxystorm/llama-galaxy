@@ -1,4 +1,6 @@
 #include "models.h"
+#include "../llama-galaxy-tp.h"
+#include "ggml-backend-galaxy-markers.h"
 
 void llama_model_llama::load_arch_hparams(llama_model_loader & ml) {
     uint32_t n_vocab = 0;
@@ -98,6 +100,10 @@ std::unique_ptr<llm_graph_context> llama_model_llama::build_arch_graph(const llm
 template <bool embed>
 llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
+    // Port Galaxy TP/SP and Galaxy2 onto the dense Llama graph without
+    // changing RoPE, causal KV cache or the single-token decode path.
+    const bool galaxy_sp = !embed && llama_galaxy_tp::sp_enabled() && n_tokens > 1;
+    const bool galaxy_sp_final = galaxy_sp && llama_galaxy_tp::sp_include_final_layer();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
     GGML_ASSERT(n_embd_head == n_rot);
@@ -173,12 +179,28 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
             cb(cur, "attn_out", il);
         }
-        if (il == n_layer - 1 && inp_out_ids) {
-            cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
-            inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
-            // 如果是最后一层，并且有输出id，那么就把当前的输出和输入都取出对应的行
+
+        const bool galaxy_sp_layer = galaxy_sp && (il + 1 < n_layer || galaxy_sp_final);
+        const bool galaxy2_ffn_sp = galaxy_sp_layer &&
+                llama_galaxy_tp::galaxy2_ffn_is_sp(il, n_layer);
+        if (galaxy_sp_layer) {
+            // Attention output is TP_PARTIAL; RS materializes local SP tokens.
+            cur = ggml_dup(ctx0, cur);
+            ggml_galaxy::mark_transition(cur, ggml_galaxy::sp_transition::reduce_scatter);
+            ggml_format_name(cur, "GALAXY_RS_ATT_%d", il);
         }
-        ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+        if (il == n_layer - 1 && inp_out_ids && !galaxy_sp_final) {
+            cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
+            inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+        }
+        ggml_tensor * residual_attn = inpSA;
+        if (galaxy_sp_layer) {
+            // Match Attention RS token ownership for the residual add.
+            residual_attn = ggml_dup(ctx0, inpSA);
+            ggml_galaxy::mark_transition(residual_attn, ggml_galaxy::sp_transition::scatter_mirrored);
+            ggml_format_name(residual_attn, "GALAXY_SCATTER_RESID_%d", il);
+        }
+        ggml_tensor * ffn_inp = ggml_add(ctx0, cur, residual_attn);
         cb(ffn_inp, "ffn_inp", il);
         // 残差连接
         // feed-forward network (non-MoE)
@@ -188,6 +210,14 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                     model.layers[il].ffn_norm, NULL,
                     LLM_NORM_RMS, il);
             cb(cur, "ffn_norm", il);
+
+            if (galaxy_sp_layer && !galaxy2_ffn_sp) {
+                // Galaxy Scheme-1 keeps FFN tensor-parallel.
+                // Galaxy2 instead processes local tokens with full FFN weights.
+                cur = ggml_dup(ctx0, cur);
+                ggml_galaxy::mark_transition(cur, ggml_galaxy::sp_transition::all_gather);
+                ggml_format_name(cur, "GALAXY_AG_ATT_%d", il);
+            }
 
             cur = build_ffn(cur,
                     model.layers[il].ffn_up,   model.layers[il].ffn_up_b,   model.layers[il].ffn_up_s,
@@ -221,16 +251,36 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                     model.layers[il].ffn_down_exps_s);
             cb(cur, "ffn_moe_out", il);
         }
+        if (galaxy_sp_layer && !galaxy2_ffn_sp) {
+            // FFN TP partial -> SP local tokens for Connection 2.
+            cur = ggml_dup(ctx0, cur);
+            ggml_galaxy::mark_transition(cur, ggml_galaxy::sp_transition::reduce_scatter);
+            ggml_format_name(cur, "GALAXY_RS_FFN_%d", il);
+        }
         cur = ggml_add(ctx0, cur, ffn_inp);
+        if (galaxy_sp_layer) {
+            // Next Attention is TP; restore the full hidden sequence.
+            cur = ggml_dup(ctx0, cur);
+            ggml_galaxy::mark_transition(cur, ggml_galaxy::sp_transition::all_gather);
+            ggml_format_name(cur, "GALAXY_AG_FFN_%d", il);
+        }
         cb(cur, "ffn_out", il);
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
+        if (llama_galaxy_tp::dump_layer_enabled(il) && n_tokens > 1) {
+            ggml_set_output(cur);
+        }
 
         // input for next layer
         inpL = cur;
     }
     cur = inpL;
+    if (galaxy_sp_final && inp_out_ids) {
+        // Full Galaxy source scheme: select output IDs after final AllGather.
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        cb(cur, "galaxy_final_out_ids", -1);
+    }
 
     cur = build_norm(cur,
             model.output_norm, NULL,

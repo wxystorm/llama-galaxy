@@ -728,3 +728,42 @@ The CLI experiment records TP-vs-SP numerical deviations separately
 and does not require exact full-logit parity by default. Pure TP and
 Galaxy modes still use their respective runtime paths; the source
 reference-mode plan selftest has no influence on inference.
+
+
+## Dense Llama 3.2 3B port (PC + Phone)
+
+The dense \`LLM_ARCH_LLAMA\` graph is now wired to the same Attention
+ReduceScatter -> Connection1 SP -> FFN TP/SP -> Connection2 AllGather
+markers used in Qwen3. Its Llama-specific RoPE and causal KV cache
+path are unchanged. A single-token decode graph remains pure TP.
+The loader rejects MoE Llama when Galaxy SP is requested, rather than
+silently inserting transitions across unsupported expert execution.
+
+**Llama-3.2-3B-Instruct (GGUF Q4_K_M) model dimensions:**
+- 28 layers; 24 attention heads; 8 KV heads; hidden=3072; FFN=8192.
+- Equal static partitions: \`-HeadSplit "12,12"\` and
+  \`-FfnSplit "4096,4096"\`.
+- \`-SeqWeights "1,1"\` produces a balanced token split; \`"20,12"\`
+  tests source-inspired nonuniform ownership.
+- For the full Scheme-2 Galaxy2 configuration, use
+  \`-Galaxy2FfnSpLayers all -FinalLayerSP\`. This replicates all 28 FFN
+  layers on *both* ranks, and should be more feasible than the 14B
+  model, but actual Meta/CUDA/Phone memory use must still be tested.
+
+Suggested sequence: first baseline \`-PureTP\`, then one-layer
+\`-Galaxy2 -Galaxy2FfnSpLayers 1\`, then full
+\`-Galaxy2 -Galaxy2FfnSpLayers all -FinalLayerSP\`.
+
+For one Llama 3.2 3B full-Galaxy2 smoke run:
+
+    .\tools\galaxy\run_galaxy_sp_smoke.ps1 -Model "E:\llama\models\Llama-3.2-3B-Instruct-Q4_K_M.gguf" -Rpc "10.39.52.114:50052" -PromptFile "D:\prima.cpp\prompts\prompt_64.txt" -HeadSplit "12,12" -FfnSplit "4096,4096" -Galaxy2 -Galaxy2FfnSpLayers all -FinalLayerSP -TimeoutSec 300
+
+Expected per full 72-token Prefill graph (28 transformer blocks):
+- Galaxy Scheme-1 with \`-FinalLayerSP\`: RS=56, AG=56, scatter=28
+- Galaxy2 Scheme-2 all layers: RS=28, AG=28, scatter=28
+- Galaxy2 N=1 with final SP: RS=55, AG=55, scatter=28
+
+This port is **not yet Windows/Phone runtime validated**. Compilation,
+correctness witnesses and output logits still need live checks on the
+user's hardware. The upstream independent SP Attention/Q-KV strategy
+remains separate work, not silently supported by the Llama port.

@@ -345,8 +345,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     if (galaxy.active && ud->model->arch != LLM_ARCH_QWEN3 && ud->model->arch != LLM_ARCH_LLAMA) {
         throw std::invalid_argument("Galaxy TP phase 1 supports dense Qwen3 and Llama only");
     }
-    if ((llama_galaxy_tp::sp_enabled() || llama_galaxy_tp::galaxy2_enabled()) && ud->model->arch != LLM_ARCH_QWEN3) {
-        throw std::invalid_argument("Galaxy SP graph transitions currently support Qwen3 only");
+    if (llama_galaxy_tp::sp_enabled() || llama_galaxy_tp::galaxy2_enabled()) {
+        if (ud->model->arch != LLM_ARCH_QWEN3 && ud->model->arch != LLM_ARCH_LLAMA) {
+            throw std::invalid_argument("Galaxy SP graph transitions support dense Qwen3 and Llama only");
+        }
+        if (ud->model->arch == LLM_ARCH_LLAMA && hparams.n_expert != 0) {
+            throw std::invalid_argument("Galaxy Llama SP currently requires a dense FFN (n_expert == 0)");
+        }
     }
     //GGML_LOG_INFO("已经调用 llama_meta_device_get_split_state, tensor_name: %s\n", tensor_name.c_str());
     //如果是q,k,v权重，打印切分信息

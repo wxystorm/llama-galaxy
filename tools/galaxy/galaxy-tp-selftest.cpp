@@ -33,6 +33,11 @@ int main() {
     must_throw([] { validate_counts({16, 24}, 40, 5, "heads"); });
     must_throw([] { validate_counts({20, 20}, 41, 5, "heads"); });
     must_throw([] { validate_counts({8704, 8704}, 17408, 1024, "ffn"); });
+    // Dense Qwen3 and Llama 3.2 can reuse the same static rank policy:
+    // Llama 3.2 3B: 24 Attention heads, 8 KV heads, FFN=8192.
+    validate_counts({12, 12}, 24, 3, "Llama3.2 attention heads");
+    validate_counts({4096, 4096}, 8192, 256, "Llama3.2 FFN units");
+    must_throw([] { validate_counts({10,14}, 24, 3, "invalid Llama GQA split"); });
     // The original Qwen3 last-token shortcut is retained unless final-layer
     // SP was explicitly requested, so these eligible counts differ by one.
     require_test(llama_galaxy_tp::galaxy2_eligible_ffn_layers(40, false) == 39, "last TP");
