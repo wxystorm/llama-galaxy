@@ -1736,3 +1736,42 @@ to W_o, the persistent KV-cache has not been redistributed, and
 Decode still runs the original TP code. Only after a successful
 live-shadow test should a separate explicit REPLACE mode consume the
 computed TP-form output and bypass/override production Attention.
+
+
+## Fixed CUDA Flash Attention fatal error in live selftest
+
+The first galaxy-causal-live-selftest PC_RPC run passed its CONTRACTS
+but aborted in ggml/src/ggml-cuda/fattn.cu:585. That is the
+BEST_FATTN_KERNEL_NONE branch inside ggml_cuda_flash_attn_ext(),
+NOT a TP/SP collective, RPC data-transfer, or model cache failure.
+
+The original synthetic fixture chose head_dim=16, a dimension NOT
+supported by the native CUDA Flash Attention kernel dispatcher in
+this repository. The real Llama-3.2-3B model uses head_dim=128 and
+already passed native CUDA+Phone Flash execution with that dimension.
+
+Fix:
+- The test fixture now uses 128 rather than 16, keeping 17
+  asymmetric tokens and the same 6+6 Query/2+2 KV head ownership.
+- The v1 in-graph causal shadow validates head_dim=64 or 128 before
+  building any backend kernel; dimension 16 returns a clear
+  invalid_argument rather than terminating the process.
+- The live native executor calls ggml_backend_dev_supports_op() for
+  its FLASH_ATTN_EXT node before dispatch. This can reject unsupported
+  CUDA shapes before the unconditional CUDA fatal branch. The RPC
+  backend currently returns a generic true here, so this does not
+  independently establish Phone kernel support; the subsequent native
+  execution and numerical parity remain necessary.
+- A regression contract test checks the unsupported dimension 16.
+
+Only rebuild the changed PC-side selftest and llama-cli. No GGUF
+snapshot, Phone RPC server, or model inference changes are needed.
+
+    git pull --ff-only origin feat/galaxy-baseline
+    cmake --build build-galaxy --config Release --target galaxy-causal-live-selftest llama-cli -j 8
+    .\build-galaxy\bin\Release\galaxy-causal-live-selftest.exe
+    .\build-galaxy\bin\Release\galaxy-causal-live-selftest.exe --pc CUDA0 --rpc 10.39.52.114:50052
+
+Only after both tests PASS, run the real single-layer model in
+-PureTP -LiveCausalLayer 0 mode. Never report the original
+dim-16 fatal error as evidence that the SP Attention design failed.
