@@ -95,11 +95,9 @@ inline bool galaxy2_ffn_is_sp(int64_t il, int64_t n_layers) {
     return il >= 0 && il < galaxy2_ffn_sp_count(n_layers);
 }
 
-// Opt-in diagnostic only. Comma-delimited layer indices or 'all'.
-// Selected layer outputs are pinned with GGML_TENSOR_FLAG_OUTPUT so that
-// the Meta backend can copy them after graph execution.
-inline bool dump_layer_enabled(int64_t il) {
-    const char * value = std::getenv("LLAMA_GALAXY_LAYER_DUMP");
+// Comma-delimited diagnostic layer selection, or 'all'. Keep the original
+// layer dump and the opt-in intermediate-stage dump independently selectable.
+inline bool layer_selection_contains(const char * value, int64_t il) {
     if (value == nullptr || *value == '\0' || il < 0) {
         return false;
     }
@@ -121,6 +119,17 @@ inline bool dump_layer_enabled(int64_t il) {
         start = end+1;
     }
     return false;
+}
+
+// Existing l_out snapshot: pin the selected final layer outputs.
+inline bool dump_layer_enabled(int64_t il) {
+    return layer_selection_contains(std::getenv("LLAMA_GALAXY_LAYER_DUMP"), il);
+}
+
+// Diagnostic-only snapshots of comparable logical intermediate activations.
+// Only the dense Llama Galaxy TP/SP path currently opts into this facility.
+inline bool dump_stage_enabled(int64_t il) {
+    return layer_selection_contains(std::getenv("LLAMA_GALAXY_STAGE_DUMP"), il);
 }
 
 inline std::vector<int64_t> parse_counts(const char * text, const char * key, size_t n_devices) {
