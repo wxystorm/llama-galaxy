@@ -640,7 +640,7 @@ the switch is explicitly enabled.
 
 Example:
 
-    .\tools\galaxy\run_galaxy_sp_smoke.ps1 -Model "E:\llama\models\Qwen3-0.6B-Q4_K_M.gguf" -Rpc "10.39.52.114:50052" -PromptFile "D:\prima.cpp\prompts\prompt_64.txt" -Galaxy2 -Galaxy2FfnSpLayers all -FinalLayerSP -SeqWeights "20,12" -TimeoutSec 300
+    .\tools\galaxy\run_galaxy_sp_smoke.ps1 -Model "E:\llama\models\Qwen3-0.6B-Q4_K_M.gguf" -Rpc "10.39.52.114:50052" -PromptFile "D:\prima.cpp\prompts\prompt_64.txt" -HeadSplit "8,8" -FfnSplit "1536,1536" -Galaxy2 -Galaxy2FfnSpLayers all -FinalLayerSP -SeqWeights "20,12" -TimeoutSec 300
 
 
 ## SP Attention K/V collective from source Galaxy-LM
@@ -697,3 +697,34 @@ Source references:
 - https://github.com/ysyisyourbrother/Galaxy-LM/blob/main/README.md
 - https://github.com/ysyisyourbrother/Galaxy-LM/blob/main/galaxy/models/bert/galaxy_bert_model.py
 - https://github.com/ysyisyourbrother/Galaxy-LM/blob/main/galaxy/models/bert/sp_bert_model.py
+
+
+### Source-aligned full Galaxy2 small-model validation
+
+Qwen3-0.6B uses 28 transformer blocks, 16 attention heads, 8 KV heads
+and a 3072-wide intermediate FFN. The 14B defaults (20,20 attention
+heads and 8704,8704 FFN channels) are **not** valid for this model.
+Use \`-HeadSplit "8,8" -FfnSplit "1536,1536"\` when validating the
+small-model full Galaxy2 mode. These sums are from the official
+Qwen3-0.6B model configuration.
+
+Run once on the same prompt with pure TP, Galaxy Scheme-1 and full
+Galaxy2 Scheme-2 (all FFN layers, including last), with a 20:12
+sequence allocation and WITHOUT intrusive profiling:
+
+    .\tools\galaxy\run_galaxy_three_modes.ps1 -Model "E:\llama\models\Qwen3-0.6B-Q4_K_M.gguf" -Rpc "10.39.52.114:50052" -PromptFile "D:\prima.cpp\prompts\prompt_64.txt" -HeadSplit "8,8" -FfnSplit "1536,1536" -Galaxy2FfnSpLayers all -FinalLayerSP -SeqWeights "20,12" -Profile $false -TimeoutSec 300
+
+The full-graph expected counts for 28 layers are:
+- Galaxy: Attention RS 28 + FFN RS 28 = 56, AG 56, Residual Scatter 28
+- Galaxy2: Attention RS 28, AG 28, Residual Scatter 28
+
+These values are for an actual full-sequence multi-token graph; the
+smoke runner also emits 2-token warmup graphs. Full Galaxy2 reduces
+collectives but replicates all FFN weights. If the 0.6B model is not
+present at the specified path, change only the -Model argument to the
+actual GGUF path; do not reuse the 14B attention/FFN splits.
+
+The CLI experiment records TP-vs-SP numerical deviations separately
+and does not require exact full-logit parity by default. Pure TP and
+Galaxy modes still use their respective runtime paths; the source
+reference-mode plan selftest has no influence on inference.
