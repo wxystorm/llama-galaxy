@@ -3171,13 +3171,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         hash ^= static_cast<uint64_t>(byte);
                         hash *= UINT64_C(1099511628211);
                     }
-                    GGML_LOG_INFO("[GALAXY_REAL_QKV_RANK] name=%s op=%s rank=%d"
+                    // This is explicitly opted-in diagnostic evidence and
+                    // must not disappear when the normal GGML INFO verbosity
+                    // is filtered by the CLI. Always write to stderr.
+                    std::fprintf(stderr,
+                            "[GALAXY_REAL_QKV_RANK] name=%s op=%s rank=%d"
                             " backend=%s local_features=%" PRId64
                             " tokens=%" PRId64 " bytes=%zu fnv1a64=%016" PRIx64
                             " status=READ\n",
                             node->name, ggml_op_name(node->op), rank,
                             ggml_backend_name(backend_ctx->backend_configs[rank].backend),
                             local_width, local_tokens, raw.size(), hash);
+                    std::fflush(stderr);
                 }
                 for (int64_t t = 0; t < tokens; ++t) {
                     for (int64_t f = 0; f < local_width; ++f) {
