@@ -95,6 +95,9 @@ void contract_tests() {
     invalid.tokens=2;
     expect_invalid([&] { validate(invalid); },"warmup-only tokens");
     invalid=fx.r;
+    invalid.head_dim=16;
+    expect_invalid([&] { validate(invalid); },"unsupported CUDA Flash head_dim=16");
+    invalid=fx.r;
     invalid.q.heads={5,7};
     expect_invalid([&] { validate(invalid); },"GQA group split");
     invalid=fx.r;
