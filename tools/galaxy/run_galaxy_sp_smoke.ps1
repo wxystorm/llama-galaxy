@@ -176,7 +176,7 @@ try {
     if ($DumpFfnOps) {
         if ($DumpFfnOps -ne "all") {
             foreach ($layer in $DumpFfnOps.Split(",")) {
-                foreach ($stage in @("ffn_up", "ffn_gate", "ffn_gate_par")) {
+                foreach ($stage in @("ffn_up", "ffn_gate", "ffn_swiglu")) {
                     $snapshot = Join-Path $env:LLAMA_GALAXY_FFN_OP_DUMP_DIR "$stage-$layer.f32"
                     if (-not (Test-Path -LiteralPath $snapshot) -or
                             (Get-Item -LiteralPath $snapshot).Length -le 8) {
