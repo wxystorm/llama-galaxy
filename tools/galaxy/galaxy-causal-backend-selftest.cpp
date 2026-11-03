@@ -254,7 +254,7 @@ static void run_case(const backend_pair & devices, layout shape,
     expect_reject([&] { host_staged_attention(devices,shape,local_q,new_k,new_v,
             pc.cache_k,pc.cache_v,full_k,full_v,output,0); }, "zero tile");
     expect_reject([&] { host_staged_attention(devices,shape,local_q,new_k,new_v,
-            pc.cache_k,pc.cache_v,full_k,full_v,local_q,1); }, "output aliases input");
+            pc.cache_k,pc.cache_v,full_k,full_v,output_pair{pc.q,phone.q},1); }, "output aliases input");
     if (shape.cached_tokens) {
         expect_reject([&] { host_staged_attention(devices,shape,local_q,new_k,new_v,
                 nullptr,nullptr,full_k,full_v,output,1); }, "missing cache");
