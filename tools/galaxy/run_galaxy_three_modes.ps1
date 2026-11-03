@@ -14,6 +14,7 @@ param(
     [string]$HeadSplit = "20,20",
     [string]$FfnSplit = "8704,8704",
     [string]$Galaxy2FfnSpLayers = "1",
+    [string]$Galaxy2FfnSpLayerSet = "",
     [string]$SeqWeights = "1,1",
     [switch]$FinalLayerSP,
     [int]$CollectiveTileTokens = 32,
@@ -36,6 +37,9 @@ if (-not (Test-Path -LiteralPath $Comparator)) {
 }
 if ($Galaxy2FfnSpLayers -ne "all" -and $Galaxy2FfnSpLayers -notmatch '^[0-9]+$') {
     throw "Galaxy2FfnSpLayers must be all or a nonnegative number"
+}
+if ($Galaxy2FfnSpLayerSet -and $PSBoundParameters.ContainsKey("Galaxy2FfnSpLayers")) {
+    throw "Specify Galaxy2FfnSpLayerSet OR Galaxy2FfnSpLayers, not both"
 }
 & $Comparator --selftest
 if ($LASTEXITCODE -ne 0) { throw "Comparator selftest failed" }
@@ -78,7 +82,13 @@ foreach ($mode in @("tp", "sp", "galaxy2")) {
     } elseif ($mode -eq "sp") {
         & $smoke @opts
     } else {
-        & $smoke @opts -Galaxy2 -Galaxy2FfnSpLayers $Galaxy2FfnSpLayers
+        if ($Galaxy2FfnSpLayerSet) {
+            $galaxy2Opts = $opts.Clone()
+            $galaxy2Opts["Galaxy2FfnSpLayerSet"] = $Galaxy2FfnSpLayerSet
+            & $smoke @galaxy2Opts -Galaxy2
+        } else {
+            & $smoke @opts -Galaxy2 -Galaxy2FfnSpLayers $Galaxy2FfnSpLayers
+        }
     }
     $folder = Get-ChildItem -LiteralPath $root -Directory -Filter "$mode-*" |
         Sort-Object LastWriteTime -Descending | Select-Object -First 1
@@ -127,14 +137,21 @@ $manifest = @{
     threads = $Threads
     n_predict = $NPredict
     collective_witness = $witness
-    galaxy2_sp_ffn_layers = $Galaxy2FfnSpLayers
+    galaxy2_sp_ffn_layers = if ($Galaxy2FfnSpLayerSet) { $null } else { $Galaxy2FfnSpLayers }
+    galaxy2_ffn_sp_layer_set = if ($Galaxy2FfnSpLayerSet) { $Galaxy2FfnSpLayerSet } else { $null }
     collective_tile_tokens = $CollectiveTileTokens
     seq_weights = $SeqWeights
     final_layer_sp = [bool]$FinalLayerSP
-    full_galaxy2 = ($Galaxy2FfnSpLayers -eq "all" -and [bool]$FinalLayerSP)
+    full_galaxy2 = (($Galaxy2FfnSpLayers -eq "all" -or $Galaxy2FfnSpLayerSet -eq "all") -and [bool]$FinalLayerSP)
     require_numerical_parity = [bool]$RequireNumericalParity
     numerical_status = if ($bad.Count -gt 0) { "KNOWN_DEVIATION" } else { "PASS" }
-    galaxy2_scope = if ($Galaxy2FfnSpLayers -eq "all") { "full" } else { "partial_hybrid" }
+    galaxy2_scope = if ($Galaxy2FfnSpLayerSet -and $Galaxy2FfnSpLayerSet -ne "all") {
+        "custom_hybrid"
+    } elseif ($Galaxy2FfnSpLayers -eq "all" -or $Galaxy2FfnSpLayerSet -eq "all") {
+        "full"
+    } else {
+        "partial_hybrid"
+    }
     profile_forced_sync = $Profile
     modes = $results
     numerical_failures = $bad
