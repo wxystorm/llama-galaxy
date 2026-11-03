@@ -107,6 +107,7 @@ inline void validate_execution(const backend_pair & devices, const layout & shap
     }
 
     if (shape.cached_tokens > 0) {
+        require(cached_k != cached_v, "cached Key and Value tensors alias");
         validate_tensor(cached_k, type, kv_width, shape.cached_tokens, "canonical cached Key");
         validate_tensor(cached_v, type, kv_width, shape.cached_tokens, "canonical cached Value");
         inputs.push_back(cached_k);
@@ -179,6 +180,8 @@ inline void gather_kv_with_history(const backend_pair & devices, const layout & 
         const output_pair & complete_k, const output_pair & complete_v,
         size_t tile_tokens = 32) {
     validate(shape);
+    runtime_detail::require(runtime_prefill_eligible(shape),
+            "only two nonempty Query shards in prefill are supported");
     runtime_detail::require(devices[0] && devices[1], "two backends required");
     runtime_detail::require(tile_tokens > 0 && tile_tokens <= 1024,
             "tile_tokens must be 1..1024");
@@ -208,6 +211,8 @@ inline void gather_kv_with_history(const backend_pair & devices, const layout & 
             complete_k[0] != complete_v[1] &&
             complete_k[1] != complete_v[0], "K/V outputs alias");
     if (shape.cached_tokens > 0) {
+        runtime_detail::require(cached_k != cached_v,
+                "cached K/V source buffers alias");
         runtime_detail::validate_tensor(cached_k, type, width,
                 shape.cached_tokens, "cached Key");
         runtime_detail::validate_tensor(cached_v, type, width,
@@ -263,7 +268,7 @@ inline void host_staged_attention(const backend_pair & devices, const layout & s
         const auto all_keys = runtime_detail::read_complete(complete_k[rank]);
         const auto all_values = runtime_detail::read_complete(complete_v[rank]);
         const auto interval_ = rank_queries(shape, rank);
-        std::vector<uint8_t> out(static_cast<size_t>(interval_.count*q_width)*item);
+        std::vector<uint8_t> out(ggml_nbytes(local_output[rank]));
         std::vector<double> scores(static_cast<size_t>(n_kv));
 
         for (int64_t t = 0; t < interval_.count; ++t) {
