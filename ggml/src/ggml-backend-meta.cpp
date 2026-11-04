@@ -3180,6 +3180,48 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
+        // Once a selected layer's kqv_out has been fully consumed,
+        // its producer-time Q/K/V and Attention host snapshots are no
+        // longer needed by the NEXT layer. This is important for 16/28
+        // layer experiments: otherwise every layer's multi-megabyte
+        // F32 snapshots remain live until the whole Meta graph ends.
+        //
+        // Explicit GLG1 probe export is the exception: keep snapshots
+        // when requested, because that diagnostic writes at graph end.
+        if (live_shadow_requested && kqv_layer >= 0 &&
+                original_last->ne[1] >= 8 && !qkv_probe_enabled) {
+            const auto state = live_states.find(kqv_layer);
+            const bool verified = live_replace_requested ?
+                    (state != live_states.end() && state->second.verified) :
+                    live_shadow_verified.count(kqv_layer) != 0;
+            if (verified) {
+                size_t released_bytes=0, released_tensors=0;
+                auto it=qkv_live_snapshots.begin();
+                while(it != qkv_live_snapshots.end()) {
+                    const ggml_tensor * captured=it->first;
+                    const bool belongs_to_layer =
+                            selected_layer(captured->name,"Qcur")==kqv_layer ||
+                            selected_layer(captured->name,"Kcur")==kqv_layer ||
+                            selected_layer(captured->name,"Vcur")==kqv_layer ||
+                            selected_layer(captured->name,"fattn_raw")==kqv_layer ||
+                            selected_layer(captured->name,"kqv_out")==kqv_layer;
+                    if (!belongs_to_layer) {
+                        ++it;
+                        continue;
+                    }
+                    for (const auto & copy : it->second) released_bytes+=copy.size();
+                    ++released_tensors;
+                    it=qkv_live_snapshots.erase(it);
+                }
+                std::fprintf(stderr,
+                        "[GALAXY_CAUSAL_CAPTURE_RELEASE] layer=%d"
+                        " host_bytes=%zu tensors=%zu"
+                        " deferred_probe_export=0 status=PASS\n",
+                        kqv_layer,released_bytes,released_tensors);
+                std::fflush(stderr);
+            }
+        }
+
         const galaxy_sp_transition transition = galaxy_sp_get_transition(original_last);
         if (transition != galaxy_sp_transition::none) {
             if (original_last->src[0] == nullptr ||
