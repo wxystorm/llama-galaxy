@@ -17,6 +17,7 @@ param(
     [ValidateSet(1,2,4,8,16,28)][int]$MaxPrefix = 2,
     [switch]$IncludeReplace,
     [switch]$ContinueOnLogitsMismatch,
+    [switch]$Trace,
     [string]$OutputDir = ".\galaxy-sp-results\causal-prefix-staged",
     [double]$MaxAbs = 0.10,
     [double]$MaxRmse = 0.02
@@ -61,7 +62,7 @@ $shared["Galaxy2"] = $false
 $shared["Galaxy2FfnSpLayerSet"] = ""
 $shared["FinalLayerSP"] = $false
 $shared["Profile"] = $false
-$shared["Trace"] = $false
+$shared["Trace"] = [bool]$Trace
 $shared["DumpLayers"] = ""
 $shared["DumpStages"] = ""
 $shared["DumpFfnOps"] = ""
@@ -75,6 +76,7 @@ function Save-StageManifest {
         max_prefix = $MaxPrefix
         include_replace = [bool]$IncludeReplace
         continue_on_logits_mismatch = [bool]$ContinueOnLogitsMismatch
+        trace = [bool]$Trace
         numerical_failures = $script:driftCount
         limits = @{ max_abs = $MaxAbs; max_rmse = $MaxRmse }
         model = [string]$shared["Model"]
