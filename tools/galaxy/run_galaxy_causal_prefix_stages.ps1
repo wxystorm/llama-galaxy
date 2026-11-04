@@ -166,7 +166,7 @@ function Invoke-Prefix([int]$count, [bool]$replace) {
         if ($fields["mode"] -ne $mode) { continue }
         $layer = [int]$fields["layer"]
         if ($layer -lt 0 -or $layer -ge $count -or $timedLayers.ContainsKey($layer)) {
-            throw "Duplicate/unexpected layer timing in $liveLog: $line"
+            throw "Duplicate/unexpected layer timing in ${liveLog}: $line"
         }
         $timedLayers[$layer] = $true
         $script:timings += [pscustomobject][ordered]@{
