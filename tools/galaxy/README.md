@@ -2042,3 +2042,66 @@ kqv_out byte injection alone is NOT enough to certify the whole model.
 host-staged TP/SP/KV collectives, F16 gathered K/V,
 no KV-context continuation, no SP Decode, no multiple sequences,
 no model-wide all-layer replacement or throughput speedup claim.
+
+
+## REPLACE-1 logits parity failure (2026-11-04) - diagnose before expanding
+
+Observed with the real Llama-3.2-3B, 98-token first Prefill,
+CUDA0 + Phone RPC0, TP heads 12+12, KV heads 4+4:
+
+- Pure TP baseline: 26.47 tok/s (wall varies; NOT a speed claim).
+- SHADOW-1: attention RMSE 9.37426762e-6, max_abs 0.0008845,
+  first-token logits EXACT against baseline.
+- REPLACE-1: both TP Flash nodes were skipped (11 -> 10 nodes in
+  subgraph 3); the recovered SP output was injected into both physical
+  raw Flash buffers; both kqv_out views passed byte-exact readback.
+- BUT full-vocabulary logits FAILED: RMSE=0.133029567,
+  MaxAbs=0.587991714, baseline Top1=1131, REPLACE Top1=11918,
+  top-10 overlap 10/10. The staged runner correctly stopped BEFORE
+  enabling layer1 REPLACE.
+
+**Do not confuse** pre_wo_identity=BYTE_EXACT with equivalence to
+the independent pure-TP Flash result. It only proves that kqv_out
+contains the SAME SP payload supplied in that REPLACE run. The
+original TP Flash did not execute there, so a reference is needed
+from a separate matched run.
+
+A targeted experiment requires NO new Android RPC code. It compares
+the same existing producer-time GLG1 probes at identical model input:
+
+    git pull --ff-only origin feat/galaxy-baseline
+    .\tools\galaxy\run_galaxy_replace_diagnose.ps1 -Common $common
+
+If the Python executable is not on PATH, supply the known path:
+
+    .\tools\galaxy\run_galaxy_replace_diagnose.ps1 -Common $common -PythonExe "D:\python\python.exe"
+
+It runs a new pure TP baseline and a single REPLACE-1, both with
+ProbeQkvLayers=0, DumpStages=0, DumpLayers=0, DumpLogits. It never
+silently promotes to two or four layers. The stdlib-only comparator
+tools/galaxy/galaxy-activation-diff.py reports per-tensor RMSE,
+MaxAbs, worst token and last-token RMSE for:
+
+    Qcur-0, Kcur-0, Vcur-0
+    fattn_raw-0, kqv_out-0
+    ffn_inp-0, ffn_norm-0
+    l_out-0, first_logits
+
+Read the **first** stage where error becomes large:
+- QKV differs: actual upstream model inputs changed; investigate
+  producer-time capture or model scheduling.
+- kqv_out differs substantially: native SP result / cache mask /
+  original Flash mismatch, despite successful injection.
+- kqv_out remains close but ffn_inp differs: check W_o ownership,
+  TP partial reduction and true lifetime of the injected raw buffer.
+- ffn_inp close but l_out differs: investigate FFN or residual.
+- l_out close but logits differ: error grew in later unmodified layers.
+
+The diagnostic emits [GALAXY_REPLACE_DIFF_SUM] and writes
+stage-diff.json, saving all run logs and activation snapshots.
+This is not a correctness-pass experiment: it is a deterministic
+failure-localization measurement. Do NOT relax top1, logits RMSE,
+or numerical comparison thresholds to make REPLACE appear to pass.
+
+The previous SHADOW results remain valid. Future multi-layer
+REPLACE is suspended until REPLACE-1 has independent logits parity.
