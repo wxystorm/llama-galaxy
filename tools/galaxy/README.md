@@ -2190,3 +2190,20 @@ Run the post-run trace checker against SHADOW-8's stderr.log:
 
 The checker requires two or more fresh 7-node/11-tensor native Attention graphs, forbids duplicate temporary graph UIDs or recomputation of those graphs, and checks that ordinary graph reuse is still present. Supply the full `stderr.log` path in `$shadow8Log`. The test does **not** establish numerical parity; REPLACE logits remain a separate check.
 
+
+
+## Causal native Attention REPLACE + Galaxy2 token-sharded FFN (opt-in)
+
+After proving that all 28 causal Attention REPLACE layers can execute, an explicit hybrid mode connects their existing producer-time native PC/Phone Flash Attention replacement with the **already implemented** Galaxy2 token-sharded FFN graph. Each selected FFN layer uses fully mirrored Up/Gate/Down weights; its post-Attention activation is ReduceScattered to rank-local tokens and gathered before the next TP Attention. No new host-only reference kernel is introduced. TP Attention is skipped in selected prefix layers and the native SP bytes feed W_o.
+
+This is **not full Galaxy**: first zero-based Prefill only (98-token smoke), selected FFN layers only, last-layer FFN remains on TP, Decode remains TP, host-staged Attention Q/K/V and KV AllGather remain. Neither numerical parity nor optimized performance is claimed. The flag is off by default; the existing TP, Galaxy2 and standalone Causal REPLACE paths are unchanged.
+
+Build and run with the existing Llama 3.2 3B PC/Phone configuration. The RPC protocol has not changed in this step; use the previously updated Phone server.
+
+```powershell
+ git pull --ff-only origin feat/galaxy-baseline
+ cmake --build build-galaxy --config Release --target llama-cli -j 8
+ .\\tools\\galaxy\\run_galaxy_causal_hybrid_ffn.ps1 -Common $common -AttentionPrefix 8 -FfnSpLayerSet "0" -Trace
+```
+
+After executing 8-layer SP Attention + one real FFN-SP layer, try `-AttentionPrefix 28 -FfnSpLayerSet "0-7"`, then (if memory permits) `-FfnSpLayerSet "0-26"`. The runner **does not compare logits**; it checks per-rank Flash skip/consumption, the executed Galaxy collectives and selected SP-FFN count, then writes a manifest with `numerical_parity=NOT_EVALUATED`.

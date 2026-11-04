@@ -28,6 +28,7 @@ param(
     [int]$LiveCausalLayer = -1,
     [int]$LiveCausalPrefixLayers = 0,
     [switch]$LiveCausalReplace,
+    [switch]$CausalHybridFfnSp,
     [switch]$Trace,
     [switch]$DisableRpcGraphReuse,
     [switch]$DumpLogits,
@@ -65,14 +66,19 @@ $selectedLiveLayers = if ($LiveCausalPrefixLayers -gt 0) {
 }
 $liveLayerList = $selectedLiveLayers -join ","
 $liveCount = $selectedLiveLayers.Count
-if ($liveEnabled -and -not $PureTP) {
-    throw "Causal live SP Attention currently requires -PureTP"
+if ($liveEnabled -and -not $PureTP -and -not $CausalHybridFfnSp) {
+    throw "Causal live SP Attention requires -PureTP or -CausalHybridFfnSp"
+}
+if ($CausalHybridFfnSp -and ($PureTP -or -not $Galaxy2 -or -not $LiveCausalReplace -or
+        $LiveCausalPrefixLayers -le 0 -or $FinalLayerSP -or -not $Galaxy2FfnSpLayerSet -or
+        $Galaxy2FfnSpLayerSet -eq "none")) {
+    throw "CausalHybridFfnSp requires -Galaxy2 -LiveCausalReplace -LiveCausalPrefixLayers N and a nonempty Galaxy2FfnSpLayerSet (not none); no -PureTP or -FinalLayerSP"
 }
 if ($LiveCausalReplace -and -not $liveEnabled) {
     throw "LiveCausalReplace requires LiveCausalLayer 0 or LiveCausalPrefixLayers 1/2/4/8/16/28"
 }
-if ($LiveCausalReplace -and -not $DumpLogits) {
-    throw "LiveCausalReplace requires -DumpLogits for independent TP baseline comparison"
+if ($LiveCausalReplace -and -not $DumpLogits -and -not $CausalHybridFfnSp) {
+    throw "LiveCausalReplace requires -DumpLogits unless -CausalHybridFfnSp explicitly skips numeric comparison"
 }
 if ($Galaxy2FfnSpLayerSet -and -not $Galaxy2) {
     throw "Galaxy2FfnSpLayerSet requires -Galaxy2"
@@ -105,7 +111,7 @@ $keys = @("LLAMA_GALAXY_TP", "LLAMA_GALAXY_TP_HEADS", "LLAMA_GALAXY_TP_FFN", "LL
     "LLAMA_GALAXY_STAGE_DUMP", "LLAMA_GALAXY_STAGE_DUMP_DIR",
     "LLAMA_GALAXY_FFN_OP_DUMP", "LLAMA_GALAXY_FFN_OP_DUMP_DIR",
     "LLAMA_GALAXY_QKV_PROBE_LAYERS", "LLAMA_GALAXY_QKV_PROBE_DIR",
-    "LLAMA_GALAXY_CAUSAL_LIVE_LAYER", "LLAMA_GALAXY_CAUSAL_LIVE_PREFIX_LAYERS", "LLAMA_GALAXY_CAUSAL_LIVE_MODE",
+    "LLAMA_GALAXY_CAUSAL_LIVE_LAYER", "LLAMA_GALAXY_CAUSAL_LIVE_PREFIX_LAYERS", "LLAMA_GALAXY_CAUSAL_LIVE_MODE", "LLAMA_GALAXY_CAUSAL_HYBRID_FFN",
     "LLAMA_GALAXY_COLLECTIVE_TILE_TOKENS", "LLAMA_GALAXY_RS_FUSED_READ", "LLAMA_GALAXY_SP_SEQ_WEIGHTS",
     "LLAMA_GALAXY_SP_FINAL_LAYER", "LLAMA_GALAXY_RPC_DISABLE_GRAPH_REUSE")
 $old = @{}
@@ -126,7 +132,7 @@ try {
     $env:LLAMA_GALAXY2_FFN_SP_LAYERS = if ($Galaxy2 -and -not $Galaxy2FfnSpLayerSet) { $Galaxy2FfnSpLayers } else { $null }
     $env:LLAMA_GALAXY2_FFN_SP_LAYER_SET = if ($Galaxy2 -and $Galaxy2FfnSpLayerSet) { $Galaxy2FfnSpLayerSet } else { $null }
 
-    $mode = if ($PureTP) { "tp" } elseif ($Galaxy2) { "galaxy2" } else { "sp" }
+    $mode = if ($PureTP) { "tp" } elseif ($CausalHybridFfnSp) { "hybrid" } elseif ($Galaxy2) { "galaxy2" } else { "sp" }
     $dir = Join-Path $OutputDir "$mode-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     # Every artifact path should be absolute. Powershell's current location
@@ -161,6 +167,7 @@ try {
     $env:LLAMA_GALAXY_CAUSAL_LIVE_LAYER = if ($LiveCausalLayer -eq 0) { "0" } else { $null }
     $env:LLAMA_GALAXY_CAUSAL_LIVE_PREFIX_LAYERS = if ($LiveCausalPrefixLayers -gt 0) { $LiveCausalPrefixLayers.ToString() } else { $null }
     $env:LLAMA_GALAXY_CAUSAL_LIVE_MODE = if ($LiveCausalReplace) { "REPLACE" } elseif ($liveEnabled) { "SHADOW" } else { $null }
+    $env:LLAMA_GALAXY_CAUSAL_HYBRID_FFN = if ($CausalHybridFfnSp) { "1" } else { $null }
     $env:LLAMA_GALAXY_QKV_PROBE_LAYERS = if ($ProbeQkvLayers) { $ProbeQkvLayers } else { $null }
     $env:LLAMA_GALAXY_QKV_PROBE_DIR = if ($ProbeQkvLayers) {
         $probeDir = Join-Path $dir "real-qkv"
@@ -180,7 +187,7 @@ try {
         "-ub", $UBatch.ToString(), "-t", $Threads.ToString(),
         "-n", $NPredict.ToString(), "--temp", "0", "-f", $promptArg
     )
-    Write-Host "[GALAXY_SP_SMOKE] mode=$mode devices=$Devices rpc=$Rpc profiling=$([bool]$Profile) tile_tokens=$CollectiveTileTokens rs_fused=$([bool]$RsFusedRead) seq_weights=$SeqWeights final_layer_sp=$([bool]$FinalLayerSP) rpc_graph_reuse_disabled=$([bool]$DisableRpcGraphReuse)"
+    Write-Host "[GALAXY_SP_SMOKE] mode=$mode devices=$Devices rpc=$Rpc profiling=$([bool]$Profile) tile_tokens=$CollectiveTileTokens rs_fused=$([bool]$RsFusedRead) seq_weights=$SeqWeights final_layer_sp=$([bool]$FinalLayerSP) rpc_graph_reuse_disabled=$([bool]$DisableRpcGraphReuse) causal_hybrid_ffn=$([bool]$CausalHybridFfnSp)"
     if ($Galaxy2FfnSpLayerSet) {
         Write-Host "[GALAXY2] mode=explicit_layer_set schedule=$Galaxy2FfnSpLayerSet final_layer_sp=$([bool]$FinalLayerSP)"
     } elseif ($Galaxy2 -and $Galaxy2FfnSpLayers -ne "all") {
@@ -201,7 +208,7 @@ try {
     $exitCode = $result.ExitCode
     Write-Host "[GALAXY_SP_SMOKE] exit=$exitCode logs=$dir"
 
-    $hits = @(Select-String -Path $stderr, $stdout -Pattern "GALAXY_META_TRACE","GALAXY_SP_LAYOUT_FAIL","GALAXY_SP_LAYOUT_SRC","GALAXY_SP_SUM","GALAXY_SP]","GALAXY_TP]","GALAXY_CAUSAL_LIVE","GALAXY_CAUSAL_REPLACE","GALAXY_CAUSAL_PREFIX_SUM","prompt eval time","eval time","ERROR","failed" -ErrorAction SilentlyContinue)
+    $hits = @(Select-String -Path $stderr, $stdout -Pattern "GALAXY_META_TRACE","GALAXY_SP_LAYOUT_FAIL","GALAXY_SP_LAYOUT_SRC","GALAXY_SP_SUM","GALAXY_SP]","GALAXY_TP]","GALAXY_CAUSAL_LIVE","GALAXY_CAUSAL_REPLACE","GALAXY_CAUSAL_PREFIX_SUM","GALAXY_CAUSAL_HYBRID_FFN_SUM","prompt eval time","eval time","ERROR","failed" -ErrorAction SilentlyContinue)
     # Keep the full trace in stderr.log, but print only the last 80
     # matching lines on the terminal to avoid flooding a long SP run.
     $displayHits = if ($Trace) { @($hits | Select-Object -Last 80) } else { $hits }
@@ -215,8 +222,11 @@ try {
     $spWitness = [bool](@($hits | Where-Object {
         $_.Line -match '\[GALAXY_SP_SUM\]\s+reduced_scatter=[1-9][0-9]*'
     }).Count -gt 0)
+    if ($CausalHybridFfnSp -and -not $spWitness) {
+        throw "Hybrid FFN-SP execution lacks positive ReduceScatter witness. Inspect $stderr"
+    }
     if (-not $PureTP -and -not $spWitness) {
-        Write-Warning "SP run exited normally but no positive ReduceScatter count was logged. Continue numerical comparison; actual SP collective execution remains UNVERIFIED."
+        Write-Warning "SP run exited normally but no positive ReduceScatter count was logged. Actual SP collective execution remains UNVERIFIED."
     }
     if ($liveEnabled) {
         $anyFailure = @($hits | Where-Object {
@@ -266,6 +276,15 @@ try {
                     throw "Layer $layer missing live Shadow numerical witness. Inspect $stderr"
                 }
             }
+        }
+        if ($CausalHybridFfnSp) {
+            $hybridWitness = @($hits | Where-Object {
+                $_.Line -match "\[GALAXY_CAUSAL_HYBRID_FFN_SUM\] mode=REPLACE attention_replaced=$liveCount\b.*ffn_sp_layers=[1-9][0-9]*.*status=PASS"
+            })
+            if ($hybridWitness.Count -ne 1) {
+                throw "Hybrid SP FFN execution witness missing or duplicated. Inspect $stderr"
+            }
+            Write-Host $hybridWitness[0].Line.Trim()
         }
         if ($LiveCausalReplace) {
             Write-Host "[GALAXY_CAUSAL_PREFIX] mode=REPLACE layers=$liveLayerList reference=SEPARATE_TP_BASELINE_REQUIRED result=ALL_WO_INPUTS_CONFIRMED"

@@ -2164,6 +2164,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return GGML_STATUS_FAILED;
     }
     const bool live_replace_requested = live_shadow_requested && live_mode == "REPLACE";
+    // Explicit first-prefill hybrid: producer-time SP Attention REPLACE,
+    // then the existing Galaxy2 token-sharded FFN graph transitions.
+    // This does not alter one-token Decode or enable SP KV history.
+    const char * hybrid_raw = std::getenv("LLAMA_GALAXY_CAUSAL_HYBRID_FFN");
+    const bool live_hybrid_ffn_requested = hybrid_raw &&
+            hybrid_raw[0] == '1' && hybrid_raw[1] == '\0';
     const auto selected_layer = [&](const char * name, const char * stem) -> int {
         return live_plan.match_boundary(name,stem);
     };
@@ -2351,8 +2357,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         GGML_LOG_ERROR("[GALAXY_SP] graph transitions need exactly two Meta backends\n");
         return GGML_STATUS_FAILED;
     }
-    if (live_shadow_requested && has_galaxy_markers) {
-        GGML_LOG_ERROR("[GALAXY_CAUSAL_LIVE] v1 shadow requires pure TP Attention (no SP markers)\n");
+    if (live_hybrid_ffn_requested) {
+        const char * galaxy2_raw = std::getenv("LLAMA_GALAXY2");
+        const bool galaxy2 = galaxy2_raw && std::strcmp(galaxy2_raw, "1") == 0;
+        const char * sp_raw = std::getenv("LLAMA_GALAXY_SP");
+        const bool galaxy_sp = sp_raw && std::strcmp(sp_raw, "1") == 0;
+        if (!live_replace_requested || !galaxy2 || !galaxy_sp || n_backends != 2) {
+            GGML_LOG_ERROR("[GALAXY_CAUSAL_HYBRID_FFN] invalid config: requires REPLACE+Galaxy2 SP on two ranks\n");
+            return GGML_STATUS_FAILED;
+        }
+    }
+    if (live_shadow_requested && has_galaxy_markers && !live_hybrid_ffn_requested) {
+        GGML_LOG_ERROR("[GALAXY_CAUSAL_LIVE] SP markers require explicit hybrid FFN opt-in\n");
         return GGML_STATUS_FAILED;
     }
     if (qkv_capture_enabled && n_backends != 2) {
@@ -2802,6 +2818,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     size_t galaxy_ag_count = 0;
     size_t galaxy_scatter_count = 0;
     size_t galaxy_ar_count = 0;
+    // Count successful (executed) Galaxy markers, not just graph nodes.
+    std::set<int> hybrid_attention_rs;
+    std::set<int> hybrid_residual_scatter;
+    std::set<int> hybrid_ffn_ag;
+    std::set<int> hybrid_attn_ag;
+    std::set<int> hybrid_ffn_rs;
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         const size_t i_start = backend_ctx->backend_configs[0].cgraphs[i].offset;
         const size_t i_stop = i + 1 < backend_ctx->n_subgraphs
@@ -3287,6 +3309,20 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             } catch (const std::exception & e) {
                 GGML_LOG_ERROR("[GALAXY_SP] %s failed: %s\n", original_last->name, e.what());
                 return GGML_STATUS_FAILED;
+            }
+            if (live_hybrid_ffn_requested) {
+                const auto mark_executed = [&](const char * prefix, std::set<int> & output) {
+                    const size_t n = std::strlen(prefix);
+                    if (std::strncmp(original_last->name, prefix, n) != 0) return;
+                    const std::string suffix(original_last->name + n);
+                    if (suffix.empty() || suffix.find_first_not_of("0123456789") != std::string::npos) return;
+                    output.insert(std::stoi(suffix));
+                };
+                mark_executed("GALAXY_RS_ATT_", hybrid_attention_rs);
+                mark_executed("GALAXY_SCATTER_RESID_", hybrid_residual_scatter);
+                mark_executed("GALAXY_AG_FFN_", hybrid_ffn_ag);
+                mark_executed("GALAXY_AG_ATT_", hybrid_attn_ag);
+                mark_executed("GALAXY_RS_FFN_", hybrid_ffn_rs);
             }
             if (trace) {
                 GGML_LOG_INFO("[GALAXY_META_TRACE] event=COLLECTIVE_END idx=%zu kind=%d tensor=%s\n",
@@ -3881,6 +3917,41 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     completed,live_plan.layers.size());
         }
         if(completed>0) std::fflush(stderr);
+    }
+    if (live_hybrid_ffn_requested && !hybrid_attention_rs.empty()) {
+        size_t attention_replaced = 0;
+        for (const int layer : live_plan.layers) {
+            const auto it = live_states.find(layer);
+            if (it != live_states.end() && it->second.verified) ++attention_replaced;
+        }
+        // This 2-token warmup may carry FFN markers but has no native SP
+        // Attention replacements; do not emit the prefill witness for it.
+        if (attention_replaced != 0) {
+            if (attention_replaced != live_plan.layers.size() ||
+                    hybrid_attention_rs != hybrid_residual_scatter ||
+                    hybrid_attention_rs != hybrid_ffn_ag ||
+                    hybrid_attn_ag != hybrid_ffn_rs) {
+                GGML_LOG_ERROR("[GALAXY_CAUSAL_HYBRID_FFN_SUM] status=FAIL reason=MARKER_OR_REPLACE_COVERAGE\n");
+                return GGML_STATUS_FAILED;
+            }
+            size_t sp_ffn = 0;
+            for (const int layer : hybrid_attention_rs) {
+                if (!hybrid_attn_ag.count(layer)) ++sp_ffn;
+            }
+            if (sp_ffn == 0) {
+                GGML_LOG_ERROR("[GALAXY_CAUSAL_HYBRID_FFN_SUM] status=FAIL reason=NO_SP_FFN_EXECUTED\n");
+                return GGML_STATUS_FAILED;
+            }
+            std::fprintf(stderr,
+                    "[GALAXY_CAUSAL_HYBRID_FFN_SUM] mode=REPLACE"
+                    " attention_replaced=%zu attention_rs=%zu"
+                    " residual_scatter=%zu ffn_sp_layers=%zu ffn_tp_layers=%zu"
+                    " final_all_gather=%zu status=PASS\n",
+                    attention_replaced, hybrid_attention_rs.size(),
+                    hybrid_residual_scatter.size(), sp_ffn,
+                    hybrid_attn_ag.size(), hybrid_ffn_ag.size());
+            std::fflush(stderr);
+        }
     }
     if (has_galaxy_markers) {
         // A required correctness witness, not a verbose debug message.
