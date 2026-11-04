@@ -5,9 +5,11 @@
 // read exactly the same environment and therefore pin/execute the same
 // model layers. Never enable all layers or silently accept sparse sets.
 //
-// Rollout order: 1 -> 2 -> 4 consecutive leading layers. Later, once
-// single-layer REPLACE has independently passed full-logits parity, enable
-// the next prefix size explicitly. Unset by default.
+// Rollout order: 1 -> 2 -> 4 -> 8 -> 16 -> 28 consecutive leading
+// layers (Llama-3.2-3B has 28 layers). This selection means execution
+// coverage only: it does NOT assert TP/SP numerical equivalence. Any
+// model with fewer than the selected prefix must fail the graph-wide
+// per-layer completeness contract. Unset by default.
 
 #include <cstdlib>
 #include <cstdint>
@@ -65,12 +67,22 @@ inline plan parse(const char * legacy_layer, const char * prefix_layers) {
         return result;
     }
     if (prefix) {
+        // Decimal only, exact supported prefixes, no sparse selection,
+        // leading zeros or accidental "all" activation. These sizes
+        // deliberately correspond to staged experiments on 28-layer Llama.
         const std::string count(prefix_layers);
-        if (count=="1") result.layers={0};
-        else if (count=="2") result.layers={0,1};
-        else if (count=="4") result.layers={0,1,2,3};
-        else {
-            result.error="causal SP prefix must be 1, 2, or 4 leading layers";
+        int n = 0;
+        if (count=="1") n=1;
+        else if (count=="2") n=2;
+        else if (count=="4") n=4;
+        else if (count=="8") n=8;
+        else if (count=="16") n=16;
+        else if (count=="28") n=28;
+        if (n==0) {
+            result.error="causal SP prefix must be one of 1,2,4,8,16,28 leading layers";
+        } else {
+            result.layers.reserve(static_cast<size_t>(n));
+            for (int il=0;il<n;++il) result.layers.push_back(il);
         }
     }
     return result;
