@@ -2172,7 +2172,8 @@ NOTE: The new 8/16/28-layer paths are committed and statically
 inspected but are NOT yet compiled or tested on the user's real
 Windows CUDA + Android RPC pair. Larger prefixes can exhaust pinned
 device buffers or encounter backend graph allocation limits.
-No mobile-server changes are required.
+The earlier prefix-runner changes required no mobile-server update.
+The newer RPC cache lifetime fix below requires rebuilding the Phone RPC server.
 
 
 ### RPC Graph lifetime safety (PC + Phone, causal Attention)
@@ -2180,3 +2181,12 @@ No mobile-server changes are required.
 Temporary Galaxy Attention graphs allocate and free new RPC buffers per layer. The RPC cache now fingerprints the serialized graph plus *buffer allocation generations*, not only reusable GGML arena pointers; the client drops cached UIDs when their buffers are freed. The RPC server evicts all graphs referencing a buffer **before** freeing it. Normal TP graphs with unchanged live buffers still use `GRAPH_RECOMPUTE`.
 
 **Upgrade and rebuild both PC and Phone RPC binaries** for the complete cache cleanup. The old `-DisableRpcGraphReuse` option remains available for A/B debugging, but it should no longer be needed for routine multi-layer testing. To verify, run `run_galaxy_causal_prefix_stages.ps1 -Common $common -MaxPrefix 8 -IncludeReplace -ContinueOnLogitsMismatch -Trace` (without disabling reuse), then check the log: normal TP graphs may use `GRAPH_RECOMPUTE`, while newly allocated transient Attention graphs should have distinct UIDs and full `GRAPH_COMPUTE` commands. Log lines tagged `[RPC_GRAPH_CACHE]` report buffer-triggered eviction in verbose logs.
+
+Run the post-run trace checker against SHADOW-8's stderr.log:
+
+```powershell
+.\\tools\\galaxy\\check_galaxy_rpc_graph_lifetime.ps1 -LogPath $shadow8Log -RequireNormalReuse
+```
+
+The checker requires two or more fresh 7-node/11-tensor native Attention graphs, forbids duplicate temporary graph UIDs or recomputation of those graphs, and checks that ordinary graph reuse is still present. Supply the full `stderr.log` path in `$shadow8Log`. The test does **not** establish numerical parity; REPLACE logits remain a separate check.
+
