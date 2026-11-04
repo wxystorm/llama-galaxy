@@ -1,4 +1,7 @@
 add_executable(galaxy-tp-selftest galaxy-tp-selftest.cpp)
+# llama-galaxy-tp.h includes ggml-backend-galaxy-causal-layers.h.
+# This standalone target does not inherit ggml/include from ggml.
+target_include_directories(galaxy-tp-selftest PRIVATE ${CMAKE_SOURCE_DIR}/ggml/include)
 target_compile_features(galaxy-tp-selftest PRIVATE cxx_std_17)
 
 # Standalone TP/SP collective correctness tests; no inference graph changes.
