@@ -69,6 +69,20 @@ int main() {
     }
     require_test(llama_galaxy_tp::galaxy2_parse_layer_set("27", 28)[27] == 1,
             "Galaxy2 optional final FFN layer");
+    // Llama3.2-3B full Prefill: all 28 FFN weights must be mirrored,
+    // including last layer 27. The legacy shortcut keeps only 27 eligible.
+    const auto llama_full_ffn = llama_galaxy_tp::galaxy2_resolve_ffn_sp_mask(
+            "0-27", nullptr, llama_galaxy_tp::galaxy2_eligible_ffn_layers(28, true));
+    const auto llama_short_ffn = llama_galaxy_tp::galaxy2_resolve_ffn_sp_mask(
+            "0-26", nullptr, llama_galaxy_tp::galaxy2_eligible_ffn_layers(28, false));
+    require_test(llama_full_ffn.size() == 28 && llama_short_ffn.size() == 27,
+            "Llama3.2 full/legacy eligible FFN counts");
+    for (int il = 0; il < 28; ++il) {
+        require_test(llama_full_ffn[static_cast<size_t>(il)] == 1,
+                "Llama3.2 all 28 FFN-SP layers selected");
+    }
+    require_test(llama_short_ffn[26] == 1, "legacy Llama3.2 still selects 27 FFN-SP layers");
+    must_throw([] { (void) llama_galaxy_tp::galaxy2_resolve_ffn_sp_mask("0-27", nullptr, 27); });
     must_throw([] { (void) llama_galaxy_tp::galaxy2_parse_layer_set("27", 27); });
     must_throw([] { (void) llama_galaxy_tp::galaxy2_parse_layer_set("", 27); });
     must_throw([] { (void) llama_galaxy_tp::galaxy2_parse_layer_set(nullptr, 27); });

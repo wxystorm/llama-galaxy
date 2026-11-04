@@ -70,9 +70,12 @@ if ($liveEnabled -and -not $PureTP -and -not $CausalHybridFfnSp) {
     throw "Causal live SP Attention requires -PureTP or -CausalHybridFfnSp"
 }
 if ($CausalHybridFfnSp -and ($PureTP -or -not $Galaxy2 -or -not $LiveCausalReplace -or
-        $LiveCausalPrefixLayers -le 0 -or $FinalLayerSP -or -not $Galaxy2FfnSpLayerSet -or
+        $LiveCausalPrefixLayers -le 0 -or -not $Galaxy2FfnSpLayerSet -or
         $Galaxy2FfnSpLayerSet -eq "none")) {
-    throw "CausalHybridFfnSp requires -Galaxy2 -LiveCausalReplace -LiveCausalPrefixLayers N and a nonempty Galaxy2FfnSpLayerSet (not none); no -PureTP or -FinalLayerSP"
+    throw "CausalHybridFfnSp requires -Galaxy2 -LiveCausalReplace -LiveCausalPrefixLayers N and a nonempty Galaxy2FfnSpLayerSet (not none); no -PureTP"
+}
+if ($CausalHybridFfnSp -and $FinalLayerSP -and $LiveCausalPrefixLayers -ne 28) {
+    throw "Hybrid FinalLayerSP requires the full 28-layer Causal REPLACE prefix"
 }
 if ($LiveCausalReplace -and -not $liveEnabled) {
     throw "LiveCausalReplace requires LiveCausalLayer 0 or LiveCausalPrefixLayers 1/2/4/8/16/28"

@@ -2170,6 +2170,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     const char * hybrid_raw = std::getenv("LLAMA_GALAXY_CAUSAL_HYBRID_FFN");
     const bool live_hybrid_ffn_requested = hybrid_raw &&
             hybrid_raw[0] == '1' && hybrid_raw[1] == '\0';
+    const char * final_sp_raw = std::getenv("LLAMA_GALAXY_SP_FINAL_LAYER");
+    const bool live_hybrid_final_sp_requested = live_hybrid_ffn_requested &&
+            final_sp_raw && std::strcmp(final_sp_raw, "1") == 0;
     const auto selected_layer = [&](const char * name, const char * stem) -> int {
         return live_plan.match_boundary(name,stem);
     };
@@ -2364,6 +2367,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         const bool galaxy_sp = sp_raw && std::strcmp(sp_raw, "1") == 0;
         if (!live_replace_requested || !galaxy2 || !galaxy_sp || n_backends != 2) {
             GGML_LOG_ERROR("[GALAXY_CAUSAL_HYBRID_FFN] invalid config: requires REPLACE+Galaxy2 SP on two ranks\n");
+            return GGML_STATUS_FAILED;
+        }
+        if (live_hybrid_final_sp_requested && live_plan.layers.size() != 28) {
+            GGML_LOG_ERROR("[GALAXY_CAUSAL_HYBRID_FFN] final-layer SP requires the 28-layer Llama3.2 prefix\n");
             return GGML_STATUS_FAILED;
         }
     }
@@ -3971,14 +3978,49 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 GGML_LOG_ERROR("[GALAXY_CAUSAL_HYBRID_FFN_SUM] status=FAIL reason=NO_SP_FFN_EXECUTED\n");
                 return GGML_STATUS_FAILED;
             }
+            const bool last_ffn_sp = hybrid_attention_rs.count(27) &&
+                    hybrid_ffn_ag.count(27) && !hybrid_attn_ag.count(27) &&
+                    !hybrid_ffn_rs.count(27);
+            // In full-layer mode, prove that the output IDs are applied
+            // AFTER the final FFN's AllGather. A flag alone is not evidence.
+            bool deferred_output_select = false;
+            if (live_hybrid_final_sp_requested) {
+                int last_gather_node = -1;
+                int output_select_node = -1;
+                for (int node_id = 0; node_id < cgraph->n_nodes; ++node_id) {
+                    const ggml_tensor * node = cgraph->nodes[node_id];
+                    if (ggml_galaxy::get_stage(node) == ggml_galaxy::sp_stage::ffn_output_ag &&
+                            ggml_galaxy::get_stage_layer(node) == 27) {
+                        last_gather_node = node_id;
+                    }
+                    if (node->op == GGML_OP_GET_ROWS &&
+                            std::strcmp(node->name, "galaxy_final_out_ids") == 0) {
+                        output_select_node = node_id;
+                    }
+                }
+                deferred_output_select = last_gather_node >= 0 &&
+                        output_select_node > last_gather_node;
+                if (!last_ffn_sp || !deferred_output_select ||
+                        !hybrid_residual_scatter.count(27) ||
+                        !hybrid_attention_rs.count(27)) {
+                    GGML_LOG_ERROR("[GALAXY_CAUSAL_HYBRID_FFN_SUM] status=FAIL"
+                            " reason=FINAL_LAYER_CONTRACT"
+                            " last_ffn_sp=%d gather_node=%d output_select_node=%d\n",
+                            int(last_ffn_sp), last_gather_node, output_select_node);
+                    return GGML_STATUS_FAILED;
+                }
+            }
             std::fprintf(stderr,
                     "[GALAXY_CAUSAL_HYBRID_FFN_SUM] mode=REPLACE"
                     " attention_replaced=%zu attention_rs=%zu"
                     " residual_scatter=%zu ffn_sp_layers=%zu ffn_tp_layers=%zu"
-                    " final_all_gather=%zu status=PASS\n",
+                    " final_all_gather=%zu final_layer_sp=%d final_ffn_sp=%d"
+                    " deferred_output_select=%d status=PASS\n",
                     attention_replaced, hybrid_attention_rs.size(),
                     hybrid_residual_scatter.size(), sp_ffn,
-                    hybrid_attn_ag.size(), hybrid_ffn_ag.size());
+                    hybrid_attn_ag.size(), hybrid_ffn_ag.size(),
+                    int(live_hybrid_final_sp_requested), int(last_ffn_sp),
+                    int(deferred_output_select));
             std::fflush(stderr);
         }
     }

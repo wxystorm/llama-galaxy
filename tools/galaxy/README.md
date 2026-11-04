@@ -2214,3 +2214,30 @@ After executing 8-layer SP Attention + one real FFN-SP layer, try `-AttentionPre
 The first 8-layer native Attention REPLACE + Galaxy2 FFN-SP run completed all eight Attention stages, but the new Hybrid coverage check rejected it. The last FFN AllGather marker was renamed by the Llama output callback (e.g. `GALAXY_AG_FFN_0` -> `ffn_out-0` or `l_out-0`), while the coverage counter incorrectly counted marker **names**. The runtime already dispatches markers based on `op_params`, not names.
 
 The Llama SP graph now also attaches a stable semantic stage ID and layer number to each Collective marker; the Meta Hybrid accounting uses this ID after successful Collective execution. The strict equality checks remain in place, and failures print the exact layer sets in `[GALAXY_CAUSAL_HYBRID_FFN_COVERAGE]`. `galaxy-collectives-selftest` checks marker identity survives callback renaming. This fixes the false-negative validation without hiding missing FFN work. Rebuild PC `llama-cli` and `galaxy-collectives-selftest`, then run the same hybrid command. Phone RPC server code is unchanged.
+
+
+### Full Llama3.2 28-layer Hybrid Prefill (2026-11-05)
+
+The existing Llama graph already supports `LLAMA_GALAXY_SP_FINAL_LAYER=1`: it keeps the last Attention/FFN on the full Prefill sequence, executes `GALAXY_AG_FFN_27`, then applies `galaxy_final_out_ids` to the now-mirrored output. This option is now explicitly supported by the native Attention REPLACE + Galaxy2 FFN-SP hybrid runner. It is still **first-prefill only**: one-token Decode continues to use TP and there is no historical SP KV continuation.
+
+Rebuild **PC only** (no Phone server change for this step):
+
+```powershell
+git pull --ff-only origin feat/galaxy-baseline
+cmake --build build-galaxy --config Release --target llama-cli galaxy-tp-selftest -j 8
+.\build-galaxy\bin\Release\galaxy-tp-selftest.exe
+```
+
+Suggested progression, keeping `$common` fixed:
+
+```powershell
+.\tools\galaxy\run_galaxy_causal_hybrid_ffn.ps1 -Common $common -AttentionPrefix 28 -FfnSpLayerSet "0-7"
+.\tools\galaxy\run_galaxy_causal_hybrid_ffn.ps1 -Common $common -AttentionPrefix 28 -FfnSpLayerSet "0-26"
+.\tools\galaxy\run_galaxy_causal_hybrid_ffn.ps1 -Common $common -AttentionPrefix 28 -FfnSpLayerSet "all" -FinalLayerSP -Trace
+```
+
+`all` means every eligible FFN layer **within the selected Attention prefix**, expanded to an explicit set for model weight placement and graph planning. With `AttentionPrefix=28 -FinalLayerSP`, that resolves to `0-27`; without `-FinalLayerSP`, it resolves to `0-26`. Attempting `-FinalLayerSP` with fewer than 28 Attention layers or without FFN layer 27 is rejected before model loading.
+
+The end-to-end execution witness now requires `final_layer_sp=1 final_ffn_sp=1 deferred_output_select=1`, and the Meta backend verifies that L27's FFN AllGather occurred and its graph node precedes the final `GET_ROWS` selection. The runner records the validated execution summary in `manifest.json`. Numerical comparisons are intentionally not performed. Fully mirrored 28-layer FFN weights consume more memory on the Phone: if loading fails, first run the 0-7 and 0-26 progressions instead of mislabeling an OOM as an Attention failure.
+
+This reaches the full model depth for **native causal SP Attention + Galaxy2 FFN-SP within a hybrid TP/W_o boundary**; it is not source-complete pure SP Attention, does not change Q/K/V projection ownership, and does not introduce SP Decode.
