@@ -27,6 +27,20 @@ enum class sp_transition : int32_t {
     all_gather       = 3,
 };
 
+// Stable graph-stage identity. The normal llama callback may overwrite a
+// transition tensor's name (e.g. GALAXY_AG_FFN_0 becomes l_out-0), so
+// execution witnesses must not rely on the tensor's displayed name.
+enum class sp_stage : int32_t {
+    none             = 0,
+    attention_rs     = 1,
+    residual_scatter = 2,
+    ffn_input_ag     = 3,
+    ffn_output_rs    = 4,
+    ffn_output_ag    = 5,
+};
+constexpr int32_t stage_magic = 0x47535032; // GSP2
+
+
 constexpr int32_t marker_magic = 0x47535031; // ASCII "GSP1"
 
 // Source Galaxy-LM offers per-rank seq_scatter_list such as [20,12].
@@ -101,6 +115,46 @@ inline sp_transition get_transition(const ggml_tensor * tensor) {
         case 3: return sp_transition::all_gather;
         default: return sp_transition::none;
     }
+}
+
+// Stage identity is additional metadata; older graph transitions without it
+// continue to work. Llama's opt-in hybrid mode requires it for strict
+// coverage accounting, even after an output callback renames the tensor.
+inline void set_stage(ggml_tensor * tensor, sp_stage stage, int32_t layer) {
+    const sp_transition transition = get_transition(tensor);
+    const bool compatible =
+        (transition == sp_transition::reduce_scatter &&
+            (stage == sp_stage::attention_rs || stage == sp_stage::ffn_output_rs)) ||
+        (transition == sp_transition::scatter_mirrored && stage == sp_stage::residual_scatter) ||
+        (transition == sp_transition::all_gather &&
+            (stage == sp_stage::ffn_input_ag || stage == sp_stage::ffn_output_ag));
+    if (!compatible || layer < 0) {
+        throw std::invalid_argument("Galaxy stage identity requires a compatible transition and nonnegative layer");
+    }
+    tensor->op_params[2] = stage_magic;
+    tensor->op_params[3] = static_cast<int32_t>(stage);
+    tensor->op_params[4] = layer;
+}
+
+inline sp_stage get_stage(const ggml_tensor * tensor) {
+    if (get_transition(tensor) == sp_transition::none || tensor->op_params[2] != stage_magic) {
+        return sp_stage::none;
+    }
+    const auto stage = static_cast<sp_stage>(tensor->op_params[3]);
+    switch (stage) {
+        case sp_stage::attention_rs:
+        case sp_stage::residual_scatter:
+        case sp_stage::ffn_input_ag:
+        case sp_stage::ffn_output_rs:
+        case sp_stage::ffn_output_ag:
+            return stage;
+        default:
+            return sp_stage::none;
+    }
+}
+
+inline int32_t get_stage_layer(const ggml_tensor * tensor) {
+    return get_stage(tensor) != sp_stage::none ? tensor->op_params[4] : -1;
 }
 
 } // namespace ggml_galaxy

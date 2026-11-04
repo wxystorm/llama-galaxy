@@ -201,6 +201,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
             // Attention output is TP_PARTIAL; RS materializes local SP tokens.
             cur = ggml_dup(ctx0, cur);
             ggml_galaxy::mark_transition(cur, ggml_galaxy::sp_transition::reduce_scatter);
+            ggml_galaxy::set_stage(cur, ggml_galaxy::sp_stage::attention_rs, il);
             ggml_format_name(cur, "GALAXY_RS_ATT_%d", il);
         }
         if (il == n_layer - 1 && inp_out_ids && !galaxy_sp_final) {
@@ -212,6 +213,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
             // Match Attention RS token ownership for the residual add.
             residual_attn = ggml_dup(ctx0, inpSA);
             ggml_galaxy::mark_transition(residual_attn, ggml_galaxy::sp_transition::scatter_mirrored);
+            ggml_galaxy::set_stage(residual_attn, ggml_galaxy::sp_stage::residual_scatter, il);
             ggml_format_name(residual_attn, "GALAXY_SCATTER_RESID_%d", il);
         }
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, residual_attn);
@@ -242,6 +244,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                 // Galaxy2 instead processes local tokens with full FFN weights.
                 cur = ggml_dup(ctx0, cur);
                 ggml_galaxy::mark_transition(cur, ggml_galaxy::sp_transition::all_gather);
+                ggml_galaxy::set_stage(cur, ggml_galaxy::sp_stage::ffn_input_ag, il);
                 ggml_format_name(cur, "GALAXY_AG_ATT_%d", il);
             }
 
@@ -281,6 +284,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
             // FFN TP partial -> SP local tokens for Connection 2.
             cur = ggml_dup(ctx0, cur);
             ggml_galaxy::mark_transition(cur, ggml_galaxy::sp_transition::reduce_scatter);
+            ggml_galaxy::set_stage(cur, ggml_galaxy::sp_stage::ffn_output_rs, il);
             ggml_format_name(cur, "GALAXY_RS_FFN_%d", il);
         }
         cur = ggml_add(ctx0, cur, ffn_inp);
@@ -288,6 +292,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
             // Next Attention is TP; restore the full hidden sequence.
             cur = ggml_dup(ctx0, cur);
             ggml_galaxy::mark_transition(cur, ggml_galaxy::sp_transition::all_gather);
+            ggml_galaxy::set_stage(cur, ggml_galaxy::sp_stage::ffn_output_ag, il);
             ggml_format_name(cur, "GALAXY_AG_FFN_%d", il);
         }
         cb(cur, "ffn_out", il);

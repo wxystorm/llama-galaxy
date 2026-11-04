@@ -3311,18 +3311,25 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 return GGML_STATUS_FAILED;
             }
             if (live_hybrid_ffn_requested) {
-                const auto mark_executed = [&](const char * prefix, std::set<int> & output) {
-                    const size_t n = std::strlen(prefix);
-                    if (std::strncmp(original_last->name, prefix, n) != 0) return;
-                    const std::string suffix(original_last->name + n);
-                    if (suffix.empty() || suffix.find_first_not_of("0123456789") != std::string::npos) return;
-                    output.insert(std::stoi(suffix));
-                };
-                mark_executed("GALAXY_RS_ATT_", hybrid_attention_rs);
-                mark_executed("GALAXY_SCATTER_RESID_", hybrid_residual_scatter);
-                mark_executed("GALAXY_AG_FFN_", hybrid_ffn_ag);
-                mark_executed("GALAXY_AG_ATT_", hybrid_attn_ag);
-                mark_executed("GALAXY_RS_FFN_", hybrid_ffn_rs);
+                // The callback can rename GALAXY_AG_FFN_N to ffn_out-N or
+                // l_out-N. Stage and layer are encoded in stable op_params.
+                const auto stage = ggml_galaxy::get_stage(original_last);
+                const int layer = ggml_galaxy::get_stage_layer(original_last);
+                std::set<int> * executed = nullptr;
+                switch (stage) {
+                    case ggml_galaxy::sp_stage::attention_rs:     executed = &hybrid_attention_rs;       break;
+                    case ggml_galaxy::sp_stage::residual_scatter: executed = &hybrid_residual_scatter;   break;
+                    case ggml_galaxy::sp_stage::ffn_input_ag:    executed = &hybrid_attn_ag;           break;
+                    case ggml_galaxy::sp_stage::ffn_output_rs:   executed = &hybrid_ffn_rs;            break;
+                    case ggml_galaxy::sp_stage::ffn_output_ag:   executed = &hybrid_ffn_ag;            break;
+                    default: break;
+                }
+                if (!executed || layer < 0 || !executed->insert(layer).second) {
+                    GGML_LOG_ERROR("[GALAXY_CAUSAL_HYBRID_FFN] status=FAIL"
+                            " reason=INVALID_OR_DUPLICATE_STAGE marker=%s stage=%d layer=%d\n",
+                            original_last->name, int(stage), layer);
+                    return GGML_STATUS_FAILED;
+                }
             }
             if (trace) {
                 GGML_LOG_INFO("[GALAXY_META_TRACE] event=COLLECTIVE_END idx=%zu kind=%d tensor=%s\n",
@@ -3931,6 +3938,28 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     hybrid_attention_rs != hybrid_residual_scatter ||
                     hybrid_attention_rs != hybrid_ffn_ag ||
                     hybrid_attn_ag != hybrid_ffn_rs) {
+                // Emit the actual executed layer sets to distinguish a
+                // broken collective path from a bad stage identity.
+                const auto list_layers = [](const std::set<int> & values) {
+                    std::string result;
+                    for (const int layer : values) {
+                        if (!result.empty()) result += ',';
+                        result += std::to_string(layer);
+                    }
+                    return result.empty() ? std::string("NONE") : result;
+                };
+                std::fprintf(stderr,
+                        "[GALAXY_CAUSAL_HYBRID_FFN_COVERAGE]"
+                        " replaced=%zu expected=%zu"
+                        " attention_rs=%s residual_scatter=%s"
+                        " ffn_output_ag=%s ffn_input_ag=%s ffn_output_rs=%s\n",
+                        attention_replaced, live_plan.layers.size(),
+                        list_layers(hybrid_attention_rs).c_str(),
+                        list_layers(hybrid_residual_scatter).c_str(),
+                        list_layers(hybrid_ffn_ag).c_str(),
+                        list_layers(hybrid_attn_ag).c_str(),
+                        list_layers(hybrid_ffn_rs).c_str());
+                std::fflush(stderr);
                 GGML_LOG_ERROR("[GALAXY_CAUSAL_HYBRID_FFN_SUM] status=FAIL reason=MARKER_OR_REPLACE_COVERAGE\n");
                 return GGML_STATUS_FAILED;
             }

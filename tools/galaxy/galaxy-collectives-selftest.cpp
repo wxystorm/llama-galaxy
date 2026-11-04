@@ -97,21 +97,36 @@ static void verify_marker_identity_survives_callback_rename() {
     ggml_tensor * allgather = ggml_dup(ctx, src);
     ggml_galaxy::mark_transition(allgather, ggml_galaxy::sp_transition::all_gather);
     ggml_format_name(allgather, "GALAXY_AG_FFN_%d", 0);
+    ggml_galaxy::set_stage(allgather, ggml_galaxy::sp_stage::ffn_output_ag, 0);
     ggml_format_name(allgather, "l_out-%d", 0); // matches graph_get_cb()
     require_test(ggml_galaxy::get_transition(allgather) == ggml_galaxy::sp_transition::all_gather,
                  "renaming the layer output must not erase an AllGather marker");
+    require_test(ggml_galaxy::get_stage(allgather) == ggml_galaxy::sp_stage::ffn_output_ag &&
+                 ggml_galaxy::get_stage_layer(allgather) == 0,
+                 "renamed final FFN AllGather must retain stage/layer identity");
+    require_test(ggml_galaxy::get_stage(plain) == ggml_galaxy::sp_stage::none,
+                 "plain renamed tensor must never masquerade as a staged collective");
 
     ggml_tensor * rs = ggml_dup(ctx, src);
     ggml_galaxy::mark_transition(rs, ggml_galaxy::sp_transition::reduce_scatter);
+    ggml_galaxy::set_stage(rs, ggml_galaxy::sp_stage::attention_rs, 7);
     ggml_set_name(rs, "renamed-rs");
-    require_test(ggml_galaxy::get_transition(rs) == ggml_galaxy::sp_transition::reduce_scatter,
-                 "renaming must preserve ReduceScatter");
+    require_test(ggml_galaxy::get_transition(rs) == ggml_galaxy::sp_transition::reduce_scatter &&
+                 ggml_galaxy::get_stage(rs) == ggml_galaxy::sp_stage::attention_rs &&
+                 ggml_galaxy::get_stage_layer(rs) == 7,
+                 "renaming must preserve attention ReduceScatter identity");
+    expect_reject([&] {
+        ggml_galaxy::set_stage(rs, ggml_galaxy::sp_stage::ffn_output_ag, 7);
+    }, "cannot tag a ReduceScatter as an AllGather");
 
     ggml_tensor * scatter = ggml_dup(ctx, src);
     ggml_galaxy::mark_transition(scatter, ggml_galaxy::sp_transition::scatter_mirrored);
+    ggml_galaxy::set_stage(scatter, ggml_galaxy::sp_stage::residual_scatter, 7);
     ggml_set_name(scatter, "renamed-residual");
-    require_test(ggml_galaxy::get_transition(scatter) == ggml_galaxy::sp_transition::scatter_mirrored,
-                 "renaming must preserve Residual Scatter");
+    require_test(ggml_galaxy::get_transition(scatter) == ggml_galaxy::sp_transition::scatter_mirrored &&
+                 ggml_galaxy::get_stage(scatter) == ggml_galaxy::sp_stage::residual_scatter &&
+                 ggml_galaxy::get_stage_layer(scatter) == 7,
+                 "renaming must preserve Residual Scatter identity");
 
     expect_reject([&] {
         ggml_galaxy::mark_transition(src, ggml_galaxy::sp_transition::all_gather);

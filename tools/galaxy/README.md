@@ -2207,3 +2207,10 @@ Build and run with the existing Llama 3.2 3B PC/Phone configuration. The RPC pro
 ```
 
 After executing 8-layer SP Attention + one real FFN-SP layer, try `-AttentionPrefix 28 -FfnSpLayerSet "0-7"`, then (if memory permits) `-FfnSpLayerSet "0-26"`. The runner **does not compare logits**; it checks per-rank Flash skip/consumption, the executed Galaxy collectives and selected SP-FFN count, then writes a manifest with `numerical_parity=NOT_EVALUATED`.
+
+
+### Hybrid FFN marker coverage correction (2026-11-05)
+
+The first 8-layer native Attention REPLACE + Galaxy2 FFN-SP run completed all eight Attention stages, but the new Hybrid coverage check rejected it. The last FFN AllGather marker was renamed by the Llama output callback (e.g. `GALAXY_AG_FFN_0` -> `ffn_out-0` or `l_out-0`), while the coverage counter incorrectly counted marker **names**. The runtime already dispatches markers based on `op_params`, not names.
+
+The Llama SP graph now also attaches a stable semantic stage ID and layer number to each Collective marker; the Meta Hybrid accounting uses this ID after successful Collective execution. The strict equality checks remain in place, and failures print the exact layer sets in `[GALAXY_CAUSAL_HYBRID_FFN_COVERAGE]`. `galaxy-collectives-selftest` checks marker identity survives callback renaming. This fixes the false-negative validation without hiding missing FFN work. Rebuild PC `llama-cli` and `galaxy-collectives-selftest`, then run the same hybrid command. Phone RPC server code is unchanged.
