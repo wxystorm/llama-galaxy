@@ -127,6 +127,11 @@ function Invoke-Prefix([int]$count, [bool]$replace) {
     $run = Latest-Run $stageParams["OutputDir"]
     $candidate = Join-Path $run.FullName "first_logits.f32"
     $json = Join-Path $run.FullName "logits-to-tp.json"
+    # PS 7 can be configured to throw on nonzero native exit codes.
+    # Comparator exit=2 is an EXPECTED observed numerical mismatch,
+    # so inspect its exit code/JSON explicitly instead of treating it
+    # as a command-launch failure. Other errors still fail below.
+    $PSNativeCommandUseErrorActionPreference = $false
     & $compare --tp $tpLogits --sp $candidate --max-abs $MaxAbs --max-rmse $MaxRmse --json $json
     $compareExit = $LASTEXITCODE
     if (-not (Test-Path -LiteralPath $json)) {
