@@ -4,18 +4,19 @@
 
   Stage order (default): reference TP, SHADOW 1, SHADOW 2.
   With -IncludeReplace: TP, SHADOW 1, REPLACE 1, SHADOW 2, REPLACE 2...
-  -MaxPrefix 4 also includes SHADOW/REPLACE 4 after the 2-layer pass.
+  -MaxPrefix 8/16/28 also covers the larger model prefixes.
 
-  Every smoke MUST emit its own complete per-layer witness. Every stage
-  MUST also pass full first-token vocabulary logits comparison against
-  the SAME independent TP reference, or execution stops before the
-  following stage. No background work or implicit activation of REPLACE.
+  Every smoke MUST emit its own complete per-layer execution witness.
+  Strict logits parity is the default; explicit -ContinueOnLogitsMismatch
+  records numerical failures and continues observing larger prefixes.
+  Never call a failing logits comparison a PASS.
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory=$true)][System.Collections.IDictionary]$Common,
-    [ValidateSet(1,2,4)][int]$MaxPrefix = 2,
+    [ValidateSet(1,2,4,8,16,28)][int]$MaxPrefix = 2,
     [switch]$IncludeReplace,
+    [switch]$ContinueOnLogitsMismatch,
     [string]$OutputDir = ".\galaxy-sp-results\causal-prefix-staged",
     [double]$MaxAbs = 0.10,
     [double]$MaxRmse = 0.02
@@ -66,11 +67,15 @@ $shared["DumpStages"] = ""
 $shared["DumpFfnOps"] = ""
 
 $results = @()
+$timings = @()
+$driftCount = 0
 function Save-StageManifest {
     $manifest = [ordered]@{
         status = "IN_PROGRESS"
         max_prefix = $MaxPrefix
         include_replace = [bool]$IncludeReplace
+        continue_on_logits_mismatch = [bool]$ContinueOnLogitsMismatch
+        numerical_failures = $script:driftCount
         limits = @{ max_abs = $MaxAbs; max_rmse = $MaxRmse }
         model = [string]$shared["Model"]
         prompt = [string]$shared["PromptFile"]
@@ -123,22 +128,77 @@ function Invoke-Prefix([int]$count, [bool]$replace) {
     $candidate = Join-Path $run.FullName "first_logits.f32"
     $json = Join-Path $run.FullName "logits-to-tp.json"
     & $compare --tp $tpLogits --sp $candidate --max-abs $MaxAbs --max-rmse $MaxRmse --json $json
-    if ($LASTEXITCODE -ne 0) {
-        throw "Numerical parity FAILED for $name. Inspect $json and $($run.FullName)"
+    $compareExit = $LASTEXITCODE
+    if (-not (Test-Path -LiteralPath $json)) {
+        throw "Logits comparator did not produce a report for $name. Inspect $($run.FullName)"
     }
     $report = Get-Content -LiteralPath $json -Raw | ConvertFrom-Json
-    if ($report.status -ne "PASS") {
-        throw "Unverified logits parity for $name. Inspect $json"
+    $numericalPass = $compareExit -eq 0 -and $report.status -eq "PASS"
+    if (-not $numericalPass) {
+        # Only an explicit numeric comparison failure (exit 2) is
+        # eligible to continue. IO/parse/launch errors are always fatal.
+        if ($compareExit -ne 2 -or $report.status -ne "FAIL") {
+            throw "Logits comparator error for $name (exit=$compareExit). Inspect $json"
+        }
+        if (-not $ContinueOnLogitsMismatch) {
+            throw "Numerical parity FAILED for $name. Inspect $json and $($run.FullName)"
+        }
+        $script:driftCount++
+        Write-Warning "[GALAXY_PREFIX_STAGE] stage=$name numerical_parity=FAIL rmse=$($report.rmse) max_abs=$($report.max_abs) top1=$($report.sp_top1) continuing=EXPLICIT_OBSERVATION_ONLY"
     }
+
+    # Extract one timing row for EACH selected Attention layer from the
+    # real Meta execution; the smoke already checks both rank witnesses.
+    $liveLog = Join-Path $run.FullName "stderr.log"
+    $timedLayers = @{}
+    foreach ($line in (Get-Content -LiteralPath $liveLog)) {
+        if ($line -notmatch '^\[GALAXY_CAUSAL_LIVE\] layer=[0-9]+ tokens=[0-9]+ mode=(SHADOW|REPLACE)\b' -or
+                $line -notmatch '\btp_sp_ms=') { continue }
+        $fields = @{}
+        foreach ($matched in [regex]::Matches($line,'([A-Za-z_][A-Za-z_0-9]*)=([^\s]+)')) {
+            $fields[$matched.Groups[1].Value] = $matched.Groups[2].Value
+        }
+        if ($fields["mode"] -ne $mode) { continue }
+        $layer = [int]$fields["layer"]
+        if ($layer -lt 0 -or $layer -ge $count -or $timedLayers.ContainsKey($layer)) {
+            throw "Duplicate/unexpected layer timing in $liveLog: $line"
+        }
+        $timedLayers[$layer] = $true
+        $script:timings += [pscustomobject][ordered]@{
+            stage = $name
+            prefix_layers = $count
+            mode = $mode
+            layer = $layer
+            tokens = [int]$fields["tokens"]
+            tp_sp_ms = [double]::Parse($fields["tp_sp_ms"],[System.Globalization.CultureInfo]::InvariantCulture)
+            kv_gather_ms = [double]::Parse($fields["kv_gather_ms"],[System.Globalization.CultureInfo]::InvariantCulture)
+            native_ready_wall_ms = [double]::Parse($fields["native_ready_wall_ms"],[System.Globalization.CultureInfo]::InvariantCulture)
+            sp_tp_ms = [double]::Parse($fields["sp_tp_ms"],[System.Globalization.CultureInfo]::InvariantCulture)
+            logits_parity = [string]$report.status
+        }
+    }
+    if ($timedLayers.Count -ne $count) {
+        throw "Expected $count timed layers in $name, got $($timedLayers.Count): $liveLog"
+    }
+    $script:timings | Sort-Object prefix_layers, mode, layer |
+        Export-Csv -LiteralPath (Join-Path $root "per-layer-timings.csv") -NoTypeInformation -Encoding UTF8
+
+    $status = if ($numericalPass) { "PASS" } else { "EXECUTED_NUMERICAL_FAIL" }
     $script:results += [ordered]@{
-        name=$name; prefix=$count; mode=$mode;
-        dir=$run.FullName; comparison=$json; status="PASS"
+        name=$name; prefix=$count; mode=$mode
+        dir=$run.FullName; comparison=$json
+        numerical_parity=[string]$report.status
+        logits_rmse=[double]$report.rmse
+        logits_max_abs=[double]$report.max_abs
+        reference_top1=[int]$report.tp_top1
+        candidate_top1=[int]$report.sp_top1
+        status=$status
     }
     Save-StageManifest
-    Write-Host "[GALAXY_PREFIX_STAGE] stage=$name event=PASS comparison=$json"
+    Write-Host "[GALAXY_PREFIX_STAGE] stage=$name event=$status numerical_parity=$($report.status) comparison=$json"
 }
 
-foreach ($count in @(1,2,4)) {
+foreach ($count in @(1,2,4,8,16,28)) {
     if ($count -gt $MaxPrefix) { continue }
     Invoke-Prefix $count $false
     if ($IncludeReplace) { Invoke-Prefix $count $true }
@@ -146,7 +206,9 @@ foreach ($count in @(1,2,4)) {
 
 $manifestPath = Join-Path $root "manifest.json"
 $data = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-$data.status = "PASS"
+$finalStatus = if ($driftCount -gt 0) { "EXPERIMENTAL_NUMERICAL_DRIFT" } else { "PASS" }
+$data.status = $finalStatus
 $data | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
-Write-Host "[GALAXY_PREFIX_STAGE_SUM] stages=$($results.Count) max_prefix=$MaxPrefix replace=$([bool]$IncludeReplace) status=PASS"
+Write-Host "[GALAXY_PREFIX_STAGE_SUM] stages=$($results.Count) max_prefix=$MaxPrefix replace=$([bool]$IncludeReplace) numerical_failures=$driftCount status=$finalStatus"
 Write-Host "[GALAXY_PREFIX_STAGE_SUM] manifest=$manifestPath"
+Write-Host "[GALAXY_PREFIX_STAGE_SUM] per_layer_timings=$(Join-Path $root 'per-layer-timings.csv')"
