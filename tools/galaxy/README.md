@@ -2105,3 +2105,71 @@ or numerical comparison thresholds to make REPLACE appear to pass.
 
 The previous SHADOW results remain valid. Future multi-layer
 REPLACE is suspended until REPLACE-1 has independent logits parity.
+
+
+## Expanded causal SP Attention prefix exploration (2026-11-04)
+
+Llama-3.2-3B can now explicitly select the first 1, 2, 4, 8, 16,
+or 28 Attention layers using LiveCausalPrefixLayers. The old single
+LiveCausalLayer=0 remains compatible. These are exact leading-layer
+prefixes; sparse lists and arbitrary prefix sizes are rejected.
+28 layers are the entire Llama-3.2-3B Attention stack, not full SP
+FFN or SP Decode.
+
+The REAL 98-token REPLACE-1 result previously had byte-exact
+injection into pre-Wo but failed independent full-vocabulary logits
+parity: RMSE=0.133, MaxAbs=0.588, Top1 changed. This does NOT block
+an explicitly experimental execution-coverage study, but any such
+run MUST keep that failure visible. Never call it parity PASS.
+
+Policies:
+- DEFAULT: strict logits comparator; stop on numerical mismatch.
+- EXPERIMENTAL: -ContinueOnLogitsMismatch lets the staged runner
+  continue only when the logits comparator explicitly reports a
+  numerical mismatch (exit code 2). It still saves the numerical
+  failure to JSON and the manifest, labeled EXECUTED_NUMERICAL_FAIL.
+  Causal position errors, incomplete layer coverage, backend failure,
+  mismatched TP head ownership, missing probes and other tool errors
+  still stop execution. The overall manifest is labeled
+  EXPERIMENTAL_NUMERICAL_DRIFT if any numerical mismatch occurred.
+
+Per-layer diagnostic durations and stage parity status are saved as
+per-layer-timings.csv. In addition, Meta releases each completed
+layer's host producer-time QKV/Flash snapshots immediately after the
+pre-Wo boundary has been verified, to limit host retention during
+16/28-layer experiments. Explicit GLG1 QKV probe export retains all
+requested snapshots until the normal export at graph end. This
+does not remove GGML pinned OUTPUT tensors or the persistent TP KV
+cache.
+
+Build from the current branch:
+
+    git pull --ff-only origin feat/galaxy-baseline
+    cmake --build build-galaxy --config Release --target llama-cli galaxy-causal-live-selftest galaxy-logits-compare -j 8
+    .\build-galaxy\bin\Release\galaxy-causal-live-selftest.exe --pc CUDA0 --rpc 10.39.52.114:50052
+
+Start with at most 8 Attention layers, holding all other parameters
+in the known 98-token $common constant:
+
+    .\tools\galaxy\run_galaxy_causal_prefix_stages.ps1 -Common $common -MaxPrefix 8 -IncludeReplace -ContinueOnLogitsMismatch
+
+Only after checking the full per-layer execution witnesses should
+the study expand to 16 and then 28:
+
+    .\tools\galaxy\run_galaxy_causal_prefix_stages.ps1 -Common $common -MaxPrefix 16 -IncludeReplace -ContinueOnLogitsMismatch
+    .\tools\galaxy\run_galaxy_causal_prefix_stages.ps1 -Common $common -MaxPrefix 28 -IncludeReplace -ContinueOnLogitsMismatch
+
+The staged runner repeats earlier prefixes to ensure consistent TP
+baseline and settings. For a direct standalone 8-layer execution
+witness, set $common["LiveCausalLayer"]=-1,
+$common["LiveCausalPrefixLayers"]=8,
+$common["LiveCausalReplace"]=$true,
+$common["DumpLogits"]=$true and run the existing smoke with -PureTP.
+The smoke proves kernel skip and exact pre-Wo consumption on both
+ranks, NOT independent numerical parity.
+
+NOTE: The new 8/16/28-layer paths are committed and statically
+inspected but are NOT yet compiled or tested on the user's real
+Windows CUDA + Android RPC pair. Larger prefixes can exhaust pinned
+device buffers or encounter backend graph allocation limits.
+No mobile-server changes are required.
