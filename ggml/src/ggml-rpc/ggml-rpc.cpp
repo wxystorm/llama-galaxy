@@ -5,6 +5,7 @@
 #include "transport.h"
 
 #include <array>
+#include <atomic>
 #include <cinttypes>
 #include <optional>
 #include <string>
@@ -260,7 +261,12 @@ struct ggml_backend_rpc_device_context {
     uint32_t    device;
     std::string name;
     std::string description;
+    // The client tracks each cached graph's RPC-buffer allocation generations.
+    // A freed buffer evicts all dependent UIDs, including their reverse edges.
+    std::mutex graph_cache_mutex;
     std::unordered_set<uint64_t> graph_uids;
+    std::unordered_map<uint64_t, std::vector<uint64_t>> graph_buffer_generations;
+    std::unordered_map<uint64_t, std::unordered_set<uint64_t>> buffer_graph_uids;
 };
 
 struct ggml_backend_rpc_buffer_type_context {
@@ -281,7 +287,12 @@ struct ggml_backend_rpc_buffer_context {
     std::shared_ptr<socket_t> sock;
     void * base_ptr;
     uint64_t remote_ptr;
+    uint64_t allocation_generation;
 };
+
+// A remote buffer address (and a client's GGML arena address) may be reused
+// after FREE_BUFFER. Its generation must not be reused for a new allocation.
+static std::atomic<uint64_t> rpc_next_allocation_generation{1};
 
 // RPC helper functions
 
@@ -717,11 +728,52 @@ static void ggml_backend_rpc_buffer_set_tensor(
 
     RPC_STATUS_ASSERT(status);
 }
+// Requires dev_ctx->graph_cache_mutex: callers serialize graph submission
+// and buffer free against updates to the client-side UID cache.
+static void rpc_client_forget_graph(ggml_backend_rpc_device_context * dev_ctx, uint64_t uid) {
+    const auto graph_it = dev_ctx->graph_buffer_generations.find(uid);
+    if (graph_it != dev_ctx->graph_buffer_generations.end()) {
+        for (const uint64_t generation : graph_it->second) {
+            auto buffer_it = dev_ctx->buffer_graph_uids.find(generation);
+            if (buffer_it == dev_ctx->buffer_graph_uids.end()) {
+                continue;
+            }
+            buffer_it->second.erase(uid);
+            if (buffer_it->second.empty()) {
+                dev_ctx->buffer_graph_uids.erase(buffer_it);
+            }
+        }
+        dev_ctx->graph_buffer_generations.erase(graph_it);
+    }
+    dev_ctx->graph_uids.erase(uid);
+}
+
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    auto * dev_ctx = (ggml_backend_rpc_device_context *)buffer->buft->device->context;
+    std::lock_guard<std::mutex> guard(dev_ctx->graph_cache_mutex);
+
     rpc_msg_free_buffer_req request = {ctx->remote_ptr};
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
     RPC_STATUS_ASSERT(status);
+
+    // Server invalidates its cached graphs before acknowledging this FREE.
+    // Locally, forget the same UIDs so a recycled tensor address cannot
+    // accidentally be dispatched as GRAPH_RECOMPUTE.
+    size_t invalidated = 0;
+    const auto buffer_it = dev_ctx->buffer_graph_uids.find(ctx->allocation_generation);
+    if (buffer_it != dev_ctx->buffer_graph_uids.end()) {
+        const std::vector<uint64_t> uids(buffer_it->second.begin(), buffer_it->second.end());
+        for (const uint64_t uid : uids) {
+            rpc_client_forget_graph(dev_ctx, uid);
+            ++invalidated;
+        }
+    }
+    if (invalidated != 0) {
+        GGML_LOG_INFO("[RPC_GRAPH_CACHE] side=CLIENT event=FREE_BUFFER generation=%" PRIu64
+                " invalidated=%zu remaining=%zu\n",
+                ctx->allocation_generation, invalidated, dev_ctx->graph_uids.size());
+    }
     delete ctx;
 }
 
@@ -794,7 +846,9 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     if (response.remote_ptr != 0) {
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
             ggml_backend_rpc_buffer_interface,
-            new ggml_backend_rpc_buffer_context{sock, nullptr, response.remote_ptr},
+            new ggml_backend_rpc_buffer_context{
+                sock, nullptr, response.remote_ptr,
+                rpc_next_allocation_generation.fetch_add(1, std::memory_order_relaxed)},
             response.remote_size);
         return buffer;
     } else {
@@ -917,28 +971,48 @@ static uint64_t rpc_hash_u64(uint64_t h, uint64_t v) {
     return h;
 }
 
-static uint64_t rpc_graph_effective_uid(const ggml_cgraph * cgraph) {
-    if (cgraph->uid != 0) {
-        return cgraph->uid;
+struct rpc_graph_identity {
+    uint64_t uid = 0;
+    std::vector<uint64_t> buffer_generations;
+};
+
+static rpc_graph_identity rpc_graph_effective_identity(const ggml_cgraph * cgraph) {
+    // Hash the actual serialized graph descriptors rather than only GGML
+    // arena pointers. This also catches changes to op params, views, strides,
+    // data offsets, and buffers even when the caller supplies cgraph->uid.
+    std::vector<rpc_tensor> tensors;
+    std::unordered_set<ggml_tensor *> visited;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        add_tensor(cgraph->nodes[i], tensors, visited);
     }
 
-    uint64_t uid = 0x7bf5d03899c4e5b9ULL;
-    uid = rpc_hash_u64(uid, (uint64_t) cgraph->n_nodes);
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
-        const ggml_tensor * node = cgraph->nodes[i];
-        uid = rpc_hash_u64(uid, (uint64_t) (uintptr_t) node);
-        uid = rpc_hash_u64(uid, (uint64_t) node->op);
-        uid = rpc_hash_u64(uid, (uint64_t) node->type);
-        uid = rpc_hash_u64(uid, (uint64_t) (uintptr_t) node->view_src);
-        for (int j = 0; j < GGML_MAX_DIMS; ++j) {
-            uid = rpc_hash_u64(uid, (uint64_t) node->ne[j]);
-            uid = rpc_hash_u64(uid, (uint64_t) node->nb[j]);
-        }
-        for (int j = 0; j < GGML_MAX_SRC; ++j) {
-            uid = rpc_hash_u64(uid, (uint64_t) (uintptr_t) node->src[j]);
+    uint64_t uid = cgraph->uid != 0 ? cgraph->uid : 0x7bf5d03899c4e5b9ULL;
+    uid = rpc_hash_u64(uid, static_cast<uint64_t>(cgraph->n_nodes));
+    uid = rpc_hash_u64(uid, static_cast<uint64_t>(tensors.size()));
+    for (const rpc_tensor & tensor : tensors) {
+        uid = rpc_hash_u64(uid, fnv_hash(reinterpret_cast<const uint8_t *>(&tensor), sizeof(tensor)));
+    }
+
+    // A server-side allocation may be freed and reused at the exact same
+    // remote pointer. A strictly increasing local generation makes the new
+    // graph identity different even if all GGML metadata addresses repeat.
+    std::unordered_set<uint64_t> generations;
+    for (const ggml_tensor * tensor : visited) {
+        if (tensor->buffer != nullptr && ggml_backend_buffer_is_rpc(tensor->buffer)) {
+            auto * ctx = (ggml_backend_rpc_buffer_context *)tensor->buffer->context;
+            if (ctx != nullptr) {
+                generations.insert(ctx->allocation_generation);
+            }
         }
     }
-    return uid != 0 ? uid : 0x7bf5d03899c4e5b9ULL;
+    rpc_graph_identity identity;
+    identity.buffer_generations.assign(generations.begin(), generations.end());
+    std::sort(identity.buffer_generations.begin(), identity.buffer_generations.end());
+    for (const uint64_t generation : identity.buffer_generations) {
+        uid = rpc_hash_u64(uid, generation);
+    }
+    identity.uid = uid != 0 ? uid : 0x7bf5d03899c4e5b9ULL;
+    return identity;
 }
 
 static void serialize_graph(uint32_t device, uint64_t graph_uid, const ggml_cgraph * cgraph, std::vector<uint8_t> & output) {
@@ -973,61 +1047,58 @@ static void serialize_graph(uint32_t device, uint64_t graph_uid, const ggml_cgra
 static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
     ggml_backend_dev_t rpc_dev = ggml_backend_get_device(backend);
-    ggml_backend_rpc_device_context * rpc_dev_ctx = (ggml_backend_rpc_device_context *)rpc_dev->context;
+    auto * rpc_dev_ctx = (ggml_backend_rpc_device_context *)rpc_dev->context;
 
     GGML_ASSERT(cgraph->n_nodes > 0);
-    const uint64_t graph_uid = rpc_graph_effective_uid(cgraph); //这个是客户端的
-    // Diagnostic-only opt-out for testing graph UID reuse against transient
-    // Galaxy Attention graphs. Normal inference keeps the original cache path.
-    // The RPC server still stores the latest full graph under graph_uid; when
-    // disabled the client never executes a previously cached graph.
+    const rpc_graph_identity identity = rpc_graph_effective_identity(cgraph);
+    const uint64_t graph_uid = identity.uid;
     const char * no_reuse = std::getenv("LLAMA_GALAXY_RPC_DISABLE_GRAPH_REUSE");
     const bool disable_graph_reuse = no_reuse != nullptr && std::strcmp(no_reuse, "1") == 0;
+
+    // A graph send and a FREE_BUFFER must not race the per-device cache.
+    std::lock_guard<std::mutex> guard(rpc_dev_ctx->graph_cache_mutex);
     const bool reuse = !disable_graph_reuse &&
             rpc_dev_ctx->graph_uids.find(graph_uid) != rpc_dev_ctx->graph_uids.end();
+    auto sock = get_socket(rpc_ctx->endpoint);
     if (reuse) {
-        rpc_msg_graph_recompute_req request;
-        request.device = rpc_ctx->device;
-        request.graph_uid = graph_uid;
-        auto sock = get_socket(rpc_ctx->endpoint);
-        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
+        rpc_msg_graph_recompute_req request = {rpc_ctx->device, graph_uid};
+        const bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE,
+                &request, sizeof(request));
         GGML_LOG_INFO(
             "[RPC_GRAPH] endpoint=%s device=%u graph=%p uid=%" PRIu64
             " nodes=%d tensors=reused bytes=%zu cmd=GRAPH_RECOMPUTE\n",
-            rpc_ctx->endpoint.c_str(),
-            rpc_ctx->device,
-            (void *) cgraph,
-            graph_uid,
-            cgraph->n_nodes,
-            sizeof(request));
+            rpc_ctx->endpoint.c_str(), rpc_ctx->device, (void *)cgraph,
+            graph_uid, cgraph->n_nodes, sizeof(request));
         RPC_STATUS_ASSERT(status);
     } else {
-        if (!disable_graph_reuse) {
-            rpc_dev_ctx->graph_uids.insert(graph_uid);
-        }
         std::vector<uint8_t> input;
         serialize_graph(rpc_ctx->device, graph_uid, cgraph, input);
-        auto sock = get_socket(rpc_ctx->endpoint);
-        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
+        const bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
+        const size_t n_tensors_offset = 2*sizeof(uint32_t) + sizeof(uint64_t) +
+                size_t(cgraph->n_nodes)*sizeof(uint64_t);
         uint32_t n_tensors = 0;
-        const size_t n_tensors_offset = 2*sizeof(uint32_t) + sizeof(uint64_t) + (size_t) cgraph->n_nodes*sizeof(uint64_t);
         if (input.size() >= n_tensors_offset + sizeof(n_tensors)) {
             memcpy(&n_tensors, input.data() + n_tensors_offset, sizeof(n_tensors));
         }
-        // 打印发送和接收的字节数，计算图
-        //GGML_LOG_INFO("ggml_backend_rpc_graph_compute: sent %zu bytes\n", input.size());
         GGML_LOG_INFO(
             "[RPC_GRAPH] endpoint=%s device=%u graph=%p uid=%" PRIu64
-            " nodes=%d tensors=%u bytes=%zu cmd=GRAPH_COMPUTE reuse_policy=%s\n",
-            rpc_ctx->endpoint.c_str(),
-            rpc_ctx->device,
-            (void *) cgraph,
-            graph_uid,
-            cgraph->n_nodes,
-            n_tensors,
-            input.size(),
-            disable_graph_reuse ? "DISABLED" : "NORMAL");
+            " nodes=%d tensors=%u bytes=%zu cmd=GRAPH_COMPUTE reuse_policy=%s buffer_generations=%zu\n",
+            rpc_ctx->endpoint.c_str(), rpc_ctx->device, (void *)cgraph,
+            graph_uid, cgraph->n_nodes, n_tensors, input.size(),
+            disable_graph_reuse ? "DISABLED" : "LIFETIME_SAFE",
+            identity.buffer_generations.size());
         RPC_STATUS_ASSERT(status);
+
+        if (!disable_graph_reuse) {
+            // A full GRAPH_COMPUTE replaces any previous entry for this UID.
+            // Drop its old reverse edges before recording the new lifetimes.
+            rpc_client_forget_graph(rpc_dev_ctx, graph_uid);
+            rpc_dev_ctx->graph_uids.insert(graph_uid);
+            rpc_dev_ctx->graph_buffer_generations[graph_uid] = identity.buffer_generations;
+            for (const uint64_t generation : identity.buffer_generations) {
+                rpc_dev_ctx->buffer_graph_uids[generation].insert(graph_uid);
+            }
+        }
     }
     return GGML_STATUS_SUCCESS;
 }
@@ -1156,8 +1227,11 @@ public:
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
     bool set_tensor_from_local_file(const rpc_msg_set_tensor_from_local_file_req & request, rpc_msg_set_tensor_from_local_file_rsp & response); //新加的
     struct stored_graph {
-        std::vector<uint8_t>   buffer;
-        ggml_cgraph          * graph;
+        std::vector<uint8_t> buffer;
+        ggml_cgraph * graph = nullptr;
+        // Every RPC buffer referenced by a serialized graph (including
+        // leaf tensors and views), not just its output node.
+        std::unordered_set<ggml_backend_buffer_t> dependencies;
     };
 private:
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
@@ -1286,6 +1360,24 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
     if (buffers.find(buffer) == buffers.end()) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
         return false;
+    }
+    // Remove every graph that references this buffer before its allocator
+    // can recycle the address. Persistent TP graph entries survive while
+    // their model/KV buffers are still allocated.
+    size_t invalidated = 0;
+    for (auto & device_graphs : stored_graphs) {
+        for (auto it = device_graphs.begin(); it != device_graphs.end(); ) {
+            if (it->second.dependencies.find(buffer) != it->second.dependencies.end()) {
+                it = device_graphs.erase(it);
+                ++invalidated;
+            } else {
+                ++it;
+            }
+        }
+    }
+    if (invalidated != 0) {
+        GGML_LOG_INFO("[RPC_GRAPH_CACHE] side=SERVER event=FREE_BUFFER ptr=%p invalidated=%zu\n",
+                (void *)buffer, invalidated);
     }
     ggml_backend_buffer_free(buffer);
     buffers.erase(buffer);
@@ -1670,8 +1762,24 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     const rpc_tensor * tensors = (const rpc_tensor *)src;
     LOG_DBG("[%s] device: %u, graph_uid: %" PRIu64 ", n_nodes: %u, n_tensors: %u\n", __func__, device, graph_uid, n_nodes, n_tensors);
 
+    std::unordered_set<ggml_backend_buffer_t> dependencies;
+    for (uint32_t i = 0; i < n_tensors; ++i) {
+        if (tensors[i].buffer == 0) {
+            continue;
+        }
+        auto * buffer = reinterpret_cast<ggml_backend_buffer_t>(tensors[i].buffer);
+        if (buffers.find(buffer) == buffers.end()) {
+            GGML_LOG_ERROR("[RPC_GRAPH_CACHE] invalid graph buffer for uid=%" PRIu64
+                    " tensor=%u remote_ptr=%" PRIx64 "\n",
+                    graph_uid, i, tensors[i].buffer);
+            return false;
+        }
+        dependencies.insert(buffer);
+    }
+
     size_t buf_size = ggml_tensor_overhead()*(n_nodes + n_tensors) + ggml_graph_overhead_custom(n_nodes, false); //计算缓冲区大小
     stored_graph & graph_entry = stored_graphs[device][graph_uid];  //存储计算图以用于复用
+    graph_entry.graph = nullptr; // Never expose a partially reconstructed graph.
     if (graph_entry.buffer.size() < buf_size) {
         graph_entry.buffer.resize(buf_size);
     }
@@ -1712,6 +1820,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     galaxy_phone_profile("GRAPH_COMPUTE", device, graph_uid, n_nodes,
             std::chrono::duration<double, std::milli>(compute_start - request_start).count(),
             std::chrono::duration<double, std::milli>(compute_end - compute_start).count());
+    graph_entry.dependencies = std::move(dependencies);
     graph_entry.graph = graph;
     return true;
 }

@@ -2173,3 +2173,10 @@ inspected but are NOT yet compiled or tested on the user's real
 Windows CUDA + Android RPC pair. Larger prefixes can exhaust pinned
 device buffers or encounter backend graph allocation limits.
 No mobile-server changes are required.
+
+
+### RPC Graph lifetime safety (PC + Phone, causal Attention)
+
+Temporary Galaxy Attention graphs allocate and free new RPC buffers per layer. The RPC cache now fingerprints the serialized graph plus *buffer allocation generations*, not only reusable GGML arena pointers; the client drops cached UIDs when their buffers are freed. The RPC server evicts all graphs referencing a buffer **before** freeing it. Normal TP graphs with unchanged live buffers still use `GRAPH_RECOMPUTE`.
+
+**Upgrade and rebuild both PC and Phone RPC binaries** for the complete cache cleanup. The old `-DisableRpcGraphReuse` option remains available for A/B debugging, but it should no longer be needed for routine multi-layer testing. To verify, run `run_galaxy_causal_prefix_stages.ps1 -Common $common -MaxPrefix 8 -IncludeReplace -ContinueOnLogitsMismatch -Trace` (without disabling reuse), then check the log: normal TP graphs may use `GRAPH_RECOMPUTE`, while newly allocated transient Attention graphs should have distinct UIDs and full `GRAPH_COMPUTE` commands. Log lines tagged `[RPC_GRAPH_CACHE]` report buffer-triggered eviction in verbose logs.
