@@ -29,6 +29,7 @@ param(
     [int]$LiveCausalPrefixLayers = 0,
     [switch]$LiveCausalReplace,
     [switch]$Trace,
+    [switch]$DisableRpcGraphReuse,
     [switch]$DumpLogits,
     [int]$TimeoutSec = 0,
     [int]$NPredict = 1,
@@ -106,7 +107,7 @@ $keys = @("LLAMA_GALAXY_TP", "LLAMA_GALAXY_TP_HEADS", "LLAMA_GALAXY_TP_FFN", "LL
     "LLAMA_GALAXY_QKV_PROBE_LAYERS", "LLAMA_GALAXY_QKV_PROBE_DIR",
     "LLAMA_GALAXY_CAUSAL_LIVE_LAYER", "LLAMA_GALAXY_CAUSAL_LIVE_PREFIX_LAYERS", "LLAMA_GALAXY_CAUSAL_LIVE_MODE",
     "LLAMA_GALAXY_COLLECTIVE_TILE_TOKENS", "LLAMA_GALAXY_RS_FUSED_READ", "LLAMA_GALAXY_SP_SEQ_WEIGHTS",
-    "LLAMA_GALAXY_SP_FINAL_LAYER")
+    "LLAMA_GALAXY_SP_FINAL_LAYER", "LLAMA_GALAXY_RPC_DISABLE_GRAPH_REUSE")
 $old = @{}
 foreach ($key in $keys) { $old[$key] = [Environment]::GetEnvironmentVariable($key, "Process") }
 
@@ -116,6 +117,7 @@ try {
     $env:LLAMA_GALAXY_TP_FFN   = $FfnSplit
     $env:LLAMA_GALAXY_SP       = if ($PureTP) { "0" } else { "1" }
     $env:LLAMA_GALAXY_SP_TRACE = if ($Trace) { "1" } else { "0" }
+    $env:LLAMA_GALAXY_RPC_DISABLE_GRAPH_REUSE = if ($DisableRpcGraphReuse) { "1" } else { $null }
     $env:LLAMA_GALAXY_SP_SEQ_WEIGHTS = $SeqWeights
     $env:LLAMA_GALAXY_SP_FINAL_LAYER = if ($FinalLayerSP) { "1" } else { "0" }
     $env:LLAMA_GALAXY_COLLECTIVE_TILE_TOKENS = $CollectiveTileTokens.ToString()
@@ -178,7 +180,7 @@ try {
         "-ub", $UBatch.ToString(), "-t", $Threads.ToString(),
         "-n", $NPredict.ToString(), "--temp", "0", "-f", $promptArg
     )
-    Write-Host "[GALAXY_SP_SMOKE] mode=$mode devices=$Devices rpc=$Rpc profiling=$([bool]$Profile) tile_tokens=$CollectiveTileTokens rs_fused=$([bool]$RsFusedRead) seq_weights=$SeqWeights final_layer_sp=$([bool]$FinalLayerSP)"
+    Write-Host "[GALAXY_SP_SMOKE] mode=$mode devices=$Devices rpc=$Rpc profiling=$([bool]$Profile) tile_tokens=$CollectiveTileTokens rs_fused=$([bool]$RsFusedRead) seq_weights=$SeqWeights final_layer_sp=$([bool]$FinalLayerSP) rpc_graph_reuse_disabled=$([bool]$DisableRpcGraphReuse)"
     if ($Galaxy2FfnSpLayerSet) {
         Write-Host "[GALAXY2] mode=explicit_layer_set schedule=$Galaxy2FfnSpLayerSet final_layer_sp=$([bool]$FinalLayerSP)"
     } elseif ($Galaxy2 -and $Galaxy2FfnSpLayers -ne "all") {

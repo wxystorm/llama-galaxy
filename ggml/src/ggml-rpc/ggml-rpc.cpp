@@ -977,9 +977,14 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
 
     GGML_ASSERT(cgraph->n_nodes > 0);
     const uint64_t graph_uid = rpc_graph_effective_uid(cgraph); //这个是客户端的
-    bool reuse = rpc_dev_ctx->graph_uids.find(graph_uid) != rpc_dev_ctx->graph_uids.end();
-    //新的
-    //reuse = false;
+    // Diagnostic-only opt-out for testing graph UID reuse against transient
+    // Galaxy Attention graphs. Normal inference keeps the original cache path.
+    // The RPC server still stores the latest full graph under graph_uid; when
+    // disabled the client never executes a previously cached graph.
+    const char * no_reuse = std::getenv("LLAMA_GALAXY_RPC_DISABLE_GRAPH_REUSE");
+    const bool disable_graph_reuse = no_reuse != nullptr && std::strcmp(no_reuse, "1") == 0;
+    const bool reuse = !disable_graph_reuse &&
+            rpc_dev_ctx->graph_uids.find(graph_uid) != rpc_dev_ctx->graph_uids.end();
     if (reuse) {
         rpc_msg_graph_recompute_req request;
         request.device = rpc_ctx->device;
@@ -997,7 +1002,9 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             sizeof(request));
         RPC_STATUS_ASSERT(status);
     } else {
-        rpc_dev_ctx->graph_uids.insert(graph_uid);
+        if (!disable_graph_reuse) {
+            rpc_dev_ctx->graph_uids.insert(graph_uid);
+        }
         std::vector<uint8_t> input;
         serialize_graph(rpc_ctx->device, graph_uid, cgraph, input);
         auto sock = get_socket(rpc_ctx->endpoint);
@@ -1011,14 +1018,15 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         //GGML_LOG_INFO("ggml_backend_rpc_graph_compute: sent %zu bytes\n", input.size());
         GGML_LOG_INFO(
             "[RPC_GRAPH] endpoint=%s device=%u graph=%p uid=%" PRIu64
-            " nodes=%d tensors=%u bytes=%zu cmd=GRAPH_COMPUTE\n",
+            " nodes=%d tensors=%u bytes=%zu cmd=GRAPH_COMPUTE reuse_policy=%s\n",
             rpc_ctx->endpoint.c_str(),
             rpc_ctx->device,
             (void *) cgraph,
             graph_uid,
             cgraph->n_nodes,
             n_tensors,
-            input.size());
+            input.size(),
+            disable_graph_reuse ? "DISABLED" : "NORMAL");
         RPC_STATUS_ASSERT(status);
     }
     return GGML_STATUS_SUCCESS;

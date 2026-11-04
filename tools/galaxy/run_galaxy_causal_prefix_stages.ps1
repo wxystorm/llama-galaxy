@@ -5,6 +5,7 @@
   Stage order (default): reference TP, SHADOW 1, SHADOW 2.
   With -IncludeReplace: TP, SHADOW 1, REPLACE 1, SHADOW 2, REPLACE 2...
   -MaxPrefix 8/16/28 also covers the larger model prefixes.
+  -DisableRpcGraphReuse forces full RPC graph sends for A/B diagnosis only.
 
   Every smoke MUST emit its own complete per-layer execution witness.
   Strict logits parity is the default; explicit -ContinueOnLogitsMismatch
@@ -18,6 +19,7 @@ param(
     [switch]$IncludeReplace,
     [switch]$ContinueOnLogitsMismatch,
     [switch]$Trace,
+    [switch]$DisableRpcGraphReuse,
     [string]$OutputDir = ".\galaxy-sp-results\causal-prefix-staged",
     [double]$MaxAbs = 0.10,
     [double]$MaxRmse = 0.02
@@ -53,7 +55,7 @@ $shared = @{}
 foreach ($key in $Common.Keys) { $shared[$key] = $Common[$key] }
 foreach ($name in @("PureTP","LiveCausalLayer","LiveCausalPrefixLayers",
                     "LiveCausalReplace","OutputDir","DumpLogits",
-                    "ProbeQkvLayers","Profile","Trace")) {
+                    "ProbeQkvLayers","Profile","Trace","DisableRpcGraphReuse")) {
     [void]$shared.Remove($name)
 }
 $shared["DumpLogits"] = $true
@@ -63,6 +65,7 @@ $shared["Galaxy2FfnSpLayerSet"] = ""
 $shared["FinalLayerSP"] = $false
 $shared["Profile"] = $false
 $shared["Trace"] = [bool]$Trace
+$shared["DisableRpcGraphReuse"] = [bool]$DisableRpcGraphReuse
 $shared["DumpLayers"] = ""
 $shared["DumpStages"] = ""
 $shared["DumpFfnOps"] = ""
@@ -77,6 +80,7 @@ function Save-StageManifest {
         include_replace = [bool]$IncludeReplace
         continue_on_logits_mismatch = [bool]$ContinueOnLogitsMismatch
         trace = [bool]$Trace
+        rpc_graph_reuse_disabled = [bool]$DisableRpcGraphReuse
         numerical_failures = $script:driftCount
         limits = @{ max_abs = $MaxAbs; max_rmse = $MaxRmse }
         model = [string]$shared["Model"]
