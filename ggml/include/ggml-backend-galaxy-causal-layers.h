@@ -12,6 +12,7 @@
 // per-layer completeness contract. Unset by default.
 
 #include <cstdlib>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
