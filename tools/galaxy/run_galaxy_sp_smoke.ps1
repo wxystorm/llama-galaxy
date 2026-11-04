@@ -46,10 +46,10 @@ if (-not (Test-Path -LiteralPath $PromptFile)) { throw "Missing prompt: $PromptF
 if ($Devices.Split(",").Count -ne 2) { throw "Devices must contain exactly PC,RPC" }
 if ($PureTP -and $Galaxy2) { throw "PureTP and Galaxy2 cannot both be enabled" }
 if ($LiveCausalLayer -lt -1 -or $LiveCausalLayer -gt 0) {
-    throw "Legacy LiveCausalLayer supports only 0; use LiveCausalPrefixLayers 1/2/4 for prefix"
+    throw "Legacy LiveCausalLayer supports only 0; use LiveCausalPrefixLayers 1/2/4/8/16/28 for prefix"
 }
-if ($LiveCausalPrefixLayers -notin @(0,1,2,4)) {
-    throw "LiveCausalPrefixLayers must be 0 (off), 1, 2, or 4"
+if ($LiveCausalPrefixLayers -notin @(0,1,2,4,8,16,28)) {
+    throw "LiveCausalPrefixLayers must be 0 (off), 1, 2, 4, 8, 16, or 28"
 }
 if ($LiveCausalPrefixLayers -gt 0 -and $LiveCausalLayer -eq 0) {
     throw "Specify LiveCausalLayer 0 OR LiveCausalPrefixLayers, not both"
@@ -68,7 +68,7 @@ if ($liveEnabled -and -not $PureTP) {
     throw "Causal live SP Attention currently requires -PureTP"
 }
 if ($LiveCausalReplace -and -not $liveEnabled) {
-    throw "LiveCausalReplace requires LiveCausalLayer 0 or LiveCausalPrefixLayers 1/2/4"
+    throw "LiveCausalReplace requires LiveCausalLayer 0 or LiveCausalPrefixLayers 1/2/4/8/16/28"
 }
 if ($LiveCausalReplace -and -not $DumpLogits) {
     throw "LiveCausalReplace requires -DumpLogits for independent TP baseline comparison"
