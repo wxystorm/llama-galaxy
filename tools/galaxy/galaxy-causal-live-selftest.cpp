@@ -100,23 +100,34 @@ void contract_tests() {
     const auto one=parse(nullptr,"1");
     const auto two=parse(nullptr,"2");
     const auto four=parse(nullptr,"4");
+    const auto eight=parse(nullptr,"8");
+    const auto sixteen=parse(nullptr,"16");
+    const auto twenty_eight=parse(nullptr,"28");
     test(one.valid() && one.description()=="0" &&
          two.valid() && two.description()=="0,1" &&
-         four.valid() && four.description()=="0,1,2,3",
-         "causal 1/2/4 prefix layer order");
+         four.valid() && four.description()=="0,1,2,3" &&
+         eight.valid() && eight.layers.size()==8 &&
+         sixteen.valid() && sixteen.layers.size()==16 &&
+         twenty_eight.valid() && twenty_eight.layers.size()==28,
+         "causal 1/2/4/8/16/28 prefix order");
     test(two.match_boundary("fattn_raw-1","fattn_raw")==1 &&
          two.match_boundary("kqv_out-0","kqv_out")==0 &&
          two.match_boundary("kqv_out-2","kqv_out")==-1 &&
          two.match_boundary("kqv_out-10","kqv_out")==-1 &&
-         four.contains(3) && !four.contains(4),
+         four.contains(3) && !four.contains(4) &&
+         eight.contains(7) && !eight.contains(8) &&
+         sixteen.contains(15) && !sixteen.contains(16) &&
+         twenty_eight.contains(27) && !twenty_eight.contains(28) &&
+         twenty_eight.match_boundary("fattn_raw-27","fattn_raw")==27 &&
+         twenty_eight.match_boundary("kqv_out-28","kqv_out")==-1,
          "exact per-layer native boundaries");
-    for(const char * invalid:{"0","3","5","all","0,1","-1"}) {
+    for(const char * invalid:{"0","3","5","12","27","29","all","0,1","-1","08","2 "}) {
         test(!parse(nullptr,invalid).valid(),"invalid or sparse prefix accepted");
     }
     test(!parse("1",nullptr).valid() &&
          !parse("0","2").valid(),
          "legacy invalid layer or conflicting mode accepted");
-    std::cout << "[GALAXY_CAUSAL_PREFIX_TEST] prefixes=1,2,4"
+    std::cout << "[GALAXY_CAUSAL_PREFIX_TEST] prefixes=1,2,4,8,16,28"
               << " legacy=0 fail_closed=1 status=PASS\n";
 
     fixtures fx;
