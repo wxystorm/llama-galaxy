@@ -1458,8 +1458,7 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         mirror.record_write(offset,size);
         if (!was_ready && mirror.ready()) {
             GGML_LOG_INFO("[GALAXY_SP_QKV_RESIDENT_LOAD] tensor=%s"
-                    " bytes=%zu ranks=2 phase=MODEL_LOAD status=PASS
-",
+                    " bytes=%zu ranks=2 phase=MODEL_LOAD status=PASS\n",
                     tensor->name,mirror.total_bytes);
         }
     }
