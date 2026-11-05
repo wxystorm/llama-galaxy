@@ -2296,3 +2296,8 @@ MatMul+RoPE projector on two independent CPU GGML backends, with an F32
 identity-matrix fixture. It checks rank-local token ownership and V outputs
 and guards against invalid noncontiguous positions. Real quantized GGUF and
 CUDA + Phone still need the Windows/Android user-device run above.
+
+
+#### L0 SP-QKV producer weight lookup correction (2026-11-05)
+
+The initial L0 smoke failed at `missing Meta full-QKV source blk.0.attn_q.weight` after successfully capturing Q/K/V and scaled `attn_norm-0`. This was a lookup bug: a Meta inference graph is not required to enumerate the original model weight in `cgraph->leafs`. The L0 projector now follows the *actual* Q/K/V producer ancestry (`ROPE -> RESHAPE -> MUL_MAT` for Q/K, `RESHAPE -> MUL_MAT` for V) to the exact named `MUL_MAT.src[0]` weight. It also checks the original normalized input at `MUL_MAT.src[1]`, the Meta head-split layout and per-rank row extents before copying the quantized bytes. Any unsupported bias/LoRA/fused path fails explicitly. A CPU selftest now constructs this graph and verifies the three weight paths plus cross-layer/incorrect-input rejection. Recompile PC `llama-cli` and `galaxy-native-sp-qkv-selftest`, then rerun the unchanged `-NativeSpQkvL0` Hybrid command. No Phone RPC protocol change.

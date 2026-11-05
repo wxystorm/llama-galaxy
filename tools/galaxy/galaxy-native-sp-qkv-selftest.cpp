@@ -77,12 +77,43 @@ int main() {
         ggml_context * ctx=ggml_init(params);
         expect(ctx!=nullptr,"fixture context missing");
         ggml_tensor * pos=ggml_new_tensor_1d(ctx,GGML_TYPE_I32,8);
-        ggml_tensor * src_q=ggml_new_tensor_3d(ctx,GGML_TYPE_F32,64,2,8);
-        ggml_tensor * src_k=ggml_new_tensor_3d(ctx,GGML_TYPE_F32,64,1,8);
+        // Simulate Llama's real Q/K/V producer topology: a static named
+        // weight, mirrored norm, MatMul, Reshape, then Q/K RoPE. The weights
+        // are deliberately NOT inserted into a cgraph->leafs list.
+        ggml_tensor * normalized=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,128,8);
+        ggml_tensor * wq=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,128,128);
+        ggml_tensor * wk=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,128,64);
+        ggml_tensor * wv=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,128,64);
+        ggml_set_name(wq,"blk.0.attn_q.weight");
+        ggml_set_name(wk,"blk.0.attn_k.weight");
+        ggml_set_name(wv,"blk.0.attn_v.weight");
+        ggml_tensor * src_q=ggml_reshape_3d(ctx,ggml_mul_mat(ctx,wq,normalized),64,2,8);
+        ggml_tensor * src_k=ggml_reshape_3d(ctx,ggml_mul_mat(ctx,wk,normalized),64,1,8);
+        ggml_tensor * src_v=ggml_reshape_3d(ctx,ggml_mul_mat(ctx,wv,normalized),64,1,8);
         ggml_tensor * model_q=ggml_rope_ext(ctx,src_q,pos,nullptr,64,
                           GGML_ROPE_TYPE_NORMAL,8192,10000.f,1.f,0.f,1.f,32.f,1.f);
         ggml_tensor * model_k=ggml_rope_ext(ctx,src_k,pos,nullptr,64,
                           GGML_ROPE_TYPE_NORMAL,8192,10000.f,1.f,0.f,1.f,32.f,1.f);
+        expect(projection_weight(model_q,normalized,"blk.0.attn_q.weight")==wq,
+               "Q weight must be found by producer ancestry");
+        expect(projection_weight(model_k,normalized,"blk.0.attn_k.weight")==wk,
+               "K weight must be found by producer ancestry");
+        expect(projection_weight(src_v,normalized,"blk.0.attn_v.weight")==wv,
+               "V weight must be found by producer ancestry");
+        bool wrong_weight_rejected=false;
+        try {
+            (void) projection_weight(model_q,normalized,"blk.1.attn_q.weight");
+        } catch (const std::invalid_argument &) {
+            wrong_weight_rejected=true;
+        }
+        expect(wrong_weight_rejected,"cross-layer QKV weights must be rejected");
+        bool wrong_normalized_rejected=false;
+        try {
+            (void) projection_weight(model_q,src_q,"blk.0.attn_q.weight");
+        } catch (const std::invalid_argument &) {
+            wrong_normalized_rejected=true;
+        }
+        expect(wrong_normalized_rejected,"unrelated MatMul activation must be rejected");
         source s;
         s.hidden=128;
         s.tokens=8;

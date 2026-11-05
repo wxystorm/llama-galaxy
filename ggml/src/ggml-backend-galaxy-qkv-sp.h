@@ -88,6 +88,42 @@ inline void validate(const source & s) {
     }
 }
 
+// The live Meta graph does not promise to enumerate model-weight leaves.
+// Instead, follow each *actual* Q/K/V producer from the pinned stage back
+// through its known native reshape/RoPE path to GGML_OP_MUL_MAT. Guard both
+// the original RMSNorm input and the exact named static GGUF weight, so a
+// wrong layer or an unsupported fused/bias/LoRA path cannot be accepted.
+inline const ggml_tensor * projection_weight(const ggml_tensor * stage,
+                                               const ggml_tensor * normalized,
+                                               const std::string & expected_name) {
+    check(stage && normalized, "missing stage or normalized projection input");
+    const ggml_tensor * node=stage;
+    for (int depth=0;depth<12 && node; ++depth) {
+        if (node->op==GGML_OP_MUL_MAT) {
+            const ggml_tensor * weights=node->src[0];
+            if (!weights || node->src[1]!=normalized ||
+                    weights->op!=GGML_OP_NONE || weights->view_src!=nullptr ||
+                    std::strcmp(weights->name,expected_name.c_str())!=0) {
+                throw std::invalid_argument("Galaxy native SP QKV: unexpected MatMul inputs for "+
+                        expected_name + " (weight=" +
+                        (weights ? std::string(weights->name) : std::string("NULL")) +
+                        ", norm_match=" + (node->src[1]==normalized ? "1" : "0") + ")");
+            }
+            return weights;
+        }
+        // The dense Llama Q/K path is ROPE -> RESHAPE -> MUL_MAT,
+        // while V is RESHAPE -> MUL_MAT. Only harmless view/contiguous
+        // wrappers are permitted; e.g. an ADD bias is not silently lost.
+        if (node->op!=GGML_OP_ROPE && node->op!=GGML_OP_RESHAPE &&
+                node->op!=GGML_OP_VIEW && node->op!=GGML_OP_CONT) {
+            throw std::invalid_argument("Galaxy native SP QKV: unsupported projection ancestor "+
+                    std::string(ggml_op_name(node->op)) + " while locating " + expected_name);
+        }
+        node=node->src[0];
+    }
+    throw std::invalid_argument("Galaxy native SP QKV: no MatMul ancestor for "+expected_name);
+}
+
 // A rank graph owns its OWN full QKV matrix copies, but operates on only
 // its local tokens. No TP->SP HeadToToken collective appears in this graph.
 struct rank_graph {

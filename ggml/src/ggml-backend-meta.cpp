@@ -2385,23 +2385,29 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         src.positions.resize(size_t(src.tokens));
         for (int64_t t=0;t<src.tokens;++t) src.positions[size_t(t)]=static_cast<int32_t>(t);
 
-        const auto leaf=[&](const std::string & name) -> const ggml_tensor * {
-            for (int i=0;i<cgraph->n_leafs;++i) {
-                if (std::strcmp(cgraph->leafs[i]->name,name.c_str())==0)
-                    return cgraph->leafs[i];
-            }
-            return nullptr;
-        };
+        // Follow the real producer nodes, NOT cgraph->leafs. Backend-created
+        // graphs can omit model weights from their leaf enumeration despite
+        // their presence as MatMul src[0] and as live Meta static tensors.
+        const ggml_tensor * q=find_live_stage(layer,"Qcur",true);
+        const ggml_tensor * k=find_live_stage(layer,"Kcur",true);
+        const ggml_tensor * v=find_live_stage(layer,"Vcur",false);
         const std::string prefix="blk."+std::to_string(layer)+".";
-        for (const char * bias : {"attn_q.bias","attn_k.bias","attn_v.bias"}) {
-            if (leaf(prefix+bias)) throw std::invalid_argument("biased L0 QKV not supported");
-        }
-        const auto full_weight=[&](const std::string & name)
+        const auto full_weight=[&](const ggml_tensor * producer,
+                                   const char * suffix,
+                                   const std::array<int64_t,2> & rank_heads)
                 -> ggml_galaxy_qkv_sp::weight {
-            const ggml_tensor * global=leaf(name);
-            if (!global || !ggml_backend_buffer_is_meta(global->buffer) ||
-                    global->ne[2]!=1 || global->ne[3]!=1)
-                throw std::invalid_argument("missing Meta full-QKV source "+name);
+            const std::string name=prefix+suffix;
+            const ggml_tensor * global=ggml_galaxy_qkv_sp::projection_weight(producer,norm,name);
+            if (!global->buffer || !ggml_backend_buffer_is_meta(global->buffer)) {
+                throw std::invalid_argument("QKV weight "+name+" is not in a Meta buffer");
+            }
+            const auto split=ggml_backend_meta_get_split_state(global,false);
+            if (split.axis!=GGML_BACKEND_SPLIT_AXIS_1 ||
+                    global->ne[2]!=1 || global->ne[3]!=1 ||
+                    global->ne[1]!=(rank_heads[0]+rank_heads[1])*work.head_dim) {
+                throw std::invalid_argument("QKV weight "+name+
+                        " does not match TP head-shard layout");
+            }
             ggml_galaxy_qkv_sp::weight full;
             full.type=global->type;
             full.in=global->ne[0];
@@ -2411,26 +2417,36 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             int64_t rows=0;
             for (int rank=0;rank<2;++rank) {
                 const ggml_tensor * local=ggml_backend_meta_buffer_simple_tensor(global,rank);
+                const int64_t expected=rank_heads[rank]*work.head_dim;
                 if (!local || !local->buffer || local->type!=full.type ||
                         !ggml_is_contiguous(local) || local->ne[0]!=full.in ||
-                        local->ne[1]<=0 || local->ne[2]!=1 || local->ne[3]!=1 ||
-                        ggml_nbytes(local)!=row_bytes*size_t(local->ne[1]) ||
-                        rows+local->ne[1]>full.out)
-                    throw std::invalid_argument("TP QKV weight shard mismatch "+name);
+                        local->ne[1]!=expected || local->ne[2]!=1 || local->ne[3]!=1 ||
+                        ggml_nbytes(local)!=row_bytes*size_t(expected) ||
+                        rows+expected>full.out) {
+                    throw std::invalid_argument("TP QKV weight shard dimensions mismatch "+name+
+                            " rank="+std::to_string(rank));
+                }
                 ggml_backend_synchronize(backend_ctx->backend_configs[rank].backend);
                 ggml_backend_tensor_get(local,full.bytes.data()+row_bytes*size_t(rows),
                         0,ggml_nbytes(local));
-                rows+=local->ne[1];
+                rows+=expected;
             }
-            if(rows!=full.out) throw std::invalid_argument("incomplete QKV weight rows "+name);
+            if (rows!=full.out) throw std::invalid_argument("incomplete QKV weight rows "+name);
             full.validate();
+            std::fprintf(stderr,
+                    "[GALAXY_SP_QKV_WEIGHT] layer=%d tensor=%s"
+                    " source=MATMUL_SRC0 meta_split=AXIS_1"
+                    " rows=%" PRId64 " rank_rows=%" PRId64 "+%" PRId64
+                    " bytes=%zu status=PASS\n",
+                    layer,name.c_str(),full.out,
+                    rank_heads[0]*work.head_dim,rank_heads[1]*work.head_dim,
+                    full.bytes.size());
+            std::fflush(stderr);
             return full;
         };
-        src.wq=full_weight(prefix+"attn_q.weight");
-        src.wk=full_weight(prefix+"attn_k.weight");
-        src.wv=full_weight(prefix+"attn_v.weight");
-        const ggml_tensor * q=find_live_stage(layer,"Qcur",true);
-        const ggml_tensor * k=find_live_stage(layer,"Kcur",true);
+        src.wq=full_weight(q,"attn_q.weight",work.q.heads);
+        src.wk=full_weight(k,"attn_k.weight",work.k.heads);
+        src.wv=full_weight(v,"attn_v.weight",work.v.heads);
         if (q->src[2]!=k->src[2])
             throw std::invalid_argument("Q/K RoPE factors disagree");
         std::memcpy(src.q_rope_params.data(),q->op_params,sizeof(q->op_params));
