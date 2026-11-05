@@ -2241,3 +2241,58 @@ Suggested progression, keeping `$common` fixed:
 The end-to-end execution witness now requires `final_layer_sp=1 final_ffn_sp=1 deferred_output_select=1`, and the Meta backend verifies that L27's FFN AllGather occurred and its graph node precedes the final `GET_ROWS` selection. The runner records the validated execution summary in `manifest.json`. Numerical comparisons are intentionally not performed. Fully mirrored 28-layer FFN weights consume more memory on the Phone: if loading fails, first run the 0-7 and 0-26 progressions instead of mislabeling an OOM as an Attention failure.
 
 This reaches the full model depth for **native causal SP Attention + Galaxy2 FFN-SP within a hybrid TP/W_o boundary**; it is not source-complete pure SP Attention, does not change Q/K/V projection ownership, and does not introduce SP Decode.
+
+
+### Native SP Q/K/V projection, L0 opt-in (2026-11-05)
+
+This first QKV-SP milestone is **not** the old TP-HeadToToken layout conversion:
+the L0 scaled Attention RMSNorm output is captured at its producer boundary,
+the original quantized GGUF Q/K/V weight rows are reconstructed from the two
+TP model shards, and each rank receives a FULL mirrored Q/K/V matrix but ONLY
+its own contiguous token interval. The PC CUDA and Phone RPC backends run
+native `ggml_mul_mat` and `ggml_rope_ext` independently, with the precise
+model RoPE op_params and absolute position IDs. The Native Flash stage consumes
+these local Q/K/V tensors directly; L0's TP-to-SP head permutation is skipped.
+The remaining Hybrid Attention layers are unchanged.
+
+**Scope and limitations:** First multi-token Prefill only, L0 only,
+Llama3.2 3B dense separate Q/K/V weights with no bias, 2 ranks,
+`SeqWeights=1,1`, 8..512 fresh zero-based tokens. The old TP QKV graph and
+persistent KV-cache writes still execute for Decode compatibility, so this
+milestone is a functional dual-producer bridge and does **not** promise a
+speedup. Full QKV weights are reassembled and uploaded per invocation; next
+steps are weight preloading, removing redundant TP projections, and expanding
+layer coverage. Neither numerical parity nor Decode SP is claimed.
+
+**Update and build PC only** (Phone RPC protocol is unchanged):
+
+```powershell
+git pull --ff-only origin feat/galaxy-baseline
+cmake -S . -B build-galaxy
+cmake --build build-galaxy --config Release --target llama-cli galaxy-native-sp-qkv-selftest -j 8
+.\build-galaxy\bin\Release\galaxy-native-sp-qkv-selftest.exe
+```
+
+**Start with one layer of real SP QKV into Native Attention:**
+
+```powershell
+.\tools\galaxy\run_galaxy_causal_hybrid_ffn.ps1 -Common $common -AttentionPrefix 1 -FfnSpLayerSet "0" -NativeSpQkvL0 -Trace
+```
+
+Then, after checking the L0 witness, verify it works inside the existing
+all-28-layer Hybrid:
+
+```powershell
+.\tools\galaxy\run_galaxy_causal_hybrid_ffn.ps1 -Common $common -AttentionPrefix 28 -FfnSpLayerSet "all" -FinalLayerSP -NativeSpQkvL0
+```
+
+The runner requires exactly one line of the form
+`[GALAXY_SP_QKV] layer=0 mode=SP_NATIVE producer=FULL_WEIGHT_LOCAL_TOKENS local_tokens=49+49 projection_wall_ms=... tp_projection_kept_for_kv=1 direct_native_flash=1 status=PASS`
+for the known 98-token prompt. The existing `GALAXY_CAUSAL_REPLACE_VERIFY`
+and `GALAXY_CAUSAL_HYBRID_FFN_SUM` contracts remain unchanged.
+
+The CPU-only `galaxy-native-sp-qkv-selftest` runs the SAME native
+MatMul+RoPE projector on two independent CPU GGML backends, with an F32
+identity-matrix fixture. It checks rank-local token ownership and V outputs
+and guards against invalid noncontiguous positions. Real quantized GGUF and
+CUDA + Phone still need the Windows/Android user-device run above.

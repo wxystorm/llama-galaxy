@@ -29,6 +29,7 @@ param(
     [int]$LiveCausalPrefixLayers = 0,
     [switch]$LiveCausalReplace,
     [switch]$CausalHybridFfnSp,
+    [switch]$NativeSpQkvL0,
     [switch]$Trace,
     [switch]$DisableRpcGraphReuse,
     [switch]$DumpLogits,
@@ -77,6 +78,10 @@ if ($CausalHybridFfnSp -and ($PureTP -or -not $Galaxy2 -or -not $LiveCausalRepla
 if ($CausalHybridFfnSp -and $FinalLayerSP -and $LiveCausalPrefixLayers -ne 28) {
     throw "Hybrid FinalLayerSP requires the full 28-layer Causal REPLACE prefix"
 }
+if ($NativeSpQkvL0 -and (-not $CausalHybridFfnSp -or -not $LiveCausalReplace -or
+        $LiveCausalPrefixLayers -lt 1 -or $SeqWeights -ne "1,1")) {
+    throw "NativeSpQkvL0 requires a Hybrid REPLACE prefix including L0 and -SeqWeights 1,1"
+}
 if ($LiveCausalReplace -and -not $liveEnabled) {
     throw "LiveCausalReplace requires LiveCausalLayer 0 or LiveCausalPrefixLayers 1/2/4/8/16/28"
 }
@@ -114,7 +119,7 @@ $keys = @("LLAMA_GALAXY_TP", "LLAMA_GALAXY_TP_HEADS", "LLAMA_GALAXY_TP_FFN", "LL
     "LLAMA_GALAXY_STAGE_DUMP", "LLAMA_GALAXY_STAGE_DUMP_DIR",
     "LLAMA_GALAXY_FFN_OP_DUMP", "LLAMA_GALAXY_FFN_OP_DUMP_DIR",
     "LLAMA_GALAXY_QKV_PROBE_LAYERS", "LLAMA_GALAXY_QKV_PROBE_DIR",
-    "LLAMA_GALAXY_CAUSAL_LIVE_LAYER", "LLAMA_GALAXY_CAUSAL_LIVE_PREFIX_LAYERS", "LLAMA_GALAXY_CAUSAL_LIVE_MODE", "LLAMA_GALAXY_CAUSAL_HYBRID_FFN",
+    "LLAMA_GALAXY_CAUSAL_LIVE_LAYER", "LLAMA_GALAXY_CAUSAL_LIVE_PREFIX_LAYERS", "LLAMA_GALAXY_CAUSAL_LIVE_MODE", "LLAMA_GALAXY_CAUSAL_HYBRID_FFN", "LLAMA_GALAXY_NATIVE_SP_QKV_L0",
     "LLAMA_GALAXY_COLLECTIVE_TILE_TOKENS", "LLAMA_GALAXY_RS_FUSED_READ", "LLAMA_GALAXY_SP_SEQ_WEIGHTS",
     "LLAMA_GALAXY_SP_FINAL_LAYER", "LLAMA_GALAXY_RPC_DISABLE_GRAPH_REUSE")
 $old = @{}
@@ -171,6 +176,7 @@ try {
     $env:LLAMA_GALAXY_CAUSAL_LIVE_PREFIX_LAYERS = if ($LiveCausalPrefixLayers -gt 0) { $LiveCausalPrefixLayers.ToString() } else { $null }
     $env:LLAMA_GALAXY_CAUSAL_LIVE_MODE = if ($LiveCausalReplace) { "REPLACE" } elseif ($liveEnabled) { "SHADOW" } else { $null }
     $env:LLAMA_GALAXY_CAUSAL_HYBRID_FFN = if ($CausalHybridFfnSp) { "1" } else { $null }
+    $env:LLAMA_GALAXY_NATIVE_SP_QKV_L0 = if ($NativeSpQkvL0) { "1" } else { $null }
     $env:LLAMA_GALAXY_QKV_PROBE_LAYERS = if ($ProbeQkvLayers) { $ProbeQkvLayers } else { $null }
     $env:LLAMA_GALAXY_QKV_PROBE_DIR = if ($ProbeQkvLayers) {
         $probeDir = Join-Path $dir "real-qkv"
@@ -190,7 +196,7 @@ try {
         "-ub", $UBatch.ToString(), "-t", $Threads.ToString(),
         "-n", $NPredict.ToString(), "--temp", "0", "-f", $promptArg
     )
-    Write-Host "[GALAXY_SP_SMOKE] mode=$mode devices=$Devices rpc=$Rpc profiling=$([bool]$Profile) tile_tokens=$CollectiveTileTokens rs_fused=$([bool]$RsFusedRead) seq_weights=$SeqWeights final_layer_sp=$([bool]$FinalLayerSP) rpc_graph_reuse_disabled=$([bool]$DisableRpcGraphReuse) causal_hybrid_ffn=$([bool]$CausalHybridFfnSp)"
+    Write-Host "[GALAXY_SP_SMOKE] mode=$mode devices=$Devices rpc=$Rpc profiling=$([bool]$Profile) tile_tokens=$CollectiveTileTokens rs_fused=$([bool]$RsFusedRead) seq_weights=$SeqWeights final_layer_sp=$([bool]$FinalLayerSP) rpc_graph_reuse_disabled=$([bool]$DisableRpcGraphReuse) causal_hybrid_ffn=$([bool]$CausalHybridFfnSp) native_sp_qkv_l0=$([bool]$NativeSpQkvL0)"
     if ($Galaxy2FfnSpLayerSet) {
         Write-Host "[GALAXY2] mode=explicit_layer_set schedule=$Galaxy2FfnSpLayerSet final_layer_sp=$([bool]$FinalLayerSP)"
     } elseif ($Galaxy2 -and $Galaxy2FfnSpLayers -ne "all") {
@@ -211,7 +217,7 @@ try {
     $exitCode = $result.ExitCode
     Write-Host "[GALAXY_SP_SMOKE] exit=$exitCode logs=$dir"
 
-    $hits = @(Select-String -Path $stderr, $stdout -Pattern "GALAXY_META_TRACE","GALAXY_SP_LAYOUT_FAIL","GALAXY_SP_LAYOUT_SRC","GALAXY_SP_SUM","GALAXY_SP]","GALAXY_TP]","GALAXY_CAUSAL_LIVE","GALAXY_CAUSAL_REPLACE","GALAXY_CAUSAL_PREFIX_SUM","GALAXY_CAUSAL_HYBRID_FFN_SUM","prompt eval time","eval time","ERROR","failed" -ErrorAction SilentlyContinue)
+    $hits = @(Select-String -Path $stderr, $stdout -Pattern "GALAXY_META_TRACE","GALAXY_SP_LAYOUT_FAIL","GALAXY_SP_LAYOUT_SRC","GALAXY_SP_SUM","GALAXY_SP]","GALAXY_TP]","GALAXY_CAUSAL_LIVE","GALAXY_CAUSAL_REPLACE","GALAXY_CAUSAL_PREFIX_SUM","GALAXY_CAUSAL_HYBRID_FFN_SUM","GALAXY_SP_QKV","prompt eval time","eval time","ERROR","failed" -ErrorAction SilentlyContinue)
     # Keep the full trace in stderr.log, but print only the last 80
     # matching lines on the terminal to avoid flooding a long SP run.
     $displayHits = if ($Trace) { @($hits | Select-Object -Last 80) } else { $hits }
@@ -227,6 +233,15 @@ try {
     }).Count -gt 0)
     if ($CausalHybridFfnSp -and -not $spWitness) {
         throw "Hybrid FFN-SP execution lacks positive ReduceScatter witness. Inspect $stderr"
+    }
+    if ($NativeSpQkvL0) {
+        $nativeWitness = @($hits | Where-Object {
+            $_.Line -match '\[GALAXY_SP_QKV\] layer=0 mode=SP_NATIVE .*local_tokens=[1-9][0-9]*\+[1-9][0-9]*.*tp_projection_kept_for_kv=1 direct_native_flash=1 status=PASS'
+        })
+        if ($nativeWitness.Count -ne 1) {
+            throw "Native L0 SP QKV producer is missing or duplicated. Inspect $stderr"
+        }
+        Write-Host $nativeWitness[0].Line.Trim()
     }
     if (-not $PureTP -and -not $spWitness) {
         Write-Warning "SP run exited normally but no positive ReduceScatter count was logged. Actual SP collective execution remains UNVERIFIED."

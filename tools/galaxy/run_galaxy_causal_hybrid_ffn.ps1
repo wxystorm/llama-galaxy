@@ -9,6 +9,7 @@ param(
     [ValidateSet(1,2,4,8,16,28)][int]$AttentionPrefix = 8,
     [string]$FfnSpLayerSet = "0",
     [switch]$FinalLayerSP,
+    [switch]$NativeSpQkvL0,
     [switch]$Trace,
     [string]$OutputDir = ".\\galaxy-sp-results\\causal-hybrid-ffn"
 )
@@ -57,7 +58,7 @@ $opts = @{}
 foreach ($key in $Common.Keys) { $opts[$key] = $Common[$key] }
 foreach ($name in @("PureTP","Galaxy2","Galaxy2FfnSpLayers","Galaxy2FfnSpLayerSet",
                     "LiveCausalLayer","LiveCausalPrefixLayers","LiveCausalReplace",
-                    "FinalLayerSP","DumpLogits","OutputDir","CausalHybridFfnSp","Trace")) {
+                    "FinalLayerSP","DumpLogits","OutputDir","CausalHybridFfnSp","NativeSpQkvL0","Trace")) {
     [void]$opts.Remove($name)
 }
 $opts["Galaxy2"] = $true
@@ -66,11 +67,12 @@ $opts["LiveCausalLayer"] = -1
 $opts["LiveCausalPrefixLayers"] = $AttentionPrefix
 $opts["LiveCausalReplace"] = $true
 $opts["CausalHybridFfnSp"] = $true
+$opts["NativeSpQkvL0"] = [bool]$NativeSpQkvL0
 $opts["FinalLayerSP"] = [bool]$FinalLayerSP
 $opts["DumpLogits"] = $false
 $opts["Trace"] = [bool]$Trace
 $opts["OutputDir"] = $runRoot
-Write-Host "[GALAXY_CAUSAL_HYBRID] event=START attention_prefix=$AttentionPrefix ffn_sp_layer_set=$resolvedSet final_layer_sp=$([bool]$FinalLayerSP)"
+Write-Host "[GALAXY_CAUSAL_HYBRID] event=START attention_prefix=$AttentionPrefix ffn_sp_layer_set=$resolvedSet final_layer_sp=$([bool]$FinalLayerSP) native_sp_qkv_l0=$([bool]$NativeSpQkvL0)"
 & $smoke @opts
 $run = @(Get-ChildItem -LiteralPath $runRoot -Directory -Filter "hybrid-*" | Sort-Object LastWriteTime -Descending)
 if ($run.Count -ne 1) {
@@ -95,6 +97,8 @@ $manifest = [ordered]@{
     attention_prefix = $AttentionPrefix
     ffn_sp_layer_set = $resolvedSet
     ffn_sp_count = $chosen.Count
+    native_sp_qkv_l0 = [bool]$NativeSpQkvL0
+    tp_qkv_kept_for_kv_cache = [bool]$NativeSpQkvL0
     final_layer_sp = [bool]$FinalLayerSP
     final_layer_ffn_sp = [bool]$FinalLayerSP
     deferred_output_select_verified = [bool]$FinalLayerSP

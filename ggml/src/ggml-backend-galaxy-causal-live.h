@@ -16,6 +16,7 @@
 
 #include "ggml-backend-galaxy-layout.h"
 #include "ggml-backend-galaxy-collectives.h"
+#include "ggml-backend-galaxy-qkv-sp.h"
 
 #include <array>
 #include <algorithm>
@@ -53,6 +54,10 @@ struct request {
     int layer = -1;
     size_t tile_tokens = 32;
     double max_rmse = 0.001;
+    // Optional true token-sharded projection, with full Q/K/V per local
+    // token rank. When set, native Flash consumes this layout directly;
+    // the TP->SP HeadToToken exchange is not run.
+    const ggml_galaxy_qkv_sp::projected * sp_qkv = nullptr;
 };
 
 struct measurement {
@@ -66,6 +71,7 @@ struct measurement {
     double kv_gather_ms = 0;
     double native_ready_wall_ms = 0;
     double token_to_head_ms = 0;
+    bool direct_sp_qkv = false;
 };
 
 inline void require(bool ok, const std::string & explanation) {
@@ -101,9 +107,24 @@ inline void validate(const request & r, bool reference_required = true) {
             "collective tile must be 1..1024");
     require(std::isfinite(r.max_rmse) && r.max_rmse >= 0,
             "RMSE tolerance must be nonnegative and finite");
-    validate_shards(r.q,r.tokens,r.head_dim,"Q");
-    validate_shards(r.k,r.tokens,r.head_dim,"K");
-    validate_shards(r.v,r.tokens,r.head_dim,"V");
+    if (r.sp_qkv == nullptr) {
+        validate_shards(r.q,r.tokens,r.head_dim,"Q");
+        validate_shards(r.k,r.tokens,r.head_dim,"K");
+        validate_shards(r.v,r.tokens,r.head_dim,"V");
+    } else {
+        require(!reference_required, "direct SP QKV only supports REPLACE");
+        for (int rank=0;rank<2;++rank) {
+            const int64_t local=rank==0?(r.tokens+1)/2:r.tokens/2;
+            const size_t d=static_cast<size_t>(r.head_dim);
+            require(r.sp_qkv->q[rank].size() ==
+                        size_t(local)*size_t(total_heads(r.q))*d*sizeof(float) &&
+                    r.sp_qkv->k[rank].size() ==
+                        size_t(local)*size_t(total_heads(r.k))*d*sizeof(float) &&
+                    r.sp_qkv->v[rank].size() ==
+                        size_t(local)*size_t(total_heads(r.v))*d*sizeof(float),
+                    "projected local SP Q/K/V byte sizes mismatch");
+        }
+    }
     if (reference_required) {
         validate_shards(r.reference,r.tokens,r.head_dim,"pre-Wo Attention");
     }
@@ -221,11 +242,13 @@ struct native_rank {
         const std::vector<ggml_fp16_t> zero(static_cast<size_t>(ggml_nelements(k_storage)),0);
         ggml_backend_tensor_set(k_storage,zero.data(),0,ggml_nbytes(k_storage));
         ggml_backend_tensor_set(v_storage,zero.data(),0,ggml_nbytes(v_storage));
-        ggml_backend_tensor_set(tp_q,r.q.bytes[rank]->data(),0,ggml_nbytes(tp_q));
-        const auto keys=convert_f16(*r.k.bytes[rank]);
-        const auto vals=convert_f16(*r.v.bytes[rank]);
-        ggml_backend_tensor_set(tp_k,keys.data(),0,ggml_nbytes(tp_k));
-        ggml_backend_tensor_set(tp_v,vals.data(),0,ggml_nbytes(tp_v));
+        if (r.sp_qkv == nullptr) {
+            ggml_backend_tensor_set(tp_q,r.q.bytes[rank]->data(),0,ggml_nbytes(tp_q));
+            const auto keys=convert_f16(*r.k.bytes[rank]);
+            const auto vals=convert_f16(*r.v.bytes[rank]);
+            ggml_backend_tensor_set(tp_k,keys.data(),0,ggml_nbytes(tp_k));
+            ggml_backend_tensor_set(tp_v,vals.data(),0,ggml_nbytes(tp_v));
+        }
 
         const int64_t padded_rows=GGML_PAD(rank_queries,32);
         std::vector<ggml_fp16_t> causal(static_cast<size_t>(kv_padded*padded_rows),
@@ -302,12 +325,26 @@ inline measurement run_native(const devices_t & devices, const request & r,
     const exchange kv_layout={r.k.heads,tokens,r.head_dim};
 
     auto start=ggml_galaxy_profile::clock::now();
-    ggml_galaxy_layout::head_to_token(
-            devices,{pc.tp_q,phone.tp_q},{pc.sp_q,phone.sp_q},q_layout,r.tile_tokens);
-    ggml_galaxy_layout::head_to_token(
-            devices,{pc.tp_k,phone.tp_k},{pc.sp_k,phone.sp_k},kv_layout,r.tile_tokens);
-    ggml_galaxy_layout::head_to_token(
-            devices,{pc.tp_v,phone.tp_v},{pc.sp_v,phone.sp_v},kv_layout,r.tile_tokens);
+    if (r.sp_qkv != nullptr) {
+        for (int rank=0;rank<2;++rank) {
+            auto * local=ranks[rank];
+            ggml_backend_tensor_set(local->sp_q,r.sp_qkv->q[rank].data(),0,
+                                    r.sp_qkv->q[rank].size());
+            const auto k16=convert_f16(r.sp_qkv->k[rank]);
+            const auto v16=convert_f16(r.sp_qkv->v[rank]);
+            ggml_backend_tensor_set(local->sp_k,k16.data(),0,ggml_nbytes(local->sp_k));
+            ggml_backend_tensor_set(local->sp_v,v16.data(),0,ggml_nbytes(local->sp_v));
+            ggml_backend_synchronize(devices[rank]);
+        }
+        m.direct_sp_qkv=true;
+    } else {
+        ggml_galaxy_layout::head_to_token(
+                devices,{pc.tp_q,phone.tp_q},{pc.sp_q,phone.sp_q},q_layout,r.tile_tokens);
+        ggml_galaxy_layout::head_to_token(
+                devices,{pc.tp_k,phone.tp_k},{pc.sp_k,phone.sp_k},kv_layout,r.tile_tokens);
+        ggml_galaxy_layout::head_to_token(
+                devices,{pc.tp_v,phone.tp_v},{pc.sp_v,phone.sp_v},kv_layout,r.tile_tokens);
+    }
     m.head_to_token_ms=ms(start);
 
     start=ggml_galaxy_profile::clock::now();
@@ -357,16 +394,23 @@ inline measurement run_native(const devices_t & devices, const request & r,
         ggml_backend_tensor_get(ranks[rank]->tp_output,actual.data(),0,actual.size());
         const std::vector<uint8_t> * expected =
                 reference_required ? r.reference.bytes[rank] : nullptr;
-        const auto & original_v=*r.v.bytes[rank];
+        const std::vector<uint8_t> * original_v =
+                r.sp_qkv == nullptr ? r.v.bytes[rank] : &r.sp_qkv->v[0];
         for (int64_t t=0;t<r.tokens;++t) {
             for (int64_t f=0;f<r.q.heads[rank]*r.head_dim;++f) {
                 const size_t ix=static_cast<size_t>(t*r.q.heads[rank]*r.head_dim+f);
                 const double val=read_f32(actual,ix);
                 require(std::isfinite(val),"non-finite native Flash result");
                 if (t==0) {
-                    const size_t k_index=static_cast<size_t>((f/r.head_dim/group)*r.head_dim+
-                                                              (f%r.head_dim));
-                    const double delta=val-read_f32(original_v,k_index);
+                    // In direct-SP mode token 0 is owned by rank 0 and
+                    // stores ALL KV heads. In TP mode each rank stores only
+                    // its own KV head slice.
+                    const int64_t global_head =
+                            (r.sp_qkv ? (rank==0?0:r.q.heads[0]) : 0) +
+                            f/r.head_dim;
+                    const size_t k_index=static_cast<size_t>(
+                            (global_head/group)*r.head_dim+(f%r.head_dim));
+                    const double delta=val-read_f32(*original_v,k_index);
                     first_sq+=delta*delta;
                     first_seen++;
                 }

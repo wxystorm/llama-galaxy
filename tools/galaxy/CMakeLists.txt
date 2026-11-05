@@ -4,6 +4,12 @@ add_executable(galaxy-tp-selftest galaxy-tp-selftest.cpp)
 target_include_directories(galaxy-tp-selftest PRIVATE ${CMAKE_SOURCE_DIR}/ggml/include)
 target_compile_features(galaxy-tp-selftest PRIVATE cxx_std_17)
 
+# Native Q/K/V projection selftest. Runs the same independent per-rank
+# MatMul+RoPE projector that the Hybrid L0 path will invoke.
+add_executable(galaxy-native-sp-qkv-selftest galaxy-native-sp-qkv-selftest.cpp)
+target_link_libraries(galaxy-native-sp-qkv-selftest PRIVATE ggml)
+target_compile_features(galaxy-native-sp-qkv-selftest PRIVATE cxx_std_17)
+
 # Standalone TP/SP collective correctness tests; no inference graph changes.
 add_executable(galaxy-collectives-selftest galaxy-collectives-selftest.cpp)
 target_link_libraries(galaxy-collectives-selftest PRIVATE ggml)

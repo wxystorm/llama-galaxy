@@ -2173,17 +2173,20 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     const char * final_sp_raw = std::getenv("LLAMA_GALAXY_SP_FINAL_LAYER");
     const bool live_hybrid_final_sp_requested = live_hybrid_ffn_requested &&
             final_sp_raw && std::strcmp(final_sp_raw, "1") == 0;
+    const char * native_qkv_raw = std::getenv("LLAMA_GALAXY_NATIVE_SP_QKV_L0");
+    const bool native_sp_qkv_l0 = native_qkv_raw && std::strcmp(native_qkv_raw,"1") == 0;
     const auto selected_layer = [&](const char * name, const char * stem) -> int {
         return live_plan.match_boundary(name,stem);
     };
     const bool qkv_capture_enabled = qkv_probe_enabled || live_shadow_requested;
-    const auto is_qkv_probe_node = [qkv_capture_enabled](const ggml_tensor * node) -> bool {
+    const auto is_qkv_probe_node = [qkv_capture_enabled,native_sp_qkv_l0](const ggml_tensor * node) -> bool {
         if (!qkv_capture_enabled || node == nullptr ||
                 (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 ||
                 node->ne[1] <= 0) {
             return false;
         }
-        return std::strncmp(node->name, "Qcur-", 5) == 0 ||
+        return (native_sp_qkv_l0 && std::strcmp(node->name,"attn_norm-0")==0) ||
+               std::strncmp(node->name, "Qcur-", 5) == 0 ||
                std::strncmp(node->name, "Kcur-", 5) == 0 ||
                std::strncmp(node->name, "Vcur-", 5) == 0 ||
                std::strncmp(node->name, "fattn_raw-", 10) == 0 ||
@@ -2352,12 +2355,122 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return work;
     };
 
+    // First native SP QKV step: MIRRORED attention-norm activation is
+    // scatter-by-token. Reassemble full quantized GGUF rows from the live
+    // TP weight shards, preserving exact row byte order and quant type.
+    // Decode / original TP KV writes are intentionally retained in v1.
+    const auto build_native_sp_qkv = [&](int layer, const ggml_galaxy_causal_live::request & work)
+            -> ggml_galaxy_qkv_sp::source {
+        if (layer!=0 || !native_sp_qkv_l0)
+            throw std::invalid_argument("SP QKV projection is enabled only for L0");
+        const ggml_tensor * norm=find_live_stage(layer,"attn_norm",false);
+        const auto snap=qkv_live_snapshots.find(norm);
+        if ((norm->op!=GGML_OP_MUL && norm->op!=GGML_OP_RMS_NORM) ||
+                norm->type!=GGML_TYPE_F32 ||
+                !ggml_is_contiguous(norm) || norm->ne[1]!=work.tokens ||
+                norm->ne[2]!=1 ||
+                ggml_backend_meta_get_split_state(norm,false).axis!=GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+                snap==qkv_live_snapshots.end() || snap->second.size()!=2 ||
+                snap->second[0].size()!=ggml_nbytes(norm) ||
+                snap->second[1].size()!=ggml_nbytes(norm)) {
+            throw std::invalid_argument("L0 normalized F32 mirrored producer snapshot missing");
+        }
+        ggml_galaxy_qkv_sp::source src;
+        src.hidden=norm->ne[0];
+        src.tokens=work.tokens;
+        src.head_dim=work.head_dim;
+        src.q_heads=ggml_galaxy_causal_live::total_heads(work.q);
+        src.kv_heads=ggml_galaxy_causal_live::total_heads(work.k);
+        src.normalized=snap->second[0];
+        src.positions.resize(size_t(src.tokens));
+        for (int64_t t=0;t<src.tokens;++t) src.positions[size_t(t)]=static_cast<int32_t>(t);
+
+        const auto leaf=[&](const std::string & name) -> const ggml_tensor * {
+            for (int i=0;i<cgraph->n_leafs;++i) {
+                if (std::strcmp(cgraph->leafs[i]->name,name.c_str())==0)
+                    return cgraph->leafs[i];
+            }
+            return nullptr;
+        };
+        const std::string prefix="blk."+std::to_string(layer)+".";
+        for (const char * bias : {"attn_q.bias","attn_k.bias","attn_v.bias"}) {
+            if (leaf(prefix+bias)) throw std::invalid_argument("biased L0 QKV not supported");
+        }
+        const auto full_weight=[&](const std::string & name)
+                -> ggml_galaxy_qkv_sp::weight {
+            const ggml_tensor * global=leaf(name);
+            if (!global || !ggml_backend_buffer_is_meta(global->buffer) ||
+                    global->ne[2]!=1 || global->ne[3]!=1)
+                throw std::invalid_argument("missing Meta full-QKV source "+name);
+            ggml_galaxy_qkv_sp::weight full;
+            full.type=global->type;
+            full.in=global->ne[0];
+            full.out=global->ne[1];
+            const size_t row_bytes=ggml_row_size(full.type,full.in);
+            full.bytes.resize(row_bytes*size_t(full.out));
+            int64_t rows=0;
+            for (int rank=0;rank<2;++rank) {
+                const ggml_tensor * local=ggml_backend_meta_buffer_simple_tensor(global,rank);
+                if (!local || !local->buffer || local->type!=full.type ||
+                        !ggml_is_contiguous(local) || local->ne[0]!=full.in ||
+                        local->ne[1]<=0 || local->ne[2]!=1 || local->ne[3]!=1 ||
+                        ggml_nbytes(local)!=row_bytes*size_t(local->ne[1]) ||
+                        rows+local->ne[1]>full.out)
+                    throw std::invalid_argument("TP QKV weight shard mismatch "+name);
+                ggml_backend_synchronize(backend_ctx->backend_configs[rank].backend);
+                ggml_backend_tensor_get(local,full.bytes.data()+row_bytes*size_t(rows),
+                        0,ggml_nbytes(local));
+                rows+=local->ne[1];
+            }
+            if(rows!=full.out) throw std::invalid_argument("incomplete QKV weight rows "+name);
+            full.validate();
+            return full;
+        };
+        src.wq=full_weight(prefix+"attn_q.weight");
+        src.wk=full_weight(prefix+"attn_k.weight");
+        src.wv=full_weight(prefix+"attn_v.weight");
+        const ggml_tensor * q=find_live_stage(layer,"Qcur",true);
+        const ggml_tensor * k=find_live_stage(layer,"Kcur",true);
+        if (q->src[2]!=k->src[2])
+            throw std::invalid_argument("Q/K RoPE factors disagree");
+        std::memcpy(src.q_rope_params.data(),q->op_params,sizeof(q->op_params));
+        std::memcpy(src.k_rope_params.data(),k->op_params,sizeof(k->op_params));
+        const ggml_tensor * factors=q->src[2];
+        if (factors) {
+            if (factors->type!=GGML_TYPE_F32 || !ggml_is_contiguous(factors) ||
+                    ggml_nelements(factors)!=work.head_dim/2)
+                throw std::invalid_argument("unsupported Llama RoPE freq factors");
+            src.rope_factors.resize(ggml_nbytes(factors));
+            if (ggml_backend_buffer_is_meta(factors->buffer)) {
+                const ggml_tensor * physical=ggml_backend_meta_buffer_simple_tensor(factors,0);
+                if (!physical || !physical->buffer ||
+                        ggml_nbytes(physical)!=src.rope_factors.size())
+                    throw std::invalid_argument("missing physical RoPE factors");
+                ggml_backend_tensor_get(physical,src.rope_factors.data(),0,src.rope_factors.size());
+            } else if (factors->buffer) {
+                ggml_backend_tensor_get(factors,src.rope_factors.data(),0,src.rope_factors.size());
+            } else if (factors->data) {
+                std::memcpy(src.rope_factors.data(),factors->data,src.rope_factors.size());
+            } else {
+                throw std::invalid_argument("original RoPE factors unreadable");
+            }
+        }
+        ggml_galaxy_qkv_sp::validate(src);
+        return src;
+    };
+
     if (trace) {
         GGML_LOG_INFO("[GALAXY_META_TRACE] event=GRAPH_BEGIN nodes=%d backends=%zu sp=%d uid=%" PRIu64 "\n",
                 cgraph->n_nodes, n_backends, int(has_galaxy_markers), cgraph->uid);
     }
     if (has_galaxy_markers && n_backends != 2) {
         GGML_LOG_ERROR("[GALAXY_SP] graph transitions need exactly two Meta backends\n");
+        return GGML_STATUS_FAILED;
+    }
+    if (native_sp_qkv_l0 &&
+            (!live_hybrid_ffn_requested || !live_replace_requested ||
+             !live_plan.contains(0) || n_backends!=2)) {
+        GGML_LOG_ERROR("[GALAXY_SP_QKV] requires two-rank Hybrid REPLACE with L0 selected\n");
         return GGML_STATUS_FAILED;
     }
     if (live_hybrid_ffn_requested) {
@@ -2984,7 +3097,25 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         backend_ctx->backend_configs[1].backend
                 };
                 std::array<std::vector<uint8_t>,2> outputs;
+                ggml_galaxy_qkv_sp::projected local_sp;
+                if (native_sp_qkv_l0 && raw_layer==0) {
+                    const auto started=ggml_galaxy_profile::clock::now();
+                    const auto sp_source=build_native_sp_qkv(raw_layer,work);
+                    local_sp=ggml_galaxy_qkv_sp::run(devs,sp_source);
+                    work.sp_qkv=&local_sp;
+                    const double elapsed=ggml_galaxy_profile::ms(started,
+                            ggml_galaxy_profile::clock::now());
+                    std::fprintf(stderr,
+                            "[GALAXY_SP_QKV] layer=0 mode=SP_NATIVE"
+                            " producer=FULL_WEIGHT_LOCAL_TOKENS local_tokens=%" PRId64 "+%" PRId64
+                            " projection_wall_ms=%.3f"
+                            " tp_projection_kept_for_kv=1 direct_native_flash=1 status=PASS\n",
+                            (work.tokens+1)/2,work.tokens/2,elapsed);
+                    std::fflush(stderr);
+                }
                 const auto measured=ggml_galaxy_causal_live::replace(devs,work,outputs);
+                if (native_sp_qkv_l0 && raw_layer==0 && !measured.direct_sp_qkv)
+                    throw std::invalid_argument("SP QKV was not consumed directly by native Flash");
                 for (int rank=0;rank<2;++rank) {
                     const ggml_tensor * local=
                             ggml_backend_meta_buffer_simple_tensor(original_last,rank);
@@ -3229,6 +3360,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 while(it != qkv_live_snapshots.end()) {
                     const ggml_tensor * captured=it->first;
                     const bool belongs_to_layer =
+                            selected_layer(captured->name,"attn_norm")==kqv_layer ||
                             selected_layer(captured->name,"Qcur")==kqv_layer ||
                             selected_layer(captured->name,"Kcur")==kqv_layer ||
                             selected_layer(captured->name,"Vcur")==kqv_layer ||
