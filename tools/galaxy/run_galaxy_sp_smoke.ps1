@@ -31,6 +31,7 @@ param(
     [switch]$CausalHybridFfnSp,
     [switch]$NativeSpQkvL0,
     [ValidateSet(0,1,2,4,8,16,28)][int]$NativeSpQkvPrefixLayers = 0,
+    [switch]$NativeSpQkvResidentWeights,
     [switch]$Trace,
     [switch]$DisableRpcGraphReuse,
     [switch]$DumpLogits,
@@ -89,6 +90,10 @@ $nativeSpQkvLayers = if ($nativeSpQkvCount -gt 0) {
     @()
 }
 $nativeSpQkvLayerList = $nativeSpQkvLayers -join ","
+if ($NativeSpQkvResidentWeights -and $nativeSpQkvCount -eq 0) {
+    throw "NativeSpQkvResidentWeights requires a native SP QKV prefix"
+}
+$residentExpected = if ($NativeSpQkvResidentWeights) { 1 } else { 0 }
 if ($nativeSpQkvCount -gt 0 -and (-not $CausalHybridFfnSp -or -not $LiveCausalReplace -or
         $LiveCausalPrefixLayers -lt $nativeSpQkvCount -or $SeqWeights -ne "1,1")) {
     throw "Native SP QKV prefix requires Hybrid REPLACE with Attention prefix >= QKV prefix, and SeqWeights 1,1"
@@ -130,7 +135,7 @@ $keys = @("LLAMA_GALAXY_TP", "LLAMA_GALAXY_TP_HEADS", "LLAMA_GALAXY_TP_FFN", "LL
     "LLAMA_GALAXY_STAGE_DUMP", "LLAMA_GALAXY_STAGE_DUMP_DIR",
     "LLAMA_GALAXY_FFN_OP_DUMP", "LLAMA_GALAXY_FFN_OP_DUMP_DIR",
     "LLAMA_GALAXY_QKV_PROBE_LAYERS", "LLAMA_GALAXY_QKV_PROBE_DIR",
-    "LLAMA_GALAXY_CAUSAL_LIVE_LAYER", "LLAMA_GALAXY_CAUSAL_LIVE_PREFIX_LAYERS", "LLAMA_GALAXY_CAUSAL_LIVE_MODE", "LLAMA_GALAXY_CAUSAL_HYBRID_FFN", "LLAMA_GALAXY_NATIVE_SP_QKV_L0", "LLAMA_GALAXY_NATIVE_SP_QKV_PREFIX_LAYERS",
+    "LLAMA_GALAXY_CAUSAL_LIVE_LAYER", "LLAMA_GALAXY_CAUSAL_LIVE_PREFIX_LAYERS", "LLAMA_GALAXY_CAUSAL_LIVE_MODE", "LLAMA_GALAXY_CAUSAL_HYBRID_FFN", "LLAMA_GALAXY_NATIVE_SP_QKV_L0", "LLAMA_GALAXY_NATIVE_SP_QKV_PREFIX_LAYERS", "LLAMA_GALAXY_NATIVE_SP_QKV_RESIDENT_WEIGHTS",
     "LLAMA_GALAXY_COLLECTIVE_TILE_TOKENS", "LLAMA_GALAXY_RS_FUSED_READ", "LLAMA_GALAXY_SP_SEQ_WEIGHTS",
     "LLAMA_GALAXY_SP_FINAL_LAYER", "LLAMA_GALAXY_RPC_DISABLE_GRAPH_REUSE")
 $old = @{}
@@ -191,6 +196,9 @@ try {
     $env:LLAMA_GALAXY_NATIVE_SP_QKV_PREFIX_LAYERS = if ($NativeSpQkvPrefixLayers -gt 0) {
         $NativeSpQkvPrefixLayers.ToString()
     } else { $null }
+    $env:LLAMA_GALAXY_NATIVE_SP_QKV_RESIDENT_WEIGHTS = if ($NativeSpQkvResidentWeights) {
+        "1"
+    } else { $null }
     $env:LLAMA_GALAXY_QKV_PROBE_LAYERS = if ($ProbeQkvLayers) { $ProbeQkvLayers } else { $null }
     $env:LLAMA_GALAXY_QKV_PROBE_DIR = if ($ProbeQkvLayers) {
         $probeDir = Join-Path $dir "real-qkv"
@@ -210,7 +218,7 @@ try {
         "-ub", $UBatch.ToString(), "-t", $Threads.ToString(),
         "-n", $NPredict.ToString(), "--temp", "0", "-f", $promptArg
     )
-    Write-Host "[GALAXY_SP_SMOKE] mode=$mode devices=$Devices rpc=$Rpc profiling=$([bool]$Profile) tile_tokens=$CollectiveTileTokens rs_fused=$([bool]$RsFusedRead) seq_weights=$SeqWeights final_layer_sp=$([bool]$FinalLayerSP) rpc_graph_reuse_disabled=$([bool]$DisableRpcGraphReuse) causal_hybrid_ffn=$([bool]$CausalHybridFfnSp) native_sp_qkv_prefix=$nativeSpQkvCount"
+    Write-Host "[GALAXY_SP_SMOKE] mode=$mode devices=$Devices rpc=$Rpc profiling=$([bool]$Profile) tile_tokens=$CollectiveTileTokens rs_fused=$([bool]$RsFusedRead) seq_weights=$SeqWeights final_layer_sp=$([bool]$FinalLayerSP) rpc_graph_reuse_disabled=$([bool]$DisableRpcGraphReuse) causal_hybrid_ffn=$([bool]$CausalHybridFfnSp) native_sp_qkv_prefix=$nativeSpQkvCount resident_weights=$residentExpected"
     if ($Galaxy2FfnSpLayerSet) {
         Write-Host "[GALAXY2] mode=explicit_layer_set schedule=$Galaxy2FfnSpLayerSet final_layer_sp=$([bool]$FinalLayerSP)"
     } elseif ($Galaxy2 -and $Galaxy2FfnSpLayers -ne "all") {
@@ -250,7 +258,7 @@ try {
     }
     if ($nativeSpQkvCount -gt 0) {
         $nativeWitnesses = @($hits | Where-Object {
-            $_.Line -match '^\[GALAXY_SP_QKV\] layer=([0-9]+) mode=SP_NATIVE .*local_tokens=[1-9][0-9]*\+[1-9][0-9]*.*tp_projection_kept_for_kv=1 direct_native_flash=1 status=PASS$'
+            $_.Line -match "^\[GALAXY_SP_QKV\] layer=([0-9]+) mode=SP_NATIVE .*local_tokens=[1-9][0-9]*\+[1-9][0-9]*.*tp_projection_kept_for_kv=1 direct_native_flash=1 resident_weights=$residentExpected runtime_weight_read_bytes=[0-9]+ runtime_weight_upload_bytes=[0-9]+ status=PASS$"
         })
         if ($nativeWitnesses.Count -ne $nativeSpQkvCount) {
             throw "Expected $nativeSpQkvCount native SP QKV layer witnesses; observed $($nativeWitnesses.Count). Inspect $stderr"
@@ -263,10 +271,155 @@ try {
         }
         $escapedNative = [regex]::Escape($nativeSpQkvLayerList)
         $nativeSummary = @($hits | Where-Object {
-            $_.Line -match "^\[GALAXY_SP_QKV_PREFIX_SUM\] mode=SP_NATIVE layers=$escapedNative completed=$nativeSpQkvCount expected=$nativeSpQkvCount all_layers_verified=1 tp_cache_preserved=1 status=PASS$"
+            $_.Line -match "^\[GALAXY_SP_QKV_PREFIX_SUM\] mode=SP_NATIVE layers=$escapedNative completed=$nativeSpQkvCount expected=$nativeSpQkvCount all_layers_verified=1 tp_cache_preserved=1 resident_weights=$residentExpected status=PASS$"
         })
         if ($nativeSummary.Count -ne 1) {
             throw "Native SP QKV full-prefix completion witness missing or duplicated. Inspect $stderr"
+        }
+        if ($NativeSpQkvResidentWeights) {
+            foreach ($entry in $nativeWitnesses) {
+                if ($entry.Line -notmatch "runtime_weight_read_bytes=0 runtime_weight_upload_bytes=0 status=PASS$") {
+                    throw "Resident QKV ran, but inference weight read/upload is nonzero: $($entry.Line)"
+                }
+            }
+            $loaded = @($hits | Where-Object {
+                $_.Line -match '\[GALAXY_SP_QKV_RESIDENT_LOAD\] tensor=blk\.[0-9]+\.attn_(q|k|v)\.weight .*phase=MODEL_LOAD status=PASS
+            })
+            if ($loaded.Count -ne 3*$nativeSpQkvCount) {
+                throw "Expected $($nativeSpQkvCount*3) model-load resident QKV weights; got $($loaded.Count). Inspect $stderr"
+            }
+        }
+        Write-Host $nativeSummary[0].Line.Trim()
+    }
+    if (-not $PureTP -and -not $spWitness) {
+        Write-Warning "SP run exited normally but no positive ReduceScatter count was logged. Actual SP collective execution remains UNVERIFIED."
+    }
+    if ($liveEnabled) {
+        $anyFailure = @($hits | Where-Object {
+            $_.Line -match '\[GALAXY_CAUSAL_(LIVE|REPLACE|PREFIX)(_|\])' -and
+            $_.Line -match 'status=FAIL'
+        })
+        if ($anyFailure.Count -gt 0) {
+            throw "Causal live execution reported failures. Inspect $stderr"
+        }
+        $liveMode = if ($LiveCausalReplace) { "REPLACE" } else { "SHADOW" }
+        $escapedLayers = [regex]::Escape($liveLayerList)
+        $prefixSummary = @($hits | Where-Object {
+            $_.Line -match "\[GALAXY_CAUSAL_PREFIX_SUM\] mode=$liveMode layers=$escapedLayers completed=$liveCount expected=$liveCount all_layers_verified=1 status=PASS"
+        })
+        if ($prefixSummary.Count -lt 1) {
+            throw "Causal prefix did not verify ALL $liveCount layers ($liveLayerList). Inspect $stderr"
+        }
+
+        foreach ($layer in $selectedLiveLayers) {
+            $layerTag = "layer=$layer(?![0-9])"
+            if ($LiveCausalReplace) {
+                $pass = @($hits | Where-Object {
+                    $_.Line -match "\[GALAXY_CAUSAL_LIVE\] $layerTag.*mode=REPLACE.*tp_flash_skipped=1.*pre_wo_identity=BYTE_EXACT status=PASS"
+                })
+                $summary = @($hits | Where-Object {
+                    $_.Line -match "\[GALAXY_CAUSAL_REPLACE_SUM\] $layerTag.*mode=REPLACE status=PASS"
+                })
+                if ($pass.Count -lt 1 -or $summary.Count -lt 1) {
+                    throw "Layer $layer has no verified REPLACE / pre-W_o result. Inspect $stderr"
+                }
+                foreach ($rank in @(0,1)) {
+                    $skip = @($hits | Where-Object {
+                        $_.Line -match "\[GALAXY_CAUSAL_REPLACE_DISPATCH\] $layerTag rank=$rank(?![0-9]).*tp_flash_skipped=1 status=PASS"
+                    })
+                    $consumed = @($hits | Where-Object {
+                        $_.Line -match "\[GALAXY_CAUSAL_REPLACE_VERIFY\] $layerTag rank=$rank(?![0-9]).*pre_wo_identity=BYTE_EXACT status=PASS"
+                    })
+                    if ($skip.Count -lt 1 -or $consumed.Count -lt 1) {
+                        throw "Layer $layer rank $rank did not prove TP Flash skip and SP output consumption. Inspect $stderr"
+                    }
+                }
+            } else {
+                $pass = @($hits | Where-Object {
+                    $_.Line -match "\[GALAXY_CAUSAL_LIVE\] $layerTag.*mode=SHADOW.*status=PASS"
+                })
+                if ($pass.Count -lt 1) {
+                    throw "Layer $layer missing live Shadow numerical witness. Inspect $stderr"
+                }
+            }
+        }
+        if ($CausalHybridFfnSp) {
+            $hybridWitness = @($hits | Where-Object {
+                $_.Line -match "\[GALAXY_CAUSAL_HYBRID_FFN_SUM\] mode=REPLACE attention_replaced=$liveCount\b.*ffn_sp_layers=[1-9][0-9]*.*status=PASS"
+            })
+            if ($hybridWitness.Count -ne 1) {
+                throw "Hybrid SP FFN execution witness missing or duplicated. Inspect $stderr"
+            }
+            Write-Host $hybridWitness[0].Line.Trim()
+        }
+        if ($LiveCausalReplace) {
+            Write-Host "[GALAXY_CAUSAL_PREFIX] mode=REPLACE layers=$liveLayerList reference=SEPARATE_TP_BASELINE_REQUIRED result=ALL_WO_INPUTS_CONFIRMED"
+        } else {
+            Write-Host "[GALAXY_CAUSAL_PREFIX] mode=SHADOW layers=$liveLayerList reference=IN_FLIGHT result=ALL_LAYERS_CONFIRMED"
+        }
+    }
+    if ($Profile) { Write-Host "[GALAXY_PROFILE] directory=$($env:LLAMA_GALAXY_PROFILE_DIR)" }
+    if ($DumpLayers) { Write-Host "[GALAXY_LAYER_DUMP] layers=$DumpLayers dir=$($env:LLAMA_GALAXY_LAYER_DUMP_DIR)" }
+    if ($DumpStages) {
+        $stageNames = @("ffn_inp", "ffn_norm")
+        foreach ($layer in $DumpStages.Split(",")) {
+            foreach ($stage in $stageNames) {
+                $snapshot = Join-Path $env:LLAMA_GALAXY_STAGE_DUMP_DIR "$stage-$layer.f32"
+                if ($DumpStages -ne "all" -and (-not (Test-Path -LiteralPath $snapshot) -or
+                        (Get-Item -LiteralPath $snapshot).Length -le 8)) {
+                    throw "Missing Galaxy diagnostic stage snapshot: $snapshot"
+                }
+            }
+        }
+        Write-Host "[GALAXY_STAGE_DUMP] layers=$DumpStages dir=$($env:LLAMA_GALAXY_STAGE_DUMP_DIR)"
+    }
+    if ($DumpFfnOps) {
+        if ($DumpFfnOps -ne "all") {
+            foreach ($layer in $DumpFfnOps.Split(",")) {
+                foreach ($stage in @("ffn_up", "ffn_gate", "ffn_swiglu")) {
+                    $snapshot = Join-Path $env:LLAMA_GALAXY_FFN_OP_DUMP_DIR "$stage-$layer.f32"
+                    if (-not (Test-Path -LiteralPath $snapshot) -or
+                            (Get-Item -LiteralPath $snapshot).Length -le 8) {
+                        throw "Missing Galaxy FFN operator snapshot: $snapshot"
+                    }
+                }
+            }
+        }
+        Write-Host "[GALAXY_FFN_OP_DUMP] layers=$DumpFfnOps dir=$($env:LLAMA_GALAXY_FFN_OP_DUMP_DIR)"
+    }
+    if ($ProbeQkvLayers) {
+        $probeRoot = $env:LLAMA_GALAXY_QKV_PROBE_DIR
+        $tokenRuns = @(Get-ChildItem -LiteralPath $probeRoot -Directory -Filter "tokens-*" |
+            Where-Object { $_.Name -match '^tokens-([0-9]+)$' } |
+            Sort-Object @{Expression = { [int64]$_.Name.Substring(7) }; Descending = $true})
+        if ($tokenRuns.Count -eq 0) {
+            throw "No multi-token QKV snapshots found: $probeRoot"
+        }
+        $latest = $tokenRuns[0].FullName
+        if ($ProbeQkvLayers -ne "all") {
+            foreach ($layer in $ProbeQkvLayers.Split(",")) {
+                foreach ($stage in @("Qcur", "Kcur", "Vcur", "fattn_raw", "kqv_out")) {
+                    $snap = Join-Path $latest "$stage-$layer.f32"
+                    if (-not (Test-Path -LiteralPath $snap) -or
+                            (Get-Item -LiteralPath $snap).Length -le 8) {
+                        throw "Missing real-model QKV probe snapshot: $snap"
+                    }
+                }
+            }
+        }
+        Write-Host "[GALAXY_REAL_QKV] layers=$ProbeQkvLayers largest_tokens=$($tokenRuns[0].Name) dir=$latest"
+    }
+    $spEvidence = if ($PureTP) { "N/A" } elseif ($spWitness) { "CONFIRMED" } else { "UNVERIFIED" }
+    Write-Host "[GALAXY_SP_SMOKE] PASS mode=$mode inference=PASS sp_collectives=$spEvidence"
+}
+finally {
+    foreach ($key in $keys) { [Environment]::SetEnvironmentVariable($key, $old[$key], "Process") }
+}
+
+            })
+            if ($loaded.Count -ne 3*$nativeSpQkvCount) {
+                throw "Expected $($nativeSpQkvCount*3) model-load resident QKV weights; got $($loaded.Count). Inspect $stderr"
+            }
         }
         Write-Host $nativeSummary[0].Line.Trim()
     }

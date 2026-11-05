@@ -3,8 +3,9 @@
 // Experimental first-prefill SP QKV projector. Unlike the Hybrid TP->SP
 // attention bridge, each rank evaluates full Wq/Wk/Wv on ONLY its own token
 // interval and applies the model's actual RoPE op_params at absolute positions.
-// Quantized GGUF weights are reconstructed once per projection from the
-// existing TP rank shards (never approximated or dequantized on the host).
+// Either borrow model-load-resident full GGUF QKV matrices on each backend,
+// or reconstruct the full matrices from TP shards in the staged fallback.
+// Neither mode approximates or dequantizes GGUF weights on the host.
 // The existing TP KV cache path is intentionally left untouched in v1.
 
 #include "ggml.h"
@@ -29,11 +30,14 @@ struct weight {
     ggml_type type = GGML_TYPE_F32;
     int64_t in = 0;
     int64_t out = 0;
-    std::vector<uint8_t> bytes;  // contiguous full [in,out] GGUF matrix
+    std::vector<uint8_t> bytes;  // populated only by legacy staged mode
 
-    void validate() const {
+    void validate_shape() const {
         check(in > 0 && out > 0 && in % ggml_blck_size(type) == 0,
               "weight shape / quantization block misaligned");
+    }
+    void validate() const {
+        validate_shape();
         check(bytes.size() == ggml_row_size(type, in) * size_t(out),
               "full mirrored weight has incorrect byte extent");
     }
@@ -43,6 +47,11 @@ struct source {
     weight wq;
     weight wk;
     weight wv;
+    // These physical model-owned tensors remain valid for the model buffer
+    // lifetime. The projection graphs borrow them; they never free them.
+    // Rank 0=PC, rank 1=Phone; per rank: 0=Wq,1=Wk,2=Wv.
+    bool resident_weights = false;
+    std::array<std::array<ggml_tensor *,3>,2> physical_weights = {};
     int64_t hidden = 0;
     int64_t tokens = 0;
     int64_t head_dim = 0;
@@ -64,9 +73,28 @@ struct projected {
 };
 
 inline void validate(const source & s) {
-    s.wq.validate();
-    s.wk.validate();
-    s.wv.validate();
+    if (s.resident_weights) {
+        s.wq.validate_shape();
+        s.wk.validate_shape();
+        s.wv.validate_shape();
+        const std::array<const weight *,3> shapes={&s.wq,&s.wk,&s.wv};
+        for (int rank=0;rank<2;++rank) {
+            for (int kind=0;kind<3;++kind) {
+                const ggml_tensor * t=s.physical_weights[rank][kind];
+                check(t != nullptr && t->buffer != nullptr && t->op == GGML_OP_NONE &&
+                      t->view_src == nullptr && t->type == shapes[kind]->type &&
+                      t->ne[0] == shapes[kind]->in &&
+                      t->ne[1] == shapes[kind]->out &&
+                      t->ne[2] == 1 && t->ne[3] == 1 &&
+                      ggml_is_contiguous(t),
+                      "model-owned resident QKV tensor missing or has wrong shape/type");
+            }
+        }
+    } else {
+        s.wq.validate();
+        s.wk.validate();
+        s.wv.validate();
+    }
     check(s.tokens >= 8 && s.tokens <= 512 && s.hidden > 0 &&
           (s.head_dim == 64 || s.head_dim == 128) &&
           s.q_heads > 0 && s.kv_heads > 0 && s.q_heads % s.kv_heads == 0,
@@ -151,9 +179,15 @@ struct rank_graph {
         local = rank == 0 ? first : s.tokens-first;
         check(local > 0, "empty local token interval");
 
-        wq = ggml_new_tensor_2d(ctx,s.wq.type,s.wq.in,s.wq.out);
-        wk = ggml_new_tensor_2d(ctx,s.wk.type,s.wk.in,s.wk.out);
-        wv = ggml_new_tensor_2d(ctx,s.wv.type,s.wv.in,s.wv.out);
+        // Resident mode uses GGML model-weight tensors already allocated
+        // by the Meta model loader on THIS physical backend. The graph
+        // allocates only activations, RoPE positions and output tensors.
+        wq = s.resident_weights ? s.physical_weights[rank][0] :
+                ggml_new_tensor_2d(ctx,s.wq.type,s.wq.in,s.wq.out);
+        wk = s.resident_weights ? s.physical_weights[rank][1] :
+                ggml_new_tensor_2d(ctx,s.wk.type,s.wk.in,s.wk.out);
+        wv = s.resident_weights ? s.physical_weights[rank][2] :
+                ggml_new_tensor_2d(ctx,s.wv.type,s.wv.in,s.wv.out);
         inp = ggml_new_tensor_2d(ctx,GGML_TYPE_F32,s.hidden,local);
         pos = ggml_new_tensor_1d(ctx,GGML_TYPE_I32,local);
         if (!s.rope_factors.empty()) {
@@ -200,9 +234,11 @@ struct rank_graph {
     rank_graph & operator=(const rank_graph &) = delete;
 
     void upload(ggml_backend_t backend, const source & s) {
-        ggml_backend_tensor_set(wq,s.wq.bytes.data(),0,s.wq.bytes.size());
-        ggml_backend_tensor_set(wk,s.wk.bytes.data(),0,s.wk.bytes.size());
-        ggml_backend_tensor_set(wv,s.wv.bytes.data(),0,s.wv.bytes.size());
+        if (!s.resident_weights) {
+            ggml_backend_tensor_set(wq,s.wq.bytes.data(),0,s.wq.bytes.size());
+            ggml_backend_tensor_set(wk,s.wk.bytes.data(),0,s.wk.bytes.size());
+            ggml_backend_tensor_set(wv,s.wv.bytes.data(),0,s.wv.bytes.size());
+        }
         const size_t row = size_t(s.hidden)*sizeof(float);
         ggml_backend_tensor_set(inp,s.normalized.data()+size_t(begin)*row,0,size_t(local)*row);
         ggml_backend_tensor_set(pos,s.positions.data()+begin,0,size_t(local)*sizeof(int32_t));

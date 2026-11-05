@@ -26,7 +26,9 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -429,6 +431,42 @@ struct ggml_backend_meta_simple_tensor_container {
     ggml_backend_meta_simple_tensor_container() {}
 };
 
+// Optional model-buffer-owned SP-QKV full-weight replicas.
+// Constructed when model buffers are allocated, populated by the same
+// GGUF set_tensor callbacks, and destroyed with the model Meta buffer.
+// No static/global pointers or cross-model caches.
+struct ggml_backend_meta_resident_qkv {
+    std::vector<ggml_context_ptr> contexts;
+    std::vector<ggml_backend_buffer_ptr> buffers;
+    std::vector<ggml_tensor *> tensors;
+    std::vector<std::pair<size_t,size_t>> loaded_ranges;
+    size_t total_bytes = 0;
+
+    void record_write(size_t offset, size_t size) {
+        if (offset > total_bytes || size > total_bytes-offset) {
+            throw std::invalid_argument("resident SP QKV GGUF write exceeds tensor");
+        }
+        if (size==0) return;
+        loaded_ranges.emplace_back(offset,offset+size);
+        std::sort(loaded_ranges.begin(),loaded_ranges.end());
+        std::vector<std::pair<size_t,size_t>> merged;
+        for (const auto & interval:loaded_ranges) {
+            if (merged.empty() || merged.back().second<interval.first) {
+                merged.push_back(interval);
+            } else {
+                merged.back().second=std::max(merged.back().second,interval.second);
+            }
+        }
+        loaded_ranges=std::move(merged);
+    }
+    bool ready() const {
+        return loaded_ranges.size()==1 &&
+               loaded_ranges.front().first==0 &&
+               loaded_ranges.front().second==total_bytes &&
+               tensors.size()==2;
+    }
+};
+
 struct ggml_backend_meta_buffer_context {
     // FIXME
     // Most tensors can simply be stored statically in their own buffer.
@@ -442,6 +480,8 @@ struct ggml_backend_meta_buffer_context {
     int stc_compute_index      = 0;
     int stc_compute_index_next = 0;
     std::vector<ggml_backend_buffer_ptr> bufs;
+    std::map<const ggml_tensor *, ggml_backend_meta_resident_qkv> resident_qkv;
+    std::mutex resident_qkv_mutex;
 
     // FIXME
     // The size of the split state cache is unbounded and can theoretically grow infinitely large.
@@ -504,6 +544,19 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
     }
     return it->second[index];
 }
+// This is intentionally a model-buffer lookup: the mirror lifetime is
+// attached to the model, not to a temporary graph or a backend pointer.
+static ggml_tensor * ggml_backend_meta_resident_qkv_tensor(
+        const ggml_tensor * model_weight, size_t rank) {
+    if (!model_weight || !model_weight->buffer ||
+            !ggml_backend_buffer_is_meta(model_weight->buffer)) return nullptr;
+    auto * ctx=static_cast<ggml_backend_meta_buffer_context *>(model_weight->buffer->context);
+    const auto it=ctx->resident_qkv.find(model_weight);
+    if (it==ctx->resident_qkv.end() || !it->second.ready() ||
+            rank>=it->second.tensors.size()) return nullptr;
+    return it->second.tensors[rank];
+}
+
 // 判断一个张量是否是静态的，即是否在静态简单张量容器中存在
 static bool ggml_backend_meta_tensor_is_static(
         const ggml_tensor * tensor) {
@@ -1384,6 +1437,32 @@ ggml_backend_meta_try_set_local_file_2d(
 }
 
 static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    // When loading the model, copy the ORIGINAL full quantized GGUF bytes
+    // to both persistent SP-QKV buffers. Never reconstruct from TP shards
+    // at inference time. Track all write ranges, not only final chunk size.
+    auto * meta_ctx=static_cast<ggml_backend_meta_buffer_context *>(buffer->context);
+    auto native=meta_ctx->resident_qkv.find(tensor);
+    if (native!=meta_ctx->resident_qkv.end()) {
+        // Model loaders may issue subrange writes: serialize coverage updates
+        // and copying to the same long-lived physical weight tensor.
+        std::lock_guard<std::mutex> guard(meta_ctx->resident_qkv_mutex);
+        auto & mirror=native->second;
+        const bool was_ready=mirror.ready();
+        if (offset>mirror.total_bytes || size>mirror.total_bytes-offset)
+            throw std::invalid_argument("SP QKV load-time mirror offset/size out of range");
+        if (size>0) {
+            for (auto * full:mirror.tensors) {
+                ggml_backend_tensor_set(full,data,offset,size);
+            }
+        }
+        mirror.record_write(offset,size);
+        if (!was_ready && mirror.ready()) {
+            GGML_LOG_INFO("[GALAXY_SP_QKV_RESIDENT_LOAD] tensor=%s"
+                    " bytes=%zu ranks=2 phase=MODEL_LOAD status=PASS
+",
+                    tensor->name,mirror.total_bytes);
+        }
+    }
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
@@ -1872,6 +1951,75 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
     return ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, buf_ctx, max_size);
 }
 
+// Extra full Q/K/V weights for native token-sharded projector, prepared
+// alongside model tensor allocation. TP model weights stay split for Decode.
+static void ggml_backend_meta_prepare_resident_qkv(
+        ggml_context * model_ctx, ggml_backend_meta_buffer_context * meta_ctx,
+        ggml_backend_buffer_type_t meta_buft) {
+    const char * raw=std::getenv("LLAMA_GALAXY_NATIVE_SP_QKV_RESIDENT_WEIGHTS");
+    if (!raw || std::strcmp(raw,"1")!=0) return;
+    const auto plan=ggml_galaxy_causal_layers::native_qkv_from_environment();
+    if (!plan.valid() || plan.layers.empty() || meta_ctx->bufs.size()!=2) {
+        throw std::invalid_argument("SP QKV resident weights require a valid two-rank native prefix");
+    }
+    size_t total_bytes=0, selected_tensors=0;
+    for (ggml_tensor * t=ggml_get_first_tensor(model_ctx);
+         t!=nullptr; t=ggml_get_next_tensor(model_ctx,t)) {
+        int layer=-1;
+        const std::string name(t->name);
+        for (const int candidate:plan.layers) {
+            const std::string stem="blk."+std::to_string(candidate)+".attn_";
+            if (name==stem+"q.weight" || name==stem+"k.weight" ||
+                    name==stem+"v.weight") {
+                layer=candidate;
+                break;
+            }
+        }
+        if (layer<0) continue;
+        if (t->op!=GGML_OP_NONE || t->view_src || t->ne[2]!=1 ||
+                t->ne[3]!=1 || !ggml_is_contiguous(t) ||
+                ggml_backend_meta_get_split_state(t,false).axis!=GGML_BACKEND_SPLIT_AXIS_1) {
+            throw std::invalid_argument("SP QKV resident model weight is not a static TP head shard: "+name);
+        }
+        ggml_backend_meta_resident_qkv mirror;
+        mirror.total_bytes=ggml_nbytes(t);
+        for (size_t rank=0;rank<2;++rank) {
+            const ggml_init_params params={size_t(64)*1024,nullptr,true};
+            ggml_context * raw_ctx=ggml_init(params);
+            if (!raw_ctx) throw std::runtime_error("SP QKV resident GGML context allocation failed");
+            ggml_context_ptr own_ctx(raw_ctx);
+            ggml_tensor * full=ggml_new_tensor_2d(raw_ctx,t->type,t->ne[0],t->ne[1]);
+            ggml_set_name(full,t->name);
+            const auto physical_buft=ggml_backend_meta_buft_simple_buft(meta_buft,rank);
+            ggml_backend_buffer_ptr physical(
+                    ggml_backend_alloc_ctx_tensors_from_buft(raw_ctx,physical_buft));
+            if (!physical || !full->buffer || ggml_nbytes(full)!=mirror.total_bytes)
+                throw std::runtime_error("SP QKV resident physical weight allocation failed: "+name);
+            ggml_backend_buffer_set_usage(physical.get(),GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            mirror.tensors.push_back(full);
+            mirror.contexts.emplace_back(std::move(own_ctx));
+            mirror.buffers.emplace_back(std::move(physical));
+        }
+        if (!meta_ctx->resident_qkv.emplace(t,std::move(mirror)).second) {
+            throw std::runtime_error("duplicate SP QKV resident weight "+name);
+        }
+        ++selected_tensors;
+        total_bytes+=ggml_nbytes(t);
+        GGML_LOG_INFO("[GALAXY_SP_QKV_RESIDENT_ALLOC] layer=%d tensor=%s"
+                " bytes_per_rank=%zu ranks=2 phase=MODEL_ALLOC status=PASS\n",
+                layer,name.c_str(),ggml_nbytes(t));
+    }
+    // Called for both MODEL and COMPUTE Meta buffer contexts; not every
+    // context contains model weights. Never require global coverage within
+    // one buffer. At inference each selected Q/K/V must resolve to a fully
+    // loaded mirror or the native projector rejects that layer.
+    if (selected_tensors) {
+        GGML_LOG_INFO("[GALAXY_SP_QKV_RESIDENT_ALLOC_SUM] requested_layers=%zu"
+                " weights_in_this_buffer=%zu bytes_per_rank=%zu status=PASS\n",
+                plan.layers.size(),selected_tensors,total_bytes);
+    }
+}
+
 struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
 
@@ -1894,6 +2042,9 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
     ggml_backend_meta_buffer_context * meta_buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
 
     ggml_backend_buffer_t meta_buf = ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, meta_buf_ctx, 0);
+    // If optional resident allocations fail, release all Meta and physical
+    // buffers instead of leaking model memory during a failed model load.
+    ggml_backend_buffer_ptr meta_guard(meta_buf);
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {    //这里是张量切分主要逻辑
         t->buffer = meta_buf;
         ggml_backend_meta_buffer_init_tensor_impl(meta_buf_ctx->stc_static, t); //后端切分张量
@@ -1923,7 +2074,10 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
         GGML_ASSERT(meta_buf_ctx->bufs[i]);
         meta_buf->size = std::max(meta_buf->size, ggml_backend_buffer_get_size(meta_buf_ctx->bufs[i].get()));
     }
-    return meta_buf;    //里面的context指向的就是meta_buf_ctx
+    // Both physical model buffers now exist; allocate mirrors BEFORE
+    // llama_model_loader starts writing their GGUF weights.
+    ggml_backend_meta_prepare_resident_qkv(ctx,meta_buf_ctx,buft);
+    return meta_guard.release();    //里面的context指向的就是meta_buf_ctx
 }
 
 //
@@ -2180,6 +2334,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return GGML_STATUS_FAILED;
     }
     const bool native_sp_qkv_requested = !native_qkv_plan.layers.empty();
+    const char * resident_raw=std::getenv("LLAMA_GALAXY_NATIVE_SP_QKV_RESIDENT_WEIGHTS");
+    const bool resident_qkv_requested=resident_raw && std::strcmp(resident_raw,"1")==0;
     const auto selected_layer = [&](const char * name, const char * stem) -> int {
         return live_plan.match_boundary(name,stem);
     };
@@ -2390,6 +2546,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         src.q_heads=ggml_galaxy_causal_live::total_heads(work.q);
         src.kv_heads=ggml_galaxy_causal_live::total_heads(work.k);
         src.normalized=snap->second[0];
+        src.resident_weights=resident_qkv_requested;
         src.positions.resize(size_t(src.tokens));
         for (int64_t t=0;t<src.tokens;++t) src.positions[size_t(t)]=static_cast<int32_t>(t);
 
@@ -2402,7 +2559,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         const std::string prefix="blk."+std::to_string(layer)+".";
         const auto full_weight=[&](const ggml_tensor * producer,
                                    const char * suffix,
-                                   const std::array<int64_t,2> & rank_heads)
+                                   const std::array<int64_t,2> & rank_heads,
+                                   int weight_kind)
                 -> ggml_galaxy_qkv_sp::weight {
             const std::string name=prefix+suffix;
             const ggml_tensor * global=ggml_galaxy_qkv_sp::projection_weight(producer,norm,name);
@@ -2413,14 +2571,42 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (split.axis!=GGML_BACKEND_SPLIT_AXIS_1 ||
                     global->ne[2]!=1 || global->ne[3]!=1 ||
                     global->ne[1]!=(rank_heads[0]+rank_heads[1])*work.head_dim) {
-                throw std::invalid_argument("QKV weight "+name+
-                        " does not match TP head-shard layout");
+                throw std::invalid_argument("QKV weight "+name+" does not match TP head-shard layout");
             }
             ggml_galaxy_qkv_sp::weight full;
             full.type=global->type;
             full.in=global->ne[0];
             full.out=global->ne[1];
             const size_t row_bytes=ggml_row_size(full.type,full.in);
+            if (resident_qkv_requested) {
+                // Model buffer owns the replicas and their lifetime.
+                // No inference-time TP shard readback or weight uploads.
+                for (int rank=0;rank<2;++rank) {
+                    ggml_tensor * resident=ggml_backend_meta_resident_qkv_tensor(global,rank);
+                    if (!resident || !resident->buffer ||
+                            resident->type!=full.type ||
+                            resident->ne[0]!=full.in || resident->ne[1]!=full.out ||
+                            resident->ne[2]!=1 || resident->ne[3]!=1 ||
+                            ggml_nbytes(resident)!=row_bytes*size_t(full.out)) {
+                        throw std::invalid_argument("resident QKV weight not fully loaded on rank "+
+                                std::to_string(rank)+": "+name);
+                    }
+                    if (!ggml_backend_supports_buft(
+                            backend_ctx->backend_configs[rank].backend,
+                            ggml_backend_buffer_get_type(resident->buffer))) {
+                        throw std::invalid_argument("resident QKV weight on unsupported physical backend: "+name);
+                    }
+                    src.physical_weights[rank][weight_kind]=resident;
+                }
+                std::fprintf(stderr,
+                        "[GALAXY_SP_QKV_WEIGHT] layer=%d tensor=%s"
+                        " source=RESIDENT_MODEL_LOAD meta_split=AXIS_1"
+                        " rows=%" PRId64 " bytes_per_rank=%zu"
+                        " runtime_read_bytes=0 runtime_upload_bytes=0 status=PASS\n",
+                        layer,name.c_str(),full.out,row_bytes*size_t(full.out));
+                std::fflush(stderr);
+                return full;
+            }
             full.bytes.resize(row_bytes*size_t(full.out));
             int64_t rows=0;
             for (int rank=0;rank<2;++rank) {
@@ -2452,9 +2638,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             std::fflush(stderr);
             return full;
         };
-        src.wq=full_weight(q,"attn_q.weight",work.q.heads);
-        src.wk=full_weight(k,"attn_k.weight",work.k.heads);
-        src.wv=full_weight(v,"attn_v.weight",work.v.heads);
+        src.wq=full_weight(q,"attn_q.weight",work.q.heads,0);
+        src.wk=full_weight(k,"attn_k.weight",work.k.heads,1);
+        src.wv=full_weight(v,"attn_v.weight",work.v.heads,2);
         if (q->src[2]!=k->src[2])
             throw std::invalid_argument("Q/K RoPE factors disagree");
         std::memcpy(src.q_rope_params.data(),q->op_params,sizeof(q->op_params));
@@ -2489,6 +2675,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     }
     if (has_galaxy_markers && n_backends != 2) {
         GGML_LOG_ERROR("[GALAXY_SP] graph transitions need exactly two Meta backends\n");
+        return GGML_STATUS_FAILED;
+    }
+    if (resident_qkv_requested && !native_sp_qkv_requested) {
+        GGML_LOG_ERROR("[GALAXY_SP_QKV_RESIDENT] requires native SP QKV prefix\n");
         return GGML_STATUS_FAILED;
     }
     if (native_sp_qkv_requested) {
@@ -3130,10 +3320,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 std::array<std::vector<uint8_t>,2> outputs;
                 ggml_galaxy_qkv_sp::projected local_sp;
                 double sp_projection_ms = 0.0;
+                size_t native_qkv_weight_bytes=0;
                 const bool native_selected = native_qkv_plan.contains(raw_layer);
                 if (native_selected) {
                     const auto started=ggml_galaxy_profile::clock::now();
                     const auto sp_source=build_native_sp_qkv(raw_layer,work);
+                    native_qkv_weight_bytes=
+                            ggml_row_size(sp_source.wq.type,sp_source.wq.in)*size_t(sp_source.wq.out)+
+                            ggml_row_size(sp_source.wk.type,sp_source.wk.in)*size_t(sp_source.wk.out)+
+                            ggml_row_size(sp_source.wv.type,sp_source.wv.in)*size_t(sp_source.wv.out);
                     local_sp=ggml_galaxy_qkv_sp::run(devs,sp_source);
                     work.sp_qkv=&local_sp;
                     sp_projection_ms=ggml_galaxy_profile::ms(started,
@@ -3149,8 +3344,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             "[GALAXY_SP_QKV] layer=%d mode=SP_NATIVE"
                             " producer=FULL_WEIGHT_LOCAL_TOKENS local_tokens=%" PRId64 "+%" PRId64
                             " projection_wall_ms=%.3f"
-                            " tp_projection_kept_for_kv=1 direct_native_flash=1 status=PASS\n",
-                            raw_layer,(work.tokens+1)/2,work.tokens/2,sp_projection_ms);
+                            " tp_projection_kept_for_kv=1 direct_native_flash=1"
+                            " resident_weights=%d runtime_weight_read_bytes=%zu"
+                            " runtime_weight_upload_bytes=%zu status=PASS\n",
+                            raw_layer,(work.tokens+1)/2,work.tokens/2,sp_projection_ms,
+                            int(resident_qkv_requested),
+                            resident_qkv_requested ? size_t(0) : native_qkv_weight_bytes,
+                            resident_qkv_requested ? size_t(0) : 2*native_qkv_weight_bytes);
                     std::fflush(stderr);
                 }
                 for (int rank=0;rank<2;++rank) {
@@ -4134,9 +4334,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             std::fprintf(stderr,
                     "[GALAXY_SP_QKV_PREFIX_SUM] mode=SP_NATIVE layers=%s"
                     " completed=%zu expected=%zu all_layers_verified=1"
-                    " tp_cache_preserved=1 status=PASS\n",
+                    " tp_cache_preserved=1 resident_weights=%d status=PASS\n",
                     native_qkv_plan.description().c_str(),
-                    native_qkv_completed.size(),expected.size());
+                    native_qkv_completed.size(),expected.size(),
+                    int(resident_qkv_requested));
             std::fflush(stderr);
         }
     }

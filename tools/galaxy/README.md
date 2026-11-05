@@ -2329,3 +2329,41 @@ Optional intermediate prefixes: `-AttentionPrefix 4 -FfnSpLayerSet "0-3" -Native
 For each selected layer `N`, the Meta executor logs an actual producer result `[GALAXY_SP_QKV] layer=N mode=SP_NATIVE ... direct_native_flash=1 status=PASS`. A layer is counted as **completed** only after the Native Attention output is injected and its `kqv_out` input into `W_o` is verified byte-for-byte. At the end of the prefill, it logs `[GALAXY_SP_QKV_PREFIX_SUM] mode=SP_NATIVE layers=0,... completed=N expected=N all_layers_verified=1 tp_cache_preserved=1 status=PASS`. The PowerShell runner independently verifies both the exact set of per-layer witnesses and the full-prefix summary, and records `native_sp_qkv_prefix` and `native_sp_qkv_layers` in `manifest.json`. Neither partial execution nor duplicate layer evidence is accepted. A two-token warmup is allowed to skip all selected layers.
 
 **Not yet optimized:** full quantized Q/K/V weights are reassembled from TP shards and uploaded to both physical backends for *each* layer during Prefill. The original TP Q/K/V graph continues to write the existing KV Cache for later TP Decode. This is a deliberate temporary dual-producer stage, not a measured speedup or an SP Decode implementation. Next work after execution acceptance: persistent mirrored QKV weights prepared at model load, then remove redundant TP projection while preserving the exact Decode/KV semantics. Numerical parity is not part of this experiment's pass criterion.
+
+ 
+### Optional model-resident native QKV weights (2026-11-06)
+
+After the 28+28+28 native QKV/Attention/FFN **execution** chain passed, the next isolated experiment adds `-NativeSpQkvResidentWeights`. This is a separate opt-in from `-NativeSpQkvPrefixLayers`: when enabled, the Meta model allocator allocates independent, **full Wq/Wk/Wv tensors on both PC CUDA and Phone RPC** for each selected SP-QKV layer. During original GGUF loading, full contiguous quantized weight data is written into those tensors. Their GGML context and physical backend buffers are owned by the **Meta model buffer** for the entire model lifetime and freed with it. The existing TP model shards stay unchanged to preserve KV-cache updates and Decode. No RPC protocol change or permanent global cache.
+
+During Prefill, native SP QKV MatMul graphs now *borrow* those already-loaded physical model tensors directly: there is no per-layer TP-weight readback/reconstruction and no separate inference-time weight allocation/upload. Runtime checks fail closed if the model buffer has not fully populated a selected rank's weight. The nonresident path remains unchanged, allowing A/B tests. This moves QKV weight transfer to model loading and allocates **additional full QKV memory on both devices**; it does not eliminate the original TP QKV compute or model-load transfer overhead. The resident run must independently confirm that all 3N weight copies finished loading and every selected layer executed with zero inferred weight transfer bytes.
+
+Build the PC binary and two relevant tests:
+
+```powershell
+git pull --ff-only origin feat/galaxy-baseline
+cmake --build build-galaxy --config Release --target llama-cli galaxy-tp-selftest galaxy-native-sp-qkv-selftest -j 8
+.\build-galaxy\bin\Release\galaxy-tp-selftest.exe
+.\build-galaxy\bin\Release\galaxy-native-sp-qkv-selftest.exe
+```
+
+Compare staged and resident weights with the **same** `$common` and selected FFN+Attention configuration; start with two layers to check allocation and model loading:
+
+```powershell
+.\tools\galaxy\run_galaxy_causal_hybrid_ffn.ps1 -Common $common -AttentionPrefix 2 -FfnSpLayerSet "0-1" -NativeSpQkvPrefixLayers 2 -NativeSpQkvResidentWeights -Trace
+```
+
+Then full 28 layers:
+
+```powershell
+.\tools\galaxy\run_galaxy_causal_hybrid_ffn.ps1 -Common $common -AttentionPrefix 28 -FfnSpLayerSet all -FinalLayerSP -NativeSpQkvPrefixLayers 28 -NativeSpQkvResidentWeights
+```
+
+Expected logs, in load/execution order:
+
+- `[GALAXY_SP_QKV_RESIDENT_ALLOC] ... phase=MODEL_ALLOC status=PASS`
+- `[GALAXY_SP_QKV_RESIDENT_LOAD] tensor=blk.N.attn_(q|k|v).weight ... phase=MODEL_LOAD status=PASS` (3 per selected layer, one per full weight)
+- `[GALAXY_SP_QKV_WEIGHT] layer=N ... source=RESIDENT_MODEL_LOAD ... runtime_read_bytes=0 runtime_upload_bytes=0 status=PASS` (Q/K/V)
+- `[GALAXY_SP_QKV] layer=N mode=SP_NATIVE ... direct_native_flash=1 resident_weights=1 runtime_weight_read_bytes=0 runtime_weight_upload_bytes=0 status=PASS`
+- `[GALAXY_SP_QKV_PREFIX_SUM] ... completed=N expected=N ... resident_weights=1 status=PASS`
+
+Only the PC needs rebuilding. `manifest.json` captures the resident flag and verifies its per-Prefill transfer byte count is zero; this covers **QKV model weights only**, not normal activations, K/V AllGather, or output transfers. Throughput comparisons must separate model-load wall time from prompt-evaluation time. All full-layer modes still keep the old TP QKV projections until a safe SP KV-cache write integration is available; numerical parity remains unverified.

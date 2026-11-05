@@ -136,6 +136,57 @@ int main() {
         validate(s);
         const projected out=run({pc,phone},s);
         check_geometry(out,s);
+
+        // The resident path uses model-buffer-owned QKV tensors, supplied
+        // from DIFFERENT GGML contexts than each invocation's activation
+        // graph. Verify that no ephemeral weight allocation or upload is
+        // required and that the external MatMul leaves execute correctly.
+        source resident=s;
+        resident.resident_weights=true;
+        resident.wq.bytes.clear();
+        resident.wk.bytes.clear();
+        resident.wv.bytes.clear();
+        std::array<ggml_context *,2> model_ctxs{};
+        std::array<ggml_backend_buffer_t,2> model_bufs{};
+        const std::array<ggml_backend_t,2> devices={pc,phone};
+        const std::array<const weight *,3> weights={&s.wq,&s.wk,&s.wv};
+        for (int rank=0;rank<2;++rank) {
+            const ggml_init_params mp={size_t(32)*1024,nullptr,true};
+            model_ctxs[rank]=ggml_init(mp);
+            expect(model_ctxs[rank]!=nullptr,"model weight GGML context failed");
+            for(int kind=0;kind<3;++kind) {
+                const weight & w=*weights[kind];
+                resident.physical_weights[rank][kind]=ggml_new_tensor_2d(
+                        model_ctxs[rank],w.type,w.in,w.out);
+            }
+            model_bufs[rank]=ggml_backend_alloc_ctx_tensors(
+                    model_ctxs[rank],devices[rank]);
+            expect(model_bufs[rank]!=nullptr,"model weight backend buffer failed");
+            for(int kind=0;kind<3;++kind) {
+                ggml_backend_tensor_set(resident.physical_weights[rank][kind],
+                        weights[kind]->bytes.data(),0,weights[kind]->bytes.size());
+            }
+        }
+        validate(resident);
+        const projected native_resident=run(devices,resident);
+        check_geometry(native_resident,resident);
+        for(int rank=0;rank<2;++rank) {
+            expect(native_resident.q[rank]==out.q[rank] &&
+                   native_resident.k[rank]==out.k[rank] &&
+                   native_resident.v[rank]==out.v[rank],
+                   "model-resident QKV differs from legacy per-invocation upload");
+        }
+        source missing=resident;
+        missing.physical_weights[1][0]=nullptr;
+        bool rejected_missing=false;
+        try { validate(missing); }
+        catch (const std::invalid_argument &) { rejected_missing=true; }
+        expect(rejected_missing,"resident projector must reject missing backend weight");
+        for(int rank=1;rank>=0;--rank) {
+            ggml_backend_buffer_free(model_bufs[rank]);
+            ggml_free(model_ctxs[rank]);
+        }
+
         source bad=s;
         bad.positions[4]=0;
         bool rejected=false;
@@ -145,7 +196,8 @@ int main() {
         ggml_backend_free(phone);
         ggml_backend_free(pc);
         std::cout << "GALAXY_NATIVE_SP_QKV_SELFTEST PASS full_weights=1 local_tokens=4+4"
-                     " matmul=1 rope=1 direct_sp=1" << std::endl;
+                     " matmul=1 rope=1 direct_sp=1 resident_backend_weights=PASS"
+                     " unchanged_outputs=PASS" << std::endl;
         return 0;
     } catch (const std::exception & e) {
         std::cerr << "GALAXY_NATIVE_SP_QKV_SELFTEST FAIL " << e.what() << std::endl;
