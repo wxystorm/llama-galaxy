@@ -3085,7 +3085,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         // predecessor nodes have already been dispatched normally.
         if (is_replace_raw_boundary) {
             try {
-                const auto work=build_live_request(raw_layer,nullptr);
+                auto work=build_live_request(raw_layer,nullptr);
                 if (work.tokens!=original_last->ne[2] ||
                         work.head_dim!=original_last->ne[0] ||
                         work.q.heads[0]+work.q.heads[1]!=original_last->ne[1]) {
