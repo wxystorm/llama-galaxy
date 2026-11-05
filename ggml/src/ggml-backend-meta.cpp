@@ -2173,19 +2173,24 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     const char * final_sp_raw = std::getenv("LLAMA_GALAXY_SP_FINAL_LAYER");
     const bool live_hybrid_final_sp_requested = live_hybrid_ffn_requested &&
             final_sp_raw && std::strcmp(final_sp_raw, "1") == 0;
-    const char * native_qkv_raw = std::getenv("LLAMA_GALAXY_NATIVE_SP_QKV_L0");
-    const bool native_sp_qkv_l0 = native_qkv_raw && std::strcmp(native_qkv_raw,"1") == 0;
+    const auto native_qkv_plan = ggml_galaxy_causal_layers::native_qkv_from_environment();
+    if (!native_qkv_plan.valid()) {
+        GGML_LOG_ERROR("[GALAXY_SP_QKV] invalid selector: %s\n",
+                native_qkv_plan.error.c_str());
+        return GGML_STATUS_FAILED;
+    }
+    const bool native_sp_qkv_requested = !native_qkv_plan.layers.empty();
     const auto selected_layer = [&](const char * name, const char * stem) -> int {
         return live_plan.match_boundary(name,stem);
     };
     const bool qkv_capture_enabled = qkv_probe_enabled || live_shadow_requested;
-    const auto is_qkv_probe_node = [qkv_capture_enabled,native_sp_qkv_l0](const ggml_tensor * node) -> bool {
+    const auto is_qkv_probe_node = [qkv_capture_enabled,&native_qkv_plan](const ggml_tensor * node) -> bool {
         if (!qkv_capture_enabled || node == nullptr ||
                 (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 ||
                 node->ne[1] <= 0) {
             return false;
         }
-        return (native_sp_qkv_l0 && std::strcmp(node->name,"attn_norm-0")==0) ||
+        return native_qkv_plan.match_boundary(node->name,"attn_norm")>=0 ||
                std::strncmp(node->name, "Qcur-", 5) == 0 ||
                std::strncmp(node->name, "Kcur-", 5) == 0 ||
                std::strncmp(node->name, "Vcur-", 5) == 0 ||
@@ -2200,12 +2205,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // by Layer M's kqv_out, even when the two have the same byte extent.
     struct live_layer_state {
         std::array<std::vector<uint8_t>,2> tp_heads;
+        bool native_sp_qkv = false;
         bool pending = false;
         bool verified = false;
         int64_t tokens = 0;
     };
     std::map<int,live_layer_state> live_states;
     std::set<int> live_shadow_verified;
+    std::set<int> native_qkv_completed;
 
     // Name alone is not identity: projection, reshape and RoPE can all
     // share "Qcur-0". Restrict selection to the actual OUTPUT node that
@@ -2361,8 +2368,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // Decode / original TP KV writes are intentionally retained in v1.
     const auto build_native_sp_qkv = [&](int layer, const ggml_galaxy_causal_live::request & work)
             -> ggml_galaxy_qkv_sp::source {
-        if (layer!=0 || !native_sp_qkv_l0)
-            throw std::invalid_argument("SP QKV projection is enabled only for L0");
+        if (!native_qkv_plan.contains(layer))
+            throw std::invalid_argument("SP QKV projection layer is not selected");
         const ggml_tensor * norm=find_live_stage(layer,"attn_norm",false);
         const auto snap=qkv_live_snapshots.find(norm);
         if ((norm->op!=GGML_OP_MUL && norm->op!=GGML_OP_RMS_NORM) ||
@@ -2373,7 +2380,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 snap==qkv_live_snapshots.end() || snap->second.size()!=2 ||
                 snap->second[0].size()!=ggml_nbytes(norm) ||
                 snap->second[1].size()!=ggml_nbytes(norm)) {
-            throw std::invalid_argument("L0 normalized F32 mirrored producer snapshot missing");
+            throw std::invalid_argument("layer "+std::to_string(layer)+
+                    " normalized F32 mirrored producer snapshot missing");
         }
         ggml_galaxy_qkv_sp::source src;
         src.hidden=norm->ne[0];
@@ -2483,11 +2491,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         GGML_LOG_ERROR("[GALAXY_SP] graph transitions need exactly two Meta backends\n");
         return GGML_STATUS_FAILED;
     }
-    if (native_sp_qkv_l0 &&
-            (!live_hybrid_ffn_requested || !live_replace_requested ||
-             !live_plan.contains(0) || n_backends!=2)) {
-        GGML_LOG_ERROR("[GALAXY_SP_QKV] requires two-rank Hybrid REPLACE with L0 selected\n");
-        return GGML_STATUS_FAILED;
+    if (native_sp_qkv_requested) {
+        if (!live_hybrid_ffn_requested || !live_replace_requested || n_backends!=2) {
+            GGML_LOG_ERROR("[GALAXY_SP_QKV] requires two-rank Hybrid REPLACE\n");
+            return GGML_STATUS_FAILED;
+        }
+        for (const int layer : native_qkv_plan.layers) {
+            if (!live_plan.contains(layer)) {
+                GGML_LOG_ERROR("[GALAXY_SP_QKV] layer=%d not in selected Attention prefix\n",
+                        layer);
+                return GGML_STATUS_FAILED;
+            }
+        }
     }
     if (live_hybrid_ffn_requested) {
         const char * galaxy2_raw = std::getenv("LLAMA_GALAXY2");
@@ -3114,24 +3129,30 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 };
                 std::array<std::vector<uint8_t>,2> outputs;
                 ggml_galaxy_qkv_sp::projected local_sp;
-                if (native_sp_qkv_l0 && raw_layer==0) {
+                double sp_projection_ms = 0.0;
+                const bool native_selected = native_qkv_plan.contains(raw_layer);
+                if (native_selected) {
                     const auto started=ggml_galaxy_profile::clock::now();
                     const auto sp_source=build_native_sp_qkv(raw_layer,work);
                     local_sp=ggml_galaxy_qkv_sp::run(devs,sp_source);
                     work.sp_qkv=&local_sp;
-                    const double elapsed=ggml_galaxy_profile::ms(started,
+                    sp_projection_ms=ggml_galaxy_profile::ms(started,
                             ggml_galaxy_profile::clock::now());
+                }
+                const auto measured=ggml_galaxy_causal_live::replace(devs,work,outputs);
+                if (native_selected) {
+                    if (!measured.direct_sp_qkv) {
+                        throw std::invalid_argument(
+                                "SP QKV was not consumed directly by native Flash");
+                    }
                     std::fprintf(stderr,
-                            "[GALAXY_SP_QKV] layer=0 mode=SP_NATIVE"
+                            "[GALAXY_SP_QKV] layer=%d mode=SP_NATIVE"
                             " producer=FULL_WEIGHT_LOCAL_TOKENS local_tokens=%" PRId64 "+%" PRId64
                             " projection_wall_ms=%.3f"
                             " tp_projection_kept_for_kv=1 direct_native_flash=1 status=PASS\n",
-                            (work.tokens+1)/2,work.tokens/2,elapsed);
+                            raw_layer,(work.tokens+1)/2,work.tokens/2,sp_projection_ms);
                     std::fflush(stderr);
                 }
-                const auto measured=ggml_galaxy_causal_live::replace(devs,work,outputs);
-                if (native_sp_qkv_l0 && raw_layer==0 && !measured.direct_sp_qkv)
-                    throw std::invalid_argument("SP QKV was not consumed directly by native Flash");
                 for (int rank=0;rank<2;++rank) {
                     const ggml_tensor * local=
                             ggml_backend_meta_buffer_simple_tensor(original_last,rank);
@@ -3162,6 +3183,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                 }
                 auto & state=live_states.at(raw_layer);
+                state.native_sp_qkv=native_selected;
                 state.tp_heads=std::move(outputs);
                 state.pending=true;
                 state.tokens=work.tokens;
@@ -3286,6 +3308,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
             state.pending=false;
             state.verified=true;
+            if (state.native_sp_qkv) {
+                if (!native_qkv_plan.contains(kqv_layer) ||
+                        !native_qkv_completed.insert(kqv_layer).second) {
+                    GGML_LOG_ERROR("[GALAXY_SP_QKV] layer=%d unexpected/duplicate verification\n",
+                            kqv_layer);
+                    return GGML_STATUS_FAILED;
+                }
+            } else if (native_qkv_plan.contains(kqv_layer)) {
+                GGML_LOG_ERROR("[GALAXY_SP_QKV] layer=%d selected but no SP producer\n",
+                        kqv_layer);
+                return GGML_STATUS_FAILED;
+            }
             for(auto & bytes:state.tp_heads) bytes.clear();
             std::fprintf(stderr,
                     "[GALAXY_CAUSAL_LIVE] layer=%d tokens=%" PRId64
@@ -4079,6 +4113,32 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     completed,live_plan.layers.size());
         }
         if(completed>0) std::fflush(stderr);
+    }
+    if (native_sp_qkv_requested) {
+        size_t attention_completed=0;
+        for (const int layer: live_plan.layers) {
+            const auto found=live_states.find(layer);
+            if (found != live_states.end() && found->second.verified) ++attention_completed;
+        }
+        // A 2-token warmup may complete none; real Prefill must cover all
+        // selected Attention and SP-QKV layers within one graph invocation.
+        if (attention_completed == live_plan.layers.size()) {
+            const std::set<int> expected(native_qkv_plan.layers.begin(),
+                                         native_qkv_plan.layers.end());
+            if (native_qkv_completed != expected) {
+                GGML_LOG_ERROR("[GALAXY_SP_QKV_PREFIX_SUM] completed=%zu expected=%zu"
+                        " status=FAIL reason=NATIVE_LAYER_COVERAGE\n",
+                        native_qkv_completed.size(),expected.size());
+                return GGML_STATUS_FAILED;
+            }
+            std::fprintf(stderr,
+                    "[GALAXY_SP_QKV_PREFIX_SUM] mode=SP_NATIVE layers=%s"
+                    " completed=%zu expected=%zu all_layers_verified=1"
+                    " tp_cache_preserved=1 status=PASS\n",
+                    native_qkv_plan.description().c_str(),
+                    native_qkv_completed.size(),expected.size());
+            std::fflush(stderr);
+        }
     }
     if (live_hybrid_ffn_requested && !hybrid_attention_rs.empty()) {
         size_t attention_replaced = 0;

@@ -265,11 +265,10 @@ inline bool causal_live_shadow_enabled(int64_t il) {
     return ggml_galaxy_causal_layers::enabled(il);
 }
 
-// A separate opt-in L0 producer, used only by the first multi-token Prefill.
-// The old TP QKV projection is retained for persistent KV-cache writes.
-inline bool native_sp_qkv_l0_enabled(int64_t il) {
-    const char * raw=std::getenv("LLAMA_GALAXY_NATIVE_SP_QKV_L0");
-    return il == 0 && raw != nullptr && std::string(raw) == "1";
+// Native SP QKV is an independently selected leading-layer prefix.
+// The original TP KV-cache path is preserved until SP Decode is implemented.
+inline bool native_sp_qkv_enabled(int64_t il) {
+    return ggml_galaxy_causal_layers::native_qkv_enabled(il);
 }
 
 inline std::vector<int64_t> parse_counts(const char * text, const char * key, size_t n_devices) {

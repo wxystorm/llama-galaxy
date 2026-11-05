@@ -98,4 +98,38 @@ inline bool enabled(int64_t layer) {
     return from_environment().contains(layer);
 }
 
+// Native SP-QKV shares the causal Attention contiguous-prefix contract.
+// The historical L0-only selector remains valid, but it cannot be mixed
+// with the new multi-layer prefix.
+inline plan parse_native_qkv(const char * legacy_l0, const char * prefix_layers) {
+    const bool legacy = legacy_l0 && *legacy_l0;
+    const bool prefix = prefix_layers && *prefix_layers;
+    if (legacy && prefix) {
+        plan result;
+        result.requested = true;
+        result.error = "choose LLAMA_GALAXY_NATIVE_SP_QKV_L0 or "
+                       "LLAMA_GALAXY_NATIVE_SP_QKV_PREFIX_LAYERS, not both";
+        return result;
+    }
+    if (legacy) {
+        if (std::string(legacy_l0) != "1") {
+            plan result;
+            result.requested = true;
+            result.error = "legacy LLAMA_GALAXY_NATIVE_SP_QKV_L0 must be 1";
+            return result;
+        }
+        return parse("0", nullptr);
+    }
+    return parse(nullptr, prefix_layers);
+}
+
+inline plan native_qkv_from_environment() {
+    return parse_native_qkv(std::getenv("LLAMA_GALAXY_NATIVE_SP_QKV_L0"),
+                            std::getenv("LLAMA_GALAXY_NATIVE_SP_QKV_PREFIX_LAYERS"));
+}
+
+inline bool native_qkv_enabled(int64_t layer) {
+    return native_qkv_from_environment().contains(layer);
+}
+
 } // namespace ggml_galaxy_causal_layers

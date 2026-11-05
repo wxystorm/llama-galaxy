@@ -140,10 +140,10 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                 model.layers[il].attn_norm, NULL,
                 LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
-        // The native L0 SP QKV producer consumes the exact, fully scaled
-        // RMSNorm result before TP QKV projection. Pin its producer buffer
+        // Selected native SP QKV layers consume the exact scaled RMSNorm
+        // result before the original TP projection and KV cache writes. Pin its producer buffer
         // and force a Meta subgraph boundary to capture it at completion.
-        if (!embed && n_tokens > 1 && llama_galaxy_tp::native_sp_qkv_l0_enabled(il)) {
+        if (!embed && n_tokens > 1 && llama_galaxy_tp::native_sp_qkv_enabled(il)) {
             ggml_set_output(cur);
         }
             //归一化

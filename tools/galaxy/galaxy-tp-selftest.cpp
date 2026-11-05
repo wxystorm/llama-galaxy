@@ -111,6 +111,35 @@ int main() {
             "Galaxy2 legacy unset means all eligible");
     must_throw([] { (void) llama_galaxy_tp::galaxy2_resolve_ffn_sp_mask("0", "1", 27); });
     must_throw([] { (void) llama_galaxy_tp::galaxy2_resolve_ffn_sp_mask("27", nullptr, 27); });
+    // Shared native SP QKV prefix parser: exact selected layers, legacy L0,
+    // fail-closed invalid choices, no mixing of both environment selectors.
+    const auto qkv_none = ggml_galaxy_causal_layers::parse_native_qkv(nullptr,nullptr);
+    const auto qkv_one = ggml_galaxy_causal_layers::parse_native_qkv("1",nullptr);
+    const auto qkv_two = ggml_galaxy_causal_layers::parse_native_qkv(nullptr,"2");
+    const auto qkv_eight = ggml_galaxy_causal_layers::parse_native_qkv(nullptr,"8");
+    const auto qkv_full = ggml_galaxy_causal_layers::parse_native_qkv(nullptr,"28");
+    require_test(qkv_none.valid() && qkv_none.layers.empty(),"QKV default off");
+    require_test(qkv_one.valid() && qkv_one.layers.size()==1 &&
+            qkv_one.contains(0) && !qkv_one.contains(1),"legacy native L0");
+    require_test(qkv_two.valid() && qkv_two.layers.size()==2 &&
+            qkv_two.contains(0) && qkv_two.contains(1) && !qkv_two.contains(2),
+            "native SP QKV two-layer prefix");
+    require_test(qkv_eight.valid() && qkv_eight.layers.size()==8 &&
+            qkv_eight.match_boundary("attn_norm-7","attn_norm")==7 &&
+            qkv_eight.match_boundary("attn_norm-8","attn_norm")==-1,
+            "native SP QKV eight-layer boundary");
+    require_test(qkv_full.valid() && qkv_full.layers.size()==28 &&
+            qkv_full.contains(27) && !qkv_full.contains(28),
+            "native SP QKV full Llama3.2 28-layer prefix");
+    for (const char * bad : {"0","3","29","all","08","1,2","-1","1a"}) {
+        require_test(!ggml_galaxy_causal_layers::parse_native_qkv(nullptr,bad).valid(),
+                "invalid native SP QKV prefix must fail closed");
+    }
+    require_test(!ggml_galaxy_causal_layers::parse_native_qkv("1","8").valid(),
+            "cannot combine legacy L0 with multi-layer QKV selector");
+    require_test(!ggml_galaxy_causal_layers::parse_native_qkv("0",nullptr).valid(),
+            "legacy native SP QKV must be enabled explicitly with 1");
+
     // Stage and final-layer snapshot selection share the exact same parser.
     require_test(llama_galaxy_tp::layer_selection_contains("0,1", 0), "stage selected 0");
     require_test(llama_galaxy_tp::layer_selection_contains("0,1", 1), "stage selected 1");

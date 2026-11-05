@@ -2301,3 +2301,31 @@ CUDA + Phone still need the Windows/Android user-device run above.
 #### L0 SP-QKV producer weight lookup correction (2026-11-05)
 
 The initial L0 smoke failed at `missing Meta full-QKV source blk.0.attn_q.weight` after successfully capturing Q/K/V and scaled `attn_norm-0`. This was a lookup bug: a Meta inference graph is not required to enumerate the original model weight in `cgraph->leafs`. The L0 projector now follows the *actual* Q/K/V producer ancestry (`ROPE -> RESHAPE -> MUL_MAT` for Q/K, `RESHAPE -> MUL_MAT` for V) to the exact named `MUL_MAT.src[0]` weight. It also checks the original normalized input at `MUL_MAT.src[1]`, the Meta head-split layout and per-rank row extents before copying the quantized bytes. Any unsupported bias/LoRA/fused path fails explicitly. A CPU selftest now constructs this graph and verifies the three weight paths plus cross-layer/incorrect-input rejection. Recompile PC `llama-cli` and `galaxy-native-sp-qkv-selftest`, then rerun the unchanged `-NativeSpQkvL0` Hybrid command. No Phone RPC protocol change.
+
+ 
+### Native Q/K/V SP prefix rollout (2026-11-06)
+
+After the L0 native MatMul/RoPE producer passed on the real PC CUDA + Phone RPC pair, the same producer now supports **contiguous leading-layer prefixes** of 1, 2, 4, 8, 16 and 28 layers. The exact same selector is consumed by both Llama model graph construction (which pins each scaled `attn_norm-N` producer) and the Meta executor (which reads quantized MatMul weight shards and runs token-local Q/K/V on both devices). A requested native prefix must be entirely contained within the selected Attention REPLACE prefix. The original `-NativeSpQkvL0` switch remains available and is mutually exclusive with `-NativeSpQkvPrefixLayers`.
+
+For Windows PC:
+
+```powershell
+git pull --ff-only origin feat/galaxy-baseline
+cmake --build build-galaxy --config Release --target llama-cli galaxy-tp-selftest galaxy-native-sp-qkv-selftest -j 8
+.\build-galaxy\bin\Release\galaxy-tp-selftest.exe
+.\build-galaxy\bin\Release\galaxy-native-sp-qkv-selftest.exe
+```
+
+Then staged execution (same `$common` Llama3.2-3B model / 98-token prompt / Phone RPC):
+
+```powershell
+.\tools\galaxy\run_galaxy_causal_hybrid_ffn.ps1 -Common $common -AttentionPrefix 2 -FfnSpLayerSet "0-1" -NativeSpQkvPrefixLayers 2 -Trace
+.\tools\galaxy\run_galaxy_causal_hybrid_ffn.ps1 -Common $common -AttentionPrefix 8 -FfnSpLayerSet "0-7" -NativeSpQkvPrefixLayers 8
+.\tools\galaxy\run_galaxy_causal_hybrid_ffn.ps1 -Common $common -AttentionPrefix 28 -FfnSpLayerSet "all" -FinalLayerSP -NativeSpQkvPrefixLayers 28
+```
+
+Optional intermediate prefixes: `-AttentionPrefix 4 -FfnSpLayerSet "0-3" -NativeSpQkvPrefixLayers 4`, or 16 analogously.
+
+For each selected layer `N`, the Meta executor logs an actual producer result `[GALAXY_SP_QKV] layer=N mode=SP_NATIVE ... direct_native_flash=1 status=PASS`. A layer is counted as **completed** only after the Native Attention output is injected and its `kqv_out` input into `W_o` is verified byte-for-byte. At the end of the prefill, it logs `[GALAXY_SP_QKV_PREFIX_SUM] mode=SP_NATIVE layers=0,... completed=N expected=N all_layers_verified=1 tp_cache_preserved=1 status=PASS`. The PowerShell runner independently verifies both the exact set of per-layer witnesses and the full-prefix summary, and records `native_sp_qkv_prefix` and `native_sp_qkv_layers` in `manifest.json`. Neither partial execution nor duplicate layer evidence is accepted. A two-token warmup is allowed to skip all selected layers.
+
+**Not yet optimized:** full quantized Q/K/V weights are reassembled from TP shards and uploaded to both physical backends for *each* layer during Prefill. The original TP Q/K/V graph continues to write the existing KV Cache for later TP Decode. This is a deliberate temporary dual-producer stage, not a measured speedup or an SP Decode implementation. Next work after execution acceptance: persistent mirrored QKV weights prepared at model load, then remove redundant TP projection while preserving the exact Decode/KV semantics. Numerical parity is not part of this experiment's pass criterion.

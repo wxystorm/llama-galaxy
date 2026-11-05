@@ -10,6 +10,7 @@ param(
     [string]$FfnSpLayerSet = "0",
     [switch]$FinalLayerSP,
     [switch]$NativeSpQkvL0,
+    [ValidateSet(0,1,2,4,8,16,28)][int]$NativeSpQkvPrefixLayers = 0,
     [switch]$Trace,
     [string]$OutputDir = ".\\galaxy-sp-results\\causal-hybrid-ffn"
 )
@@ -19,6 +20,15 @@ $ErrorActionPreference = "Stop"
 if ($FinalLayerSP -and $AttentionPrefix -ne 28) {
     throw "FinalLayerSP requires AttentionPrefix 28, including Attention L27"
 }
+if ($NativeSpQkvL0 -and $NativeSpQkvPrefixLayers -gt 0) {
+    throw "Choose NativeSpQkvL0 or NativeSpQkvPrefixLayers, not both"
+}
+$nativeCount = if ($NativeSpQkvL0) { 1 } else { $NativeSpQkvPrefixLayers }
+if ($nativeCount -gt $AttentionPrefix) {
+    throw "Native QKV-SP prefix must not exceed AttentionPrefix"
+}
+$nativeLayers = if ($nativeCount -gt 0) { @(0..($nativeCount - 1)) } else { @() }
+$nativeLayerList = $nativeLayers -join ","
 if ([string]::IsNullOrWhiteSpace($FfnSpLayerSet) -or $FfnSpLayerSet -eq "none") {
     throw "Choose at least one FFN-SP layer"
 }
@@ -58,7 +68,7 @@ $opts = @{}
 foreach ($key in $Common.Keys) { $opts[$key] = $Common[$key] }
 foreach ($name in @("PureTP","Galaxy2","Galaxy2FfnSpLayers","Galaxy2FfnSpLayerSet",
                     "LiveCausalLayer","LiveCausalPrefixLayers","LiveCausalReplace",
-                    "FinalLayerSP","DumpLogits","OutputDir","CausalHybridFfnSp","NativeSpQkvL0","Trace")) {
+                    "FinalLayerSP","DumpLogits","OutputDir","CausalHybridFfnSp","NativeSpQkvL0","NativeSpQkvPrefixLayers","Trace")) {
     [void]$opts.Remove($name)
 }
 $opts["Galaxy2"] = $true
@@ -68,11 +78,12 @@ $opts["LiveCausalPrefixLayers"] = $AttentionPrefix
 $opts["LiveCausalReplace"] = $true
 $opts["CausalHybridFfnSp"] = $true
 $opts["NativeSpQkvL0"] = [bool]$NativeSpQkvL0
+$opts["NativeSpQkvPrefixLayers"] = $NativeSpQkvPrefixLayers
 $opts["FinalLayerSP"] = [bool]$FinalLayerSP
 $opts["DumpLogits"] = $false
 $opts["Trace"] = [bool]$Trace
 $opts["OutputDir"] = $runRoot
-Write-Host "[GALAXY_CAUSAL_HYBRID] event=START attention_prefix=$AttentionPrefix ffn_sp_layer_set=$resolvedSet final_layer_sp=$([bool]$FinalLayerSP) native_sp_qkv_l0=$([bool]$NativeSpQkvL0)"
+Write-Host "[GALAXY_CAUSAL_HYBRID] event=START attention_prefix=$AttentionPrefix ffn_sp_layer_set=$resolvedSet final_layer_sp=$([bool]$FinalLayerSP) native_sp_qkv_prefix=$nativeCount"
 & $smoke @opts
 $run = @(Get-ChildItem -LiteralPath $runRoot -Directory -Filter "hybrid-*" | Sort-Object LastWriteTime -Descending)
 if ($run.Count -ne 1) {
@@ -84,6 +95,13 @@ if ($witness.Count -ne 1) {
     throw "Missing or duplicate hybrid summary: $stderr"
 }
 $line = $witness[0].Line
+if ($nativeCount -gt 0) {
+    $escapedNative = [regex]::Escape($nativeLayerList)
+    $nativeSummary = @(Select-String -LiteralPath $stderr -Pattern "^\[GALAXY_SP_QKV_PREFIX_SUM\] mode=SP_NATIVE layers=$escapedNative completed=$nativeCount expected=$nativeCount all_layers_verified=1 tp_cache_preserved=1 status=PASS$")
+    if ($nativeSummary.Count -ne 1) {
+        throw "Missing Native SP QKV prefix verification in $stderr"
+    }
+}
 $expectedFinal = if ($FinalLayerSP) { 1 } else { 0 }
 if ($line -notmatch "attention_replaced=$AttentionPrefix\b" -or
         $line -notmatch "ffn_sp_layers=$($chosen.Count)\b" -or
@@ -98,7 +116,10 @@ $manifest = [ordered]@{
     ffn_sp_layer_set = $resolvedSet
     ffn_sp_count = $chosen.Count
     native_sp_qkv_l0 = [bool]$NativeSpQkvL0
-    tp_qkv_kept_for_kv_cache = [bool]$NativeSpQkvL0
+    native_sp_qkv_prefix = $nativeCount
+    native_sp_qkv_layers = $nativeLayerList
+    native_sp_qkv_verified = ($nativeCount -gt 0)
+    tp_qkv_kept_for_kv_cache = ($nativeCount -gt 0)
     final_layer_sp = [bool]$FinalLayerSP
     final_layer_ffn_sp = [bool]$FinalLayerSP
     deferred_output_select_verified = [bool]$FinalLayerSP
@@ -109,4 +130,4 @@ $manifest = [ordered]@{
 }
 $manifest | ConvertTo-Json -Depth 6 |
     Set-Content -LiteralPath (Join-Path $runRoot "manifest.json") -Encoding UTF8
-Write-Host "[GALAXY_CAUSAL_HYBRID] attention_replaced=$AttentionPrefix ffn_sp_layers=$($chosen.Count) final_layer_sp=$expectedFinal status=EXECUTION_PASS_NUMERICAL_UNCHECKED logs=$($run[0].FullName)"
+Write-Host "[GALAXY_CAUSAL_HYBRID] attention_replaced=$AttentionPrefix ffn_sp_layers=$($chosen.Count) final_layer_sp=$expectedFinal native_sp_qkv_prefix=$nativeCount status=EXECUTION_PASS_NUMERICAL_UNCHECKED logs=$($run[0].FullName)"
