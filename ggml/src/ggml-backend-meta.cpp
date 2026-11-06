@@ -2408,8 +2408,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 " captured_eligible=%d selected_op=%s"
                 " selection=%s status=%s\n",
                 expected.c_str(),named,eligible,
+                match?ggml_op_name(match->op):"NONE",
                 require_capture?"PRODUCER_CAPTURED_OUTPUT":"PLANNED_PRODUCER_OUTPUT",
-                match?ggml_op_name(match->op):"NONE",match?"PASS":"FAIL");
+                match?"PASS":"FAIL");
         std::fflush(stderr);
         if(!match) throw std::invalid_argument("missing captured model stage "+expected);
         return match;
@@ -2692,16 +2693,44 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         const ggml_tensor * k=find_live_stage(layer,"Kcur",true,false);
         const ggml_tensor * v=find_live_stage(layer,"Vcur",false,false);
         ggml_galaxy_causal_live::request work;
-        if (q->type!=GGML_TYPE_F32 || k->type!=GGML_TYPE_F32 ||
-                v->type!=GGML_TYPE_F32 || q->ne[0]<=0 || q->ne[2]<8 ||
-                q->ne[2]>512 || q->ne[3]!=1 || k->ne[0]!=q->ne[0] ||
-                k->ne[2]!=q->ne[2] || v->ne[0]!=q->ne[0] ||
-                v->ne[2]!=q->ne[2] || v->ne[3]!=1 ||
-                ggml_backend_meta_get_split_state(q,false).axis!=GGML_BACKEND_SPLIT_AXIS_1 ||
-                ggml_backend_meta_get_split_state(k,false).axis!=GGML_BACKEND_SPLIT_AXIS_1 ||
-                ggml_backend_meta_get_split_state(v,false).axis!=GGML_BACKEND_SPLIT_AXIS_0) {
-            throw std::invalid_argument("unsupported early Q/K/V source layout for TP cache bypass");
-        }
+        // An early projection runs after attn_norm but before the original
+        // Q/K/V producers. The old live bridge checks the Meta split axes
+        // AFTER their producer snapshots. Here, validate the symbolic
+        // tensors and two physical rank views; defer final axis checking
+        // to the same build_live_request() used by the proven late path.
+        const auto q_axis=ggml_backend_meta_get_split_state(q,false).axis;
+        const auto k_axis=ggml_backend_meta_get_split_state(k,false).axis;
+        const auto v_axis=ggml_backend_meta_get_split_state(v,false).axis;
+        const bool global_geometry_ok =
+                q->type==GGML_TYPE_F32 && k->type==GGML_TYPE_F32 &&
+                v->type==GGML_TYPE_F32 &&
+                ggml_backend_buffer_is_meta(q->buffer) &&
+                ggml_backend_buffer_is_meta(k->buffer) &&
+                ggml_backend_buffer_is_meta(v->buffer) &&
+                ggml_is_contiguous(q) && ggml_is_contiguous(k) &&
+                ggml_is_contiguous(v) &&
+                q->ne[0]>0 && q->ne[2]>=8 && q->ne[2]<=512 &&
+                q->ne[3]==1 && k->ne[0]==q->ne[0] &&
+                k->ne[2]==q->ne[2] && k->ne[3]==1 &&
+                v->ne[0]==q->ne[0] && v->ne[2]==q->ne[2] &&
+                v->ne[3]==1;
+        std::fprintf(stderr,
+                "[GALAXY_SP_QKV_EARLY_LAYOUT] layer=%d phase=PRE_PRODUCER"
+                " Q=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 " type=%s"
+                " K=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 " type=%s"
+                " V=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 " type=%s"
+                " meta_axes=%s,%s,%s final_axis_check=DEFERRED status=%s\n",
+                layer,
+                q->ne[0],q->ne[1],q->ne[2],q->ne[3],ggml_type_name(q->type),
+                k->ne[0],k->ne[1],k->ne[2],k->ne[3],ggml_type_name(k->type),
+                v->ne[0],v->ne[1],v->ne[2],v->ne[3],ggml_type_name(v->type),
+                ggml_backend_meta_split_axis_name(q_axis),
+                ggml_backend_meta_split_axis_name(k_axis),
+                ggml_backend_meta_split_axis_name(v_axis),
+                global_geometry_ok?"PASS":"FAIL");
+        std::fflush(stderr);
+        if (!global_geometry_ok)
+            throw std::invalid_argument("early Q/K/V symbolic geometry/type incompatible with TP cache bridge");
         work.tokens=q->ne[2];
         work.head_dim=q->ne[0];
         work.layer=layer;
@@ -2709,14 +2738,38 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             const ggml_tensor * qp=ggml_backend_meta_buffer_simple_tensor(q,rank);
             const ggml_tensor * kp=ggml_backend_meta_buffer_simple_tensor(k,rank);
             const ggml_tensor * vp=ggml_backend_meta_buffer_simple_tensor(v,rank);
-            if (!qp || !kp || !vp || !qp->buffer || !kp->buffer || !vp->buffer ||
-                    qp->ne[0]!=work.head_dim || kp->ne[0]!=work.head_dim ||
-                    qp->ne[2]!=work.tokens || kp->ne[2]!=work.tokens ||
-                    vp->ne[0]%work.head_dim!=0 || vp->ne[1]!=work.tokens ||
-                    qp->ne[1]<=0 || kp->ne[1]<=0 ||
-                    vp->ne[0]/work.head_dim!=kp->ne[1]) {
-                throw std::invalid_argument("physical TP QKV cache-producer rank shape mismatch");
-            }
+            const bool physical_ok =
+                    qp && kp && vp &&
+                    qp->buffer && kp->buffer && vp->buffer &&
+                    qp->type==GGML_TYPE_F32 && kp->type==GGML_TYPE_F32 &&
+                    vp->type==GGML_TYPE_F32 &&
+                    ggml_is_contiguous(qp) && ggml_is_contiguous(kp) &&
+                    ggml_is_contiguous(vp) &&
+                    qp->ne[0]==work.head_dim && kp->ne[0]==work.head_dim &&
+                    qp->ne[1]>0 && kp->ne[1]>0 &&
+                    qp->ne[2]==work.tokens && kp->ne[2]==work.tokens &&
+                    qp->ne[3]==1 && kp->ne[3]==1 &&
+                    vp->ne[0]>0 && vp->ne[0]%work.head_dim==0 &&
+                    vp->ne[1]==work.tokens && vp->ne[2]==1 && vp->ne[3]==1 &&
+                    vp->ne[0]/work.head_dim==kp->ne[1];
+            std::fprintf(stderr,
+                    "[GALAXY_SP_QKV_EARLY_RANK_LAYOUT] layer=%d rank=%d"
+                    " Q=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64
+                    " K=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64
+                    " V=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64
+                    " physical_ready=%d status=%s\n",
+                    layer,rank,
+                    qp?qp->ne[0]:-1,qp?qp->ne[1]:-1,
+                    qp?qp->ne[2]:-1,qp?qp->ne[3]:-1,
+                    kp?kp->ne[0]:-1,kp?kp->ne[1]:-1,
+                    kp?kp->ne[2]:-1,kp?kp->ne[3]:-1,
+                    vp?vp->ne[0]:-1,vp?vp->ne[1]:-1,
+                    vp?vp->ne[2]:-1,vp?vp->ne[3]:-1,
+                    int(qp && kp && vp && qp->buffer && kp->buffer && vp->buffer),
+                    physical_ok?"PASS":"FAIL");
+            std::fflush(stderr);
+            if (!physical_ok)
+                throw std::invalid_argument("physical TP QKV cache-producer rank shape/type mismatch");
             work.q.heads[rank]=qp->ne[1];
             work.k.heads[rank]=kp->ne[1];
             work.v.heads[rank]=vp->ne[0]/work.head_dim;
