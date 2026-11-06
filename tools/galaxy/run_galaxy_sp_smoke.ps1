@@ -283,7 +283,7 @@ try {
                 }
             }
             $loaded = @($hits | Where-Object {
-                $_.Line -match '\[GALAXY_SP_QKV_RESIDENT_LOAD\] tensor=blk\.[0-9]+\.attn_(q|k|v)\.weight .*phase=MODEL_LOAD status=PASS
+                $_.Line -match '\[GALAXY_SP_QKV_RESIDENT_LOAD\] tensor=blk\.[0-9]+\.attn_(q|k|v)\.weight .*phase=MODEL_LOAD status=PASS'
             })
             if ($loaded.Count -ne 3*$nativeSpQkvCount) {
                 throw "Expected $($nativeSpQkvCount*3) model-load resident QKV weights; got $($loaded.Count). Inspect $stderr"
