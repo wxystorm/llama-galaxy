@@ -77,7 +77,7 @@ $opts = @{}
 foreach ($key in $Common.Keys) { $opts[$key] = $Common[$key] }
 foreach ($name in @("PureTP","Galaxy2","Galaxy2FfnSpLayers","Galaxy2FfnSpLayerSet",
                     "LiveCausalLayer","LiveCausalPrefixLayers","LiveCausalReplace",
-                    "FinalLayerSP","DumpLogits","OutputDir","CausalHybridFfnSp","NativeSpQkvL0","NativeSpQkvPrefixLayers","NativeSpQkvResidentWeights","NativeSpQkvSkipTpPrefill","Trace")) {
+                    "FinalLayerSP","DumpLogits","OutputDir","CausalHybridFfnSp","NativeSpQkvL0","NativeSpQkvPrefixLayers","NativeSpQkvResidentWeights","NativeSpQkvSkipTpPrefill","RankLocalCollectives","Trace")) {
     [void]$opts.Remove($name)
 }
 $opts["Galaxy2"] = $true
@@ -92,6 +92,7 @@ $opts["NativeSpQkvResidentWeights"] = [bool]$NativeSpQkvResidentWeights
 $opts["NativeSpQkvSkipTpPrefill"] = [bool]$NativeSpQkvSkipTpPrefill
 $opts["FinalLayerSP"] = [bool]$FinalLayerSP
 $opts["DumpLogits"] = $false
+$opts["RankLocalCollectives"] = $false # keep independently verified HOST Hybrid path
 $opts["Trace"] = [bool]$Trace
 $opts["OutputDir"] = $runRoot
 Write-Host "[GALAXY_CAUSAL_HYBRID] event=START attention_prefix=$AttentionPrefix ffn_sp_layer_set=$resolvedSet final_layer_sp=$([bool]$FinalLayerSP) native_sp_qkv_prefix=$nativeCount resident_weights=$residentExpected skip_tp_prefill=$([bool]$NativeSpQkvSkipTpPrefill)"

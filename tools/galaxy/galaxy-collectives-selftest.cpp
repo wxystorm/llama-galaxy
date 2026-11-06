@@ -68,6 +68,20 @@ static void verify_rs_fused_config() {
     std::cout << "GALAXY_RS_FUSED_CONFIG_SELFTEST PASS\n";
 }
 
+static void verify_rank_local_transport_parser() {
+    require_test(parse_transport(nullptr)==transport::host,
+                 "unset transport must preserve host baseline");
+    require_test(parse_transport("")==transport::host,"empty transport selects host");
+    require_test(parse_transport("HOST")==transport::host,"explicit HOST");
+    require_test(parse_transport("RANK_LOCAL")==transport::rank_local,
+                 "explicit two-rank local reduction");
+    expect_reject([]{ (void)parse_transport("RING_DIRECT"); },
+                  "unsupported direct ring transport");
+    expect_reject([]{ (void)parse_transport("rank_local"); },
+                  "mis-cased route");
+    std::cout << "GALAXY_RANK_LOCAL_PARSER_SELFTEST PASS\n";
+}
+
 static void verify_tile_parser() {
     require_test(parse_tile_tokens(nullptr) == 32, "default tile must preserve baseline");
     require_test(parse_tile_tokens("") == 32, "empty tile must preserve baseline");
@@ -215,16 +229,27 @@ static void run_case(devices_t devices, ggml_type type,
     output_t slices = {rank0.slice, rank1.slice};
     input_t shards = {rank0.slice, rank1.slice};
     output_t full = {rank0.complete, rank1.complete};
-    reduce_scatter(devices, partial, slices, counts, tile);
+    reduce_scatter(devices, partial, slices, counts, tile, false, transport::host);
     // The fused full-input read must produce byte-for-byte identical
     // F16/F32 output, independently of the existing TP/SP-vs-TP error.
     const auto baseline_rank0 = copy_tensor_bytes(rank0.slice);
     const auto baseline_rank1 = copy_tensor_bytes(rank1.slice);
-    reduce_scatter(devices, partial, slices, counts, tile, true);
+    reduce_scatter(devices, partial, slices, counts, tile, true, transport::host);
     require_test(copy_tensor_bytes(rank0.slice) == baseline_rank0,
                  "fused RS differs bitwise on rank 0");
     require_test(copy_tensor_bytes(rank1.slice) == baseline_rank1,
                  "fused RS differs bitwise on rank 1");
+    // Exact source Ring semantics (two ranks): each rank receives ONLY
+    // its peer's partial slice and uses a backend ADD for its own tokens.
+    reduce_scatter(devices, partial, slices, counts, tile, false,
+                   transport::rank_local);
+    require_test(copy_tensor_bytes(rank0.slice) == baseline_rank0,
+                 "rank-local Ring RS differs bitwise from host on rank 0");
+    require_test(copy_tensor_bytes(rank1.slice) == baseline_rank1,
+                 "rank-local Ring RS differs bitwise from host on rank 1");
+    expect_reject([&]{ reduce_scatter(devices,partial,slices,counts,tile,
+                                     true,transport::rank_local); },
+                  "rank-local mode must reject host-only fused read");
 
     const size_t edge = static_cast<size_t>(counts[0]*hidden);
     check_equals(unpack(rank0.slice),
@@ -234,7 +259,14 @@ static void run_case(devices_t devices, ggml_type type,
                  std::vector<float>(expected.begin()+edge, expected.end()),
                  "RS rank1");
 
-    all_gather(devices, shards, full, counts, tile);
+    all_gather(devices, shards, full, counts, tile, transport::host);
+    const auto ag_expected0=copy_tensor_bytes(rank0.complete);
+    const auto ag_expected1=copy_tensor_bytes(rank1.complete);
+    all_gather(devices, shards, full, counts, tile, transport::rank_local);
+    require_test(copy_tensor_bytes(rank0.complete)==ag_expected0,
+                 "rank-local AllGather differs bitwise on rank 0");
+    require_test(copy_tensor_bytes(rank1.complete)==ag_expected1,
+                 "rank-local AllGather differs bitwise on rank 1");
     check_equals(unpack(rank0.complete), expected, "AG rank0");
     check_equals(unpack(rank1.complete), expected, "AG rank1");
 
@@ -253,7 +285,19 @@ static void run_case(devices_t devices, ggml_type type,
     const input_t kv_values = {rank0.value_slice, rank1.value_slice};
     const output_t gathered_k = {rank0.complete, rank1.complete};
     const output_t gathered_v = {rank0.value_complete, rank1.value_complete};
-    all_gather_attention_kv(devices, kv_keys, kv_values, gathered_k, gathered_v, counts, tile);
+    all_gather_attention_kv(devices, kv_keys, kv_values, gathered_k, gathered_v,
+                            counts, tile, transport::host);
+    const auto k_expected0=copy_tensor_bytes(rank0.complete);
+    const auto k_expected1=copy_tensor_bytes(rank1.complete);
+    const auto v_expected0=copy_tensor_bytes(rank0.value_complete);
+    const auto v_expected1=copy_tensor_bytes(rank1.value_complete);
+    all_gather_attention_kv(devices, kv_keys, kv_values, gathered_k, gathered_v,
+                            counts, tile, transport::rank_local);
+    require_test(copy_tensor_bytes(rank0.complete)==k_expected0 &&
+                 copy_tensor_bytes(rank1.complete)==k_expected1 &&
+                 copy_tensor_bytes(rank0.value_complete)==v_expected0 &&
+                 copy_tensor_bytes(rank1.value_complete)==v_expected1,
+                 "rank-local SP K/V allgathers differ from host reference");
     check_equals(unpack(rank0.complete), key_full, "SP attention K rank0");
     check_equals(unpack(rank1.complete), key_full, "SP attention K rank1");
     check_equals(unpack(rank0.value_complete), value_full, "SP attention V rank0");
@@ -266,7 +310,13 @@ static void run_case(devices_t devices, ggml_type type,
     // The independently gathered complete activation is the canonical
     // residual input; splitting it must return exactly the old intervals.
     const input_t mirrored = {rank0.complete, rank1.complete};
-    scatter_mirrored(devices, mirrored, slices, counts, tile);
+    scatter_mirrored(devices, mirrored, slices, counts, tile, transport::host);
+    const auto scatter_expected0=copy_tensor_bytes(rank0.slice);
+    const auto scatter_expected1=copy_tensor_bytes(rank1.slice);
+    scatter_mirrored(devices, mirrored, slices, counts, tile, transport::rank_local);
+    require_test(copy_tensor_bytes(rank0.slice)==scatter_expected0 &&
+                 copy_tensor_bytes(rank1.slice)==scatter_expected1,
+                 "rank-local mirrored residual differs from host reference");
     check_equals(unpack(rank0.slice),
                  std::vector<float>(expected.begin(), expected.begin()+edge),
                  "SP residual rank0");
@@ -281,7 +331,8 @@ static void run_case(devices_t devices, ggml_type type,
     expect_reject([&] { reduce_scatter(devices, partial, {rank0.partial,rank1.slice}, counts); }, "in-place");
     expect_reject([&] { scatter_mirrored(devices, mirrored, slices, counts, 0); }, "zero scatter tile");
 
-    std::cout << "[GALAXY_COLLECTIVES_CASE] tokens=" << total
+    std::cout << "[GALAXY_COLLECTIVES_CASE] transports=HOST,RANK_LOCAL"
+              << " bitwise_parity=PASS tokens=" << total
               << " hidden=" << hidden << " seq=" << counts[0] << "," << counts[1]
               << " type=" << (type == GGML_TYPE_F32 ? "F32" : "F16")
               << " tile=" << tile << " PASS\n";
@@ -300,6 +351,7 @@ int main(int argc, char ** argv) {
         verify_tile_parser();
         verify_sequence_weighting();
         verify_rs_fused_config();
+        verify_rank_local_transport_parser();
         ggml_backend_load_all();
         ggml_backend_t pc = pc_name.empty()
                 ? ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr)

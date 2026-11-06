@@ -15,8 +15,11 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cinttypes>
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
+#include <memory>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -164,6 +167,127 @@ inline void write(ggml_type type, uint8_t * ptr, float value) {
 
 } // namespace detail
 
+// Original Galaxy-LM implements a two-rank ReduceScatter with each rank
+// receiving ONLY its own peer contribution and doing the ADD locally.
+// This implementation uses existing ggml RPC graph-compute for the local
+// ADD/COPY, with get/set transporting the peer slice through the PC as a
+// byte relay. It does not require new RPC commands or emulate Gloo P2P.
+// HOST remains the baseline and the default. Only standard Galaxy/Galaxy2
+// opt into RANK_LOCAL; the native SP/causal Hybrid path is unchanged.
+enum class transport { host, rank_local };
+
+inline transport parse_transport(const char * raw) {
+    if (!raw || !raw[0] || std::strcmp(raw,"HOST")==0) return transport::host;
+    if (std::strcmp(raw,"RANK_LOCAL")==0) return transport::rank_local;
+    throw std::invalid_argument(
+            "LLAMA_GALAXY_COLLECTIVE_TRANSPORT must be HOST or RANK_LOCAL");
+}
+inline transport configured_transport() {
+    return parse_transport(std::getenv("LLAMA_GALAXY_COLLECTIVE_TRANSPORT"));
+}
+
+namespace detail {
+
+// Scope-local leaf: the data and backend buffer are BORROWED from an existing
+// real physical tensor. Do not use the graph producer as a source: it would
+// re-evaluate the original Transformer subgraph during the collective.
+inline ggml_tensor * borrowed_slice(ggml_context * ctx,
+                                    const ggml_tensor * physical,
+                                    int64_t tokens, size_t offset) {
+    ggml_tensor * alias=ggml_new_tensor_2d(ctx,physical->type,physical->ne[0],tokens);
+    demand(alias!=nullptr && physical->buffer && physical->data,
+           "rank-local slice has no physical buffer");
+    demand(offset <= ggml_nbytes(physical) &&
+           ggml_nbytes(alias) <= ggml_nbytes(physical)-offset,
+           "rank-local slice outside original allocation");
+    alias->buffer=physical->buffer;
+    alias->data=(char *)physical->data+offset;
+    return alias;
+}
+
+struct transient_ctx {
+    ggml_context * ctx=nullptr;
+    ggml_backend_buffer_t scratch=nullptr;
+    transient_ctx() {
+        const ggml_init_params params={1024*1024,nullptr,true};
+        ctx=ggml_init(params);
+        demand(ctx!=nullptr,"cannot initialize rank-local collective graph");
+    }
+    ~transient_ctx() {
+        if(scratch) ggml_backend_buffer_free(scratch);
+        if(ctx) ggml_free(ctx);
+    }
+    transient_ctx(const transient_ctx &)=delete;
+    transient_ctx & operator=(const transient_ctx &)=delete;
+    void execute(ggml_backend_t backend, ggml_tensor * terminal) {
+        ggml_cgraph * graph=ggml_new_graph_custom(ctx,16,false);
+        demand(graph!=nullptr,"cannot create rank-local collective graph");
+        ggml_build_forward_expand(graph,terminal);
+        const ggml_status st=ggml_backend_graph_compute(backend,graph);
+        demand(st==GGML_STATUS_SUCCESS,"rank-local device graph failed");
+        ggml_backend_synchronize(backend);
+    }
+};
+
+// The local slice has already been calculated by the TP producer.
+// Receive only the opposite rank's contribution into a temporary tensor
+// ON this rank, and compute local + received on that rank's backend.
+struct rank_local_sum {
+    transient_ctx lifetime;
+    ggml_tensor * peer=nullptr;
+    ggml_tensor * output=nullptr;
+    ggml_backend_t backend=nullptr;
+
+    rank_local_sum(ggml_backend_t device, const ggml_tensor * local_full,
+                   ggml_tensor * destination, int64_t tokens, size_t offset)
+                   : backend(device) {
+        ggml_context * ctx=lifetime.ctx;
+        auto * owned=borrowed_slice(ctx,local_full,tokens,offset);
+        peer=ggml_new_tensor_2d(ctx,local_full->type,local_full->ne[0],tokens);
+        auto * dest=borrowed_slice(ctx,destination,tokens,0);
+        auto * sum=ggml_add(ctx,owned,peer);
+        output=ggml_cpy(ctx,sum,dest);
+        // Allocates peer and sum, but does NOT allocate/overwrite either
+        // borrowed producer nor the original output physical tensor.
+        lifetime.scratch=ggml_backend_alloc_ctx_tensors(ctx,backend);
+        demand(lifetime.scratch!=nullptr,
+               "rank-local reduction cannot allocate backend scratch");
+        demand(output->buffer && output->data && peer->buffer && peer->data,
+               "rank-local reduction tensors are not backend allocated");
+    }
+    void compute() { lifetime.execute(backend,output); }
+};
+
+// Device-local COPY for AG's own shard and mirrored residual scatter.
+// COPY is executed by CUDA/RPC/CPU on the same backend; no backend GET/SET
+// through the PC host is involved for the local portion.
+inline void device_copy_slice(ggml_backend_t backend,
+                              const ggml_tensor * source, size_t source_offset,
+                              ggml_tensor * destination, size_t destination_offset,
+                              int64_t tokens) {
+    transient_ctx scope;
+    ggml_context * ctx=scope.ctx;
+    auto * src=borrowed_slice(ctx,source,tokens,source_offset);
+    auto * dst=borrowed_slice(ctx,destination,tokens,destination_offset);
+    auto * copy=ggml_cpy(ctx,src,dst);
+    const ggml_status view_status=ggml_backend_view_init(copy);
+    demand(view_status==GGML_STATUS_SUCCESS,
+           "device-local copy output view could not be initialized");
+    scope.execute(backend,copy);
+}
+
+inline void report_rank_local(const char * kind, int64_t tokens,
+                              size_t cross_bytes, size_t local_bytes) {
+    std::fprintf(stderr,
+            "[GALAXY_COLLECTIVE_ROUTE] kind=%s mode=RANK_LOCAL tokens=%" PRId64
+            " cross_payload_bytes=%zu local_device_bytes=%zu"
+            " transport=RPC_RELAY compute=DEVICE_GRAPH status=PASS\n",
+            kind,tokens,cross_bytes,local_bytes);
+    std::fflush(stderr);
+}
+
+} // namespace detail
+
 // Default 32 matches the previous implementation; larger tiles reduce RPC
 // request count. Limit to 1024 tokens to bound temporary Host allocations.
 inline size_t parse_tile_tokens(const char * raw) {
@@ -221,8 +345,47 @@ inline bool rs_fused_read_eligible(counts_t counts, size_t row_bytes) {
 // bounded PC Host memory; reductions and output writes preserve token order.
 inline void reduce_scatter(const devices_t & devices, const input_t & partial,
                            const output_t & shard, counts_t counts, size_t tile_tokens = 32,
-                           bool request_fused_read = false) {
+                           bool request_fused_read = false,
+                           transport route = configured_transport()) {
     detail::validate(devices, partial, shard, counts, tile_tokens, true);
+    if (route == transport::rank_local) {
+        detail::demand(!request_fused_read,
+                "RANK_LOCAL ReduceScatter cannot combine with HOST RS fused read");
+        detail::measure measure;
+        const size_t row=detail::multiply(partial[0]->ne[0],
+                                         detail::element_bytes(partial[0]->type));
+        const int64_t total=detail::total_tokens(counts);
+        const int64_t capacity=std::min<int64_t>(std::max(counts[0],counts[1]),
+                                                static_cast<int64_t>(tile_tokens));
+        std::vector<uint8_t> relay(detail::multiply(capacity,row));
+        measure.sync(devices[0]);
+        measure.sync(devices[1]);
+        int64_t start=0;
+        for(int rank=0;rank<2;++rank) {
+            // One ring exchange step for two ranks: receive the opposite
+            // partial contribution for THIS rank's token interval.
+            detail::rank_local_sum reducer(devices[rank],partial[rank],
+                                            shard[rank],counts[rank],
+                                            detail::multiply(start,row));
+            for(int64_t done=0;done<counts[rank];) {
+                const int64_t n=std::min<int64_t>(counts[rank]-done,
+                                                  static_cast<int64_t>(tile_tokens));
+                const size_t bytes=detail::multiply(n,row);
+                measure.read(partial[1-rank],relay.data(),
+                             detail::multiply(start+done,row),bytes);
+                measure.write(reducer.peer,relay.data(),
+                              detail::multiply(done,row),bytes);
+                measure.sync(devices[rank]);
+                done+=n;
+            }
+            reducer.compute();
+            start+=counts[rank];
+        }
+        measure.finish("RS",shard[0],total,tile_tokens);
+        detail::report_rank_local("RS",total,
+                detail::multiply(total,row),detail::multiply(total,row));
+        return;
+    }
     detail::measure measure;
     const ggml_type type = partial[0]->type;
     const size_t item = detail::element_bytes(type);
@@ -285,8 +448,44 @@ inline void reduce_scatter(const devices_t & devices, const input_t & partial,
 // Output rank tensors each receive the full original sequence in rank order.
 // Unequal splits are handled without padding.
 inline void all_gather(const devices_t & devices, const input_t & shard,
-                       const output_t & replicated, counts_t counts, size_t tile_tokens = 32) {
+                       const output_t & replicated, counts_t counts, size_t tile_tokens = 32,
+                       transport route = configured_transport()) {
     detail::validate(devices, shard, replicated, counts, tile_tokens, false);
+    if (route == transport::rank_local) {
+        detail::measure measure;
+        const size_t row=detail::multiply(shard[0]->ne[0],
+                                         detail::element_bytes(shard[0]->type));
+        const int64_t total=detail::total_tokens(counts);
+        const int64_t capacity=std::min<int64_t>(std::max(counts[0],counts[1]),
+                                                static_cast<int64_t>(tile_tokens));
+        std::vector<uint8_t> relay(detail::multiply(capacity,row));
+        measure.sync(devices[0]);
+        measure.sync(devices[1]);
+        int64_t start=0;
+        for(int rank=0;rank<2;++rank) {
+            // Each rank already owns its part: materialize it LOCALLY and
+            // relay a single copy to the other rank, as in AllGather.
+            detail::device_copy_slice(devices[rank],shard[rank],0,
+                                      replicated[rank],detail::multiply(start,row),
+                                      counts[rank]);
+            const int peer=1-rank;
+            for(int64_t done=0;done<counts[rank];) {
+                const int64_t n=std::min<int64_t>(counts[rank]-done,
+                                                  static_cast<int64_t>(tile_tokens));
+                const size_t bytes=detail::multiply(n,row);
+                measure.read(shard[rank],relay.data(),detail::multiply(done,row),bytes);
+                measure.write(replicated[peer],relay.data(),
+                              detail::multiply(start+done,row),bytes);
+                measure.sync(devices[peer]);
+                done+=n;
+            }
+            start+=counts[rank];
+        }
+        measure.finish("AG",replicated[0],total,tile_tokens);
+        detail::report_rank_local("AG",total,
+                detail::multiply(total,row),detail::multiply(total,row));
+        return;
+    }
     detail::measure measure;
     const size_t row = detail::multiply(shard[0]->ne[0], detail::element_bytes(shard[0]->type));
 
@@ -328,13 +527,14 @@ inline void all_gather(const devices_t & devices, const input_t & shard,
 inline void all_gather_attention_kv(const devices_t & devices,
         const input_t & local_keys, const input_t & local_values,
         const output_t & complete_keys, const output_t & complete_values,
-        counts_t counts, size_t tile_tokens = 32) {
+        counts_t counts, size_t tile_tokens = 32,
+        transport route = configured_transport()) {
     if (local_keys[0] == local_values[0] || local_keys[1] == local_values[1] ||
             complete_keys[0] == complete_values[0] || complete_keys[1] == complete_values[1]) {
         throw std::invalid_argument("SP Attention K/V require distinct input and output tensor storage");
     }
-    all_gather(devices, local_keys, complete_keys, counts, tile_tokens);
-    all_gather(devices, local_values, complete_values, counts, tile_tokens);
+    all_gather(devices, local_keys, complete_keys, counts, tile_tokens, route);
+    all_gather(devices, local_values, complete_values, counts, tile_tokens, route);
 }
 
 // Copy the sequence interval owned by each rank out of an already mirrored
@@ -342,8 +542,30 @@ inline void all_gather_attention_kv(const devices_t & devices,
 // Rank 0's mirror is the canonical source. No arithmetic takes place.
 // For the initial implementation, host staging is used for both backends.
 inline void scatter_mirrored(const devices_t & devices, const input_t & full,
-                            const output_t & shard, counts_t counts, size_t tile_tokens = 32) {
+                            const output_t & shard, counts_t counts, size_t tile_tokens = 32,
+                            transport route = configured_transport()) {
     detail::validate(devices, full, shard, counts, tile_tokens, true);
+    if (route == transport::rank_local) {
+        detail::measure measure;
+        const size_t row=detail::multiply(full[0]->ne[0],
+                                         detail::element_bytes(full[0]->type));
+        const int64_t total=detail::total_tokens(counts);
+        measure.sync(devices[0]);
+        measure.sync(devices[1]);
+        int64_t start=0;
+        for(int rank=0;rank<2;++rank) {
+            // Strict precondition: both full activations are MIRRORED.
+            // Never re-fetch from PC when Phone already owns its mirror.
+            detail::device_copy_slice(devices[rank],full[rank],
+                                      detail::multiply(start,row),
+                                      shard[rank],0,counts[rank]);
+            start+=counts[rank];
+        }
+        measure.finish("RESIDUAL_SCATTER",shard[0],total,tile_tokens);
+        detail::report_rank_local("RESIDUAL_SCATTER",total,0,
+                                  detail::multiply(total,row));
+        return;
+    }
     detail::measure measure;
     const size_t row = detail::multiply(full[0]->ne[0], detail::element_bytes(full[0]->type));
 

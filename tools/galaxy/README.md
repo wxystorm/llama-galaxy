@@ -2398,3 +2398,46 @@ The native SP-QKV TP-bypass run proved L0 native projection and all three physic
 The updated validator follows `src[0]` through the permitted VIEW/RESHAPE/CONT/PERMUTE ancestry to the exact selected Kcur/Vcur producer and verifies the row-index operand type, data/index row count and cache destination. It requires exactly two SET_ROWS ops in the intended Attention subgraph, one sourced from Kcur and one from Vcur, and logs `[GALAXY_SP_QKV_CACHE_STORE_NODE]` for both before dispatch. The original SET_ROWS nodes and Decode KV Cache are preserved. The isolated `galaxy-native-sp-qkv-selftest` now builds genuine ggml_set_rows nodes and checks the actual source ordering, positive K/V provenance, and negative cross-stage provenance.
 
 Rebuild PC `llama-cli` and `galaxy-native-sp-qkv-selftest`, run the selftest, and repeat the same **2-layer** Hybrid command with `-NativeSpQkvSkipTpPrefill -Trace`. Expect two `GALAXY_SP_QKV_CACHE_STORE_NODE` entries for each selected layer, then `GALAXY_SP_QKV_CACHE_STORES ... phase=EXECUTED status=PASS` and finally the existing full-prefix witness. Only after L0/L1 pass should the 28-layer command be attempted. No Phone RPC or model reload changes beyond restarting the test invocation.
+
+
+## Released Galaxy-LM communication parity: rank-local two-device path (2026-11-06)
+
+Scope: source code in Galaxy-LM galaxy/core/model_parallel/mappings.py. The
+released ReduceScatter uses one send/recv exchange for two ranks; AllGather
+uses torch.distributed.all_gather; sequence splitting is rank-local.
+Our legacy implementation instead used PC-centered Host Staging.
+
+Opt in with LLAMA_GALAXY_COLLECTIVE_TRANSPORT=RANK_LOCAL (or -RankLocalCollectives
+in the PowerShell runner). Unset/default HOST preserves the verified legacy.
+
+- RS: exchange only the partial values needed by the other rank's token interval.
+  The existing PC-hosted RPC get/set relays the peer slice into scratch on its
+  destination rank. Each rank runs a real local backend ggml_add + ggml_cpy
+  graph to produce its own reduced slice. Two ranks = one logical Ring step.
+- AG: each rank copies its own shard locally via a backend graph, and sends
+  that shard once to its peer. No self-readback / self-upload through PC Host.
+- Residual: provided BOTH devices own a matching mirrored full activation,
+  each rank copies its own slice using a local backend graph without any
+  network tensor payload.
+- The above is not direct Gloo P2P, a new Phone RPC command, or the
+  unpublished paper-level GEMM/communication-overlap mechanism. The PC
+  remains a byte relay for inter-device transfers.
+- Two devices, contiguous F16/F32; uneven positive token splits supported.
+- The native SP-QKV/causal Hybrid retains HOST mode and rejects the switch.
+- Host-only -RsFusedRead is incompatible with RANK_LOCAL.
+
+Build + run HOST-vs-RANK_LOCAL byte-exact tests (CPU+CPU and CUDA+Phone RPC):
+```powershell
+git pull --ff-only origin feat/galaxy-baseline
+cmake --build build-galaxy --config Release --target galaxy-collectives-selftest llama-cli galaxy-logits-compare -j 8
+.\build-galaxy\bin\Release\galaxy-collectives-selftest.exe
+.\build-galaxy\bin\Release\galaxy-collectives-selftest.exe --pc CUDA0 --rpc 10.39.52.114:50052
+```
+Then run standard Galaxy/Galaxy2, keeping -RankLocalCollectives off for the
+reference or enabling it to exercise the new path:
+```powershell
+.\tools\galaxy\run_galaxy_sp_smoke.ps1 @common -RankLocalCollectives -DumpLogits
+.\tools\galaxy\run_galaxy_sp_smoke.ps1 @common -Galaxy2 -Galaxy2FfnSpLayers 'all' -FinalLayerSP -RankLocalCollectives -DumpLogits
+```
+The runner requires real [GALAXY_COLLECTIVE_ROUTE] RS/AG/residual witnesses
+when this switch is enabled. It does not claim TP numerical parity or speedup.

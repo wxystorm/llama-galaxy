@@ -20,6 +20,7 @@ param(
     [string]$SeqWeights = "1,1",
     [switch]$FinalLayerSP,
     [switch]$RsFusedRead,
+    [switch]$RankLocalCollectives,
     [switch]$Profile,
     [string]$DumpLayers = "",
     [string]$DumpStages = "",
@@ -51,6 +52,12 @@ if (-not (Test-Path -LiteralPath $Model)) { throw "Missing model: $Model" }
 if (-not (Test-Path -LiteralPath $PromptFile)) { throw "Missing prompt: $PromptFile" }
 if ($Devices.Split(",").Count -ne 2) { throw "Devices must contain exactly PC,RPC" }
 if ($PureTP -and $Galaxy2) { throw "PureTP and Galaxy2 cannot both be enabled" }
+if ($RankLocalCollectives -and $CausalHybridFfnSp) {
+    throw "RankLocalCollectives applies to standard Galaxy/Galaxy2 only; Hybrid remains on verified HOST transport"
+}
+if ($RankLocalCollectives -and $RsFusedRead) {
+    throw "RankLocalCollectives cannot be combined with host-only RsFusedRead"
+}
 if ($LiveCausalLayer -lt -1 -or $LiveCausalLayer -gt 0) {
     throw "Legacy LiveCausalLayer supports only 0; use LiveCausalPrefixLayers 1/2/4/8/16/28 for prefix"
 }
@@ -142,7 +149,7 @@ $keys = @("LLAMA_GALAXY_TP", "LLAMA_GALAXY_TP_HEADS", "LLAMA_GALAXY_TP_FFN", "LL
     "LLAMA_GALAXY_FFN_OP_DUMP", "LLAMA_GALAXY_FFN_OP_DUMP_DIR",
     "LLAMA_GALAXY_QKV_PROBE_LAYERS", "LLAMA_GALAXY_QKV_PROBE_DIR",
     "LLAMA_GALAXY_CAUSAL_LIVE_LAYER", "LLAMA_GALAXY_CAUSAL_LIVE_PREFIX_LAYERS", "LLAMA_GALAXY_CAUSAL_LIVE_MODE", "LLAMA_GALAXY_CAUSAL_HYBRID_FFN", "LLAMA_GALAXY_NATIVE_SP_QKV_L0", "LLAMA_GALAXY_NATIVE_SP_QKV_PREFIX_LAYERS", "LLAMA_GALAXY_NATIVE_SP_QKV_RESIDENT_WEIGHTS", "LLAMA_GALAXY_NATIVE_SP_QKV_SKIP_TP_PREFILL",
-    "LLAMA_GALAXY_COLLECTIVE_TILE_TOKENS", "LLAMA_GALAXY_RS_FUSED_READ", "LLAMA_GALAXY_SP_SEQ_WEIGHTS",
+    "LLAMA_GALAXY_COLLECTIVE_TILE_TOKENS", "LLAMA_GALAXY_RS_FUSED_READ", "LLAMA_GALAXY_SP_SEQ_WEIGHTS", "LLAMA_GALAXY_COLLECTIVE_TRANSPORT",
     "LLAMA_GALAXY_SP_FINAL_LAYER", "LLAMA_GALAXY_RPC_DISABLE_GRAPH_REUSE")
 $old = @{}
 foreach ($key in $keys) { $old[$key] = [Environment]::GetEnvironmentVariable($key, "Process") }
@@ -158,6 +165,7 @@ try {
     $env:LLAMA_GALAXY_SP_FINAL_LAYER = if ($FinalLayerSP) { "1" } else { "0" }
     $env:LLAMA_GALAXY_COLLECTIVE_TILE_TOKENS = $CollectiveTileTokens.ToString()
     $env:LLAMA_GALAXY_RS_FUSED_READ = if ($RsFusedRead) { "1" } else { "0" }
+    $env:LLAMA_GALAXY_COLLECTIVE_TRANSPORT = if ($RankLocalCollectives) { "RANK_LOCAL" } else { "HOST" }
     $env:LLAMA_GALAXY2 = if ($Galaxy2) { "1" } else { "0" }
     $env:LLAMA_GALAXY2_FFN_SP_LAYERS = if ($Galaxy2 -and -not $Galaxy2FfnSpLayerSet) { $Galaxy2FfnSpLayers } else { $null }
     $env:LLAMA_GALAXY2_FFN_SP_LAYER_SET = if ($Galaxy2 -and $Galaxy2FfnSpLayerSet) { $Galaxy2FfnSpLayerSet } else { $null }
@@ -225,6 +233,7 @@ try {
         "-ub", $UBatch.ToString(), "-t", $Threads.ToString(),
         "-n", $NPredict.ToString(), "--temp", "0", "-f", $promptArg
     )
+    Write-Host "[GALAXY_COLLECTIVE_MODE] mode=$mode transport=$($env:LLAMA_GALAXY_COLLECTIVE_TRANSPORT) status=CONFIGURED"
     Write-Host "[GALAXY_SP_SMOKE] mode=$mode devices=$Devices rpc=$Rpc profiling=$([bool]$Profile) tile_tokens=$CollectiveTileTokens rs_fused=$([bool]$RsFusedRead) seq_weights=$SeqWeights final_layer_sp=$([bool]$FinalLayerSP) rpc_graph_reuse_disabled=$([bool]$DisableRpcGraphReuse) causal_hybrid_ffn=$([bool]$CausalHybridFfnSp) native_sp_qkv_prefix=$nativeSpQkvCount resident_weights=$residentExpected skip_tp_prefill=$bypassExpected"
     if ($Galaxy2FfnSpLayerSet) {
         Write-Host "[GALAXY2] mode=explicit_layer_set schedule=$Galaxy2FfnSpLayerSet final_layer_sp=$([bool]$FinalLayerSP)"
@@ -246,12 +255,22 @@ try {
     $exitCode = $result.ExitCode
     Write-Host "[GALAXY_SP_SMOKE] exit=$exitCode logs=$dir"
 
-    $hits = @(Select-String -Path $stderr, $stdout -Pattern "GALAXY_META_TRACE","GALAXY_SP_LAYOUT_FAIL","GALAXY_SP_LAYOUT_SRC","GALAXY_SP_SUM","GALAXY_SP]","GALAXY_TP]","GALAXY_CAUSAL_LIVE","GALAXY_CAUSAL_REPLACE","GALAXY_CAUSAL_PREFIX_SUM","GALAXY_CAUSAL_HYBRID_FFN_SUM","GALAXY_SP_QKV","GALAXY_SP_QKV_PREFIX_SUM","prompt eval time","eval time","ERROR","failed" -ErrorAction SilentlyContinue)
+    $hits = @(Select-String -Path $stderr, $stdout -Pattern "GALAXY_COLLECTIVE_ROUTE","GALAXY_META_TRACE","GALAXY_SP_LAYOUT_FAIL","GALAXY_SP_LAYOUT_SRC","GALAXY_SP_SUM","GALAXY_SP]","GALAXY_TP]","GALAXY_CAUSAL_LIVE","GALAXY_CAUSAL_REPLACE","GALAXY_CAUSAL_PREFIX_SUM","GALAXY_CAUSAL_HYBRID_FFN_SUM","GALAXY_SP_QKV","GALAXY_SP_QKV_PREFIX_SUM","prompt eval time","eval time","ERROR","failed" -ErrorAction SilentlyContinue)
     # Keep the full trace in stderr.log, but print only the last 80
     # matching lines on the terminal to avoid flooding a long SP run.
     $displayHits = if ($Trace) { @($hits | Select-Object -Last 80) } else { $hits }
     foreach ($hit in $displayHits) { Write-Host $hit.Line.Trim() }
 
+    if ($RankLocalCollectives -and -not $PureTP) {
+        $routes = @(Select-String -LiteralPath $stderr -Pattern 'GALAXY_COLLECTIVE_ROUTE.*mode=RANK_LOCAL.*status=PASS$')
+        $rsSeen = @($routes | Where-Object { $_.Line -match 'kind=RS\b' })
+        $agSeen = @($routes | Where-Object { $_.Line -match 'kind=AG\b' })
+        $residSeen = @($routes | Where-Object { $_.Line -match 'kind=RESIDUAL_SCATTER\b' })
+        if (-not $rsSeen -or -not $agSeen -or -not $residSeen) {
+            throw "RANK_LOCAL requested but missing real RS/AG/residual device-route witnesses: $stderr"
+        }
+        Write-Host "[GALAXY_COLLECTIVE_MODE] transport=RANK_LOCAL rs=$($rsSeen.Count) ag=$($agSeen.Count) residual=$($residSeen.Count) status=PASS"
+    }
     # Some llama-cli server compute failures still exit with process code 0.
     # Report the first explicit native bridge failure instead of emitting a
     # misleading "0 of 28 PASS witnesses" downstream.

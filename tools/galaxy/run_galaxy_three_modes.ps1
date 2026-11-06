@@ -18,6 +18,7 @@ param(
     [string]$SeqWeights = "1,1",
     [switch]$FinalLayerSP,
     [int]$CollectiveTileTokens = 32,
+    [switch]$RankLocalCollectives,
     [switch]$RequireNumericalParity,
     [double]$MaxAbs = 0.1,
     [double]$MaxRmse = 0.02,
@@ -56,6 +57,7 @@ $opts = @{
     Exe = $Exe
     OutputDir = $root
     CollectiveTileTokens = $CollectiveTileTokens
+    RankLocalCollectives = [bool]$RankLocalCollectives
     SeqWeights = $SeqWeights
     FinalLayerSP = $FinalLayerSP
     Devices = $Devices
@@ -73,7 +75,7 @@ $opts = @{
 }
 $results = @{}
 foreach ($mode in @("tp", "sp", "galaxy2")) {
-    Write-Host "[GALAXY_THREE_MODE] phase=$mode"
+    Write-Host "[GALAXY_THREE_MODE] phase=$mode transport=$(if($RankLocalCollectives){'RANK_LOCAL'}else{'HOST'})"
     if ($mode -eq "tp") {
         # Final-layer SP applies only to Galaxy/Galaxy2, not the TP control.
         $tpOpts = $opts.Clone()
@@ -140,6 +142,7 @@ $manifest = @{
     galaxy2_sp_ffn_layers = if ($Galaxy2FfnSpLayerSet) { $null } else { $Galaxy2FfnSpLayers }
     galaxy2_ffn_sp_layer_set = if ($Galaxy2FfnSpLayerSet) { $Galaxy2FfnSpLayerSet } else { $null }
     collective_tile_tokens = $CollectiveTileTokens
+    collective_transport = if ($RankLocalCollectives) { "RANK_LOCAL" } else { "HOST" }
     seq_weights = $SeqWeights
     final_layer_sp = [bool]$FinalLayerSP
     full_galaxy2 = (($Galaxy2FfnSpLayers -eq "all" -or $Galaxy2FfnSpLayerSet -eq "all") -and [bool]$FinalLayerSP)
