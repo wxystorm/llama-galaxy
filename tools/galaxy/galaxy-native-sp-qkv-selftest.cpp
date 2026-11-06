@@ -114,6 +114,36 @@ int main() {
             wrong_normalized_rejected=true;
         }
         expect(wrong_normalized_rejected,"unrelated MatMul activation must be rejected");
+
+        // Regression for real ggml_set_rows source ordering. Llama calls
+        // set_rows(cache, data, idx), but the GGML op stores src[0]=data,
+        // src[1]=indices, src[2]=cache. The prior bridge incorrectly
+        // followed src[1] and rejected both cache writers.
+        ggml_tensor * cache_k=ggml_new_tensor_2d(ctx,GGML_TYPE_F16,64,16);
+        ggml_tensor * cache_v=ggml_new_tensor_2d(ctx,GGML_TYPE_F16,64,16);
+        ggml_tensor * indices=ggml_new_tensor_1d(ctx,GGML_TYPE_I64,8);
+        ggml_tensor * k_values=ggml_view_2d(ctx,model_k,64,8,model_k->nb[2],0);
+        ggml_tensor * v_values=ggml_view_2d(ctx,src_v,64,8,src_v->nb[2],0);
+        ggml_tensor * store_k=ggml_set_rows(ctx,cache_k,k_values,indices);
+        ggml_tensor * store_v=ggml_set_rows(ctx,cache_v,v_values,indices);
+        expect(store_k->op==GGML_OP_SET_ROWS &&
+               store_k->src[0]==k_values &&
+               store_k->src[1]==indices &&
+               store_k->src[2]==cache_k,
+               "ggml_set_rows(src0=data,src1=indices,src2=cache) changed");
+        expect(store_v->src[0]==v_values &&
+               store_v->src[1]==indices &&
+               store_v->src[2]==cache_v,
+               "V SET_ROWS source order changed");
+        expect(cache_set_rows_from(store_k,model_k),
+               "real K-cache writer must trace through VIEW to post-RoPE Kcur");
+        expect(cache_set_rows_from(store_v,src_v),
+               "real V-cache writer must trace through VIEW to Vcur");
+        expect(!cache_set_rows_from(store_k,src_v) &&
+               !cache_set_rows_from(store_v,model_k) &&
+               !cache_set_rows_from(indices,model_k),
+               "K/V cache source identity must be rejected when mismatched");
+
         source s;
         s.hidden=128;
         s.tokens=8;
@@ -244,7 +274,8 @@ int main() {
         ggml_backend_free(pc);
         std::cout << "GALAXY_NATIVE_SP_QKV_SELFTEST PASS full_weights=1 local_tokens=4+4"
                      " matmul=1 rope=1 direct_sp=1 resident_backend_weights=PASS"
-                     " unchanged_outputs=PASS kv_token_to_tp_head=PASS" << std::endl;
+                     " unchanged_outputs=PASS kv_token_to_tp_head=PASS"
+                     " kv_set_rows_source_order=PASS" << std::endl;
         return 0;
     } catch (const std::exception & e) {
         std::cerr << "GALAXY_NATIVE_SP_QKV_SELFTEST FAIL " << e.what() << std::endl;

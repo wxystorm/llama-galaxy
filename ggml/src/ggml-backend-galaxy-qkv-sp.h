@@ -116,6 +116,30 @@ inline void validate(const source & s) {
     }
 }
 
+// Verify that a *real* Llama ggml_set_rows writer reads from this
+// post-projection K/V producer, following only layout-preserving views.
+// Important: current ggml_set_rows stores the VALUE in src[0], row
+// INDICES in src[1], and the cache DESTINATION in src[2]. These differ
+// from the public ggml_set_rows(ctx,dst,values,indices) argument order.
+inline bool cache_set_rows_from(const ggml_tensor * writer,
+                                const ggml_tensor * producer) {
+    if (!writer || !producer || writer->op!=GGML_OP_SET_ROWS ||
+            !writer->src[0] || !writer->src[1] || !writer->src[2]) return false;
+    const auto * index=writer->src[1];
+    if (index->type!=GGML_TYPE_I64 && index->type!=GGML_TYPE_I32) return false;
+    if (writer->src[0]->ne[1]!=index->ne[0] ||
+            writer->src[2]->type!=writer->type) return false;
+    const ggml_tensor * input=writer->src[0];
+    for(int depth=0;input && depth<12;++depth) {
+        if(input==producer) return true;
+        if(input->op!=GGML_OP_VIEW && input->op!=GGML_OP_RESHAPE &&
+                input->op!=GGML_OP_CONT && input->op!=GGML_OP_PERMUTE)
+            return false;
+        input=input->src[0];
+    }
+    return false;
+}
+
 // Materialize the F32 TP-head view expected by the existing Llama KV
 // cache writers. Native SP ranks own disjoint token ranges, but *each*
  // native rank computes every K/V head. The original TP ranks instead own

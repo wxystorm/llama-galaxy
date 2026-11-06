@@ -2814,31 +2814,48 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
     // Ensure the cache writes are *actually* part of this original Llama
-    // graph before skipping its TP projection producers. We preserve the
-    // original GGML SET_ROWS nodes, their index tensors and KV allocation.
+    // graph before skipping its TP projection producers. The GGML public
+    // call is set_rows(dst,values,indices), but its OP sources are:
+    //   src[0]=values, src[1]=row indices, src[2]=KV destination.
+    // This used to inspect src[1] as if it were the value source, wrongly
+    // rejecting both valid cache writes at L0. Keep the original writers,
+    // index tensors and KV storage; only their K/V values were replaced.
     const auto verify_cache_stores = [&](int layer, size_t start, size_t stop) {
         const ggml_tensor * k=find_live_stage(layer,"Kcur",true,false);
         const ggml_tensor * v=find_live_stage(layer,"Vcur",false,false);
-        int k_stores=0, v_stores=0;
-        const auto follows_stage=[](const ggml_tensor * src,
-                                    const ggml_tensor * stage)->bool {
-            for(int depth=0;src && depth<12;++depth) {
-                if(src==stage) return true;
-                if(src->op!=GGML_OP_VIEW && src->op!=GGML_OP_RESHAPE &&
-                        src->op!=GGML_OP_CONT && src->op!=GGML_OP_PERMUTE)
-                    return false;
-                src=src->src[0];
-            }
-            return false;
-        };
+        int k_stores=0, v_stores=0, all_stores=0;
         for(size_t j=start;j<stop;++j) {
             const ggml_tensor * op=cgraph->nodes[j];
-            if(op->op!=GGML_OP_SET_ROWS) continue;
-            if(follows_stage(op->src[1],k)) ++k_stores;
-            if(follows_stage(op->src[1],v)) ++v_stores;
+            if (!op || op->op!=GGML_OP_SET_ROWS) continue;
+            ++all_stores;
+            const bool is_k=ggml_galaxy_qkv_sp::cache_set_rows_from(op,k);
+            const bool is_v=ggml_galaxy_qkv_sp::cache_set_rows_from(op,v);
+            const ggml_tensor * values=op->src[0];
+            const ggml_tensor * indices=op->src[1];
+            const ggml_tensor * cache=op->src[2];
+            std::fprintf(stderr,
+                    "[GALAXY_SP_QKV_CACHE_STORE_NODE] layer=%d node=%zu"
+                    " data=%s data_op=%s indices=%s index_type=%s"
+                    " cache=%s cache_op=%s route=%s status=%s\n",
+                    layer,j,
+                    values?values->name:"NULL",
+                    values?ggml_op_name(values->op):"NULL",
+                    indices?indices->name:"NULL",
+                    indices?ggml_type_name(indices->type):"NULL",
+                    cache?cache->name:"NULL",
+                    cache?ggml_op_name(cache->op):"NULL",
+                    is_k?"K":is_v?"V":"UNKNOWN",
+                    (is_k != is_v)?"PASS":"FAIL");
+            if(is_k) ++k_stores;
+            if(is_v) ++v_stores;
         }
-        if(k_stores!=1 || v_stores!=1)
-            throw std::invalid_argument("SP-to-TP K/V cache bridge requires one original K and one V SET_ROWS");
+        if(all_stores!=2 || k_stores!=1 || v_stores!=1) {
+            throw std::invalid_argument(
+                    "TP cache SET_ROWS source identity mismatch: total="+
+                    std::to_string(all_stores)+" K="+std::to_string(k_stores)+
+                    " V="+std::to_string(v_stores)+
+                    " (ggml SET_ROWS src0=values, src1=indices, src2=cache)");
+        }
         std::fprintf(stderr,
                 "[GALAXY_SP_QKV_CACHE_STORES] layer=%d"
                 " source=SP_KV_TO_TP_HEAD cache_k_stores=1 cache_v_stores=1"
