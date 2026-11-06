@@ -2367,3 +2367,25 @@ Expected logs, in load/execution order:
 - `[GALAXY_SP_QKV_PREFIX_SUM] ... completed=N expected=N ... resident_weights=1 status=PASS`
 
 Only the PC needs rebuilding. `manifest.json` captures the resident flag and verifies its per-Prefill transfer byte count is zero; this covers **QKV model weights only**, not normal activations, K/V AllGather, or output transfers. Throughput comparisons must separate model-load wall time from prompt-evaluation time. All full-layer modes still keep the old TP QKV projections until a safe SP KV-cache write integration is available; numerical parity remains unverified.
+
+
+### Native QKV SP -> original TP KV cache bridge (optional, 2026-11-06)
+
+After all 28 resident native QKV/Attention/FFN layers passed execution, this opt-in experiment removes the redundant TP QKV Prefill projectors while retaining the exact original Llama KV-cache SET_ROWS writers and original TP Decode. Flag: -NativeSpQkvSkipTpPrefill, valid only together with -NativeSpQkvResidentWeights and a selected -NativeSpQkvPrefixLayers.
+
+Execution:
+1. At each selected attn_norm output boundary, run the native full QKV MatMul/RoPE on each rank's local tokens, using the original GGUF resident weight replicas and exact model RoPE params. Reject nonzero/continuation RoPE positions.
+2. Require the original TP Q/K projection groups to contain exactly MUL_MAT, RESHAPE, ROPE and the V group to contain exactly MUL_MAT, RESHAPE. Skip only these groups; fail closed for altered/fused graphs.
+3. Repack each native SP token-local Q/K/V F32 result into rank-local TP head shards for all prompt tokens. Inject into the actual Qcur, Kcur, Vcur physical buffers, with first-word readback fences. Qcur remains for graph snapshot compatibility; native Attention still consumes the directly computed SP Q.
+4. Preserve the original llama-kv-cache cpy_k and cpy_v SET_ROWS ops, with the existing index tensors and cache allocations. Require exactly one K and V writer linked to the intended producers; dispatch and synchronize both backends before native SP Attention.
+5. Reuse already projected local SP QKV for native Attention; inject its output at the real pre-W_o boundary and verify the original physical W_o input. The existing FFN-SP and final output remain unchanged.
+
+PC build: cmake --build build-galaxy --config Release --target llama-cli galaxy-native-sp-qkv-selftest -j 8
+CPU layout test: .\build-galaxy\bin\Release\galaxy-native-sp-qkv-selftest.exe
+
+2-layer smoke: .\tools\galaxy\run_galaxy_causal_hybrid_ffn.ps1 -Common $common -AttentionPrefix 2 -FfnSpLayerSet "0-1" -NativeSpQkvPrefixLayers 2 -NativeSpQkvResidentWeights -NativeSpQkvSkipTpPrefill -Trace
+28-layer smoke: .\tools\galaxy\run_galaxy_causal_hybrid_ffn.ps1 -Common $common -AttentionPrefix 28 -FfnSpLayerSet all -FinalLayerSP -NativeSpQkvPrefixLayers 28 -NativeSpQkvResidentWeights -NativeSpQkvSkipTpPrefill
+
+Per-layer proof: GALAXY_SP_QKV_EARLY; six GALAXY_SP_QKV_TP_SKIP (3 producers x 2 ranks); three GALAXY_SP_QKV_TP_INJECT; one GALAXY_SP_QKV_CACHE_STORES phase=EXECUTED; native SP Attention and byte-exact W_o input confirmation. Full 28-layer proof: GALAXY_SP_QKV_TP_BYPASS_SUM completed=28 expected=28 tp_qkv_nodes_skipped=224 cache_kv_store_ops=56 status=PASS.
+
+Scope: experimental fresh first-Prefill only, Llama-3.2-3B dense, no TP projection graph shape deviations, no altered decode logic. The host SP-to-TP K/V shuffle still costs bandwidth. Runtime dispatch and backend-write verification are not evidence of independent numerical or Decode logits parity. Always compare the new opt-in to the previous resident 28-layer baseline; remove only -NativeSpQkvSkipTpPrefill to roll back. PC must be rebuilt, Phone RPC protocol remains unchanged.

@@ -2335,6 +2335,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     const bool native_sp_qkv_requested = !native_qkv_plan.layers.empty();
     const char * resident_raw=std::getenv("LLAMA_GALAXY_NATIVE_SP_QKV_RESIDENT_WEIGHTS");
     const bool resident_qkv_requested=resident_raw && std::strcmp(resident_raw,"1")==0;
+    const char * no_tp_raw=std::getenv("LLAMA_GALAXY_NATIVE_SP_QKV_SKIP_TP_PREFILL");
+    const bool no_tp_qkv_requested=no_tp_raw && std::strcmp(no_tp_raw,"1")==0;
     const auto selected_layer = [&](const char * name, const char * stem) -> int {
         return live_plan.match_boundary(name,stem);
     };
@@ -2368,13 +2370,25 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     std::map<int,live_layer_state> live_states;
     std::set<int> live_shadow_verified;
     std::set<int> native_qkv_completed;
+    struct native_tp_cache_bridge {
+        ggml_galaxy_qkv_sp::projected sp;
+        ggml_galaxy_causal_live::request geometry;
+        int64_t tokens=0;
+        unsigned injected_mask=0;
+        bool prepared=false;
+        bool consumed=false;
+        double projection_wall_ms=0.0;
+    };
+    std::map<int,native_tp_cache_bridge> native_tp_cache_bridges;
+    std::set<int> bypass_tp_cache_completed;
 
     // Name alone is not identity: projection, reshape and RoPE can all
     // share "Qcur-0". Restrict selection to the actual OUTPUT node that
     // was captured when its producing subgraph completed. Q/K must be
     // post-RoPE, V must be the final rank-sharded 3D tensor.
     const auto find_live_stage = [&](int layer, const char * stage,
-                                      bool must_be_rope) -> const ggml_tensor * {
+                                      bool must_be_rope,
+                                      bool require_capture = true) -> const ggml_tensor * {
         const std::string expected=std::string(stage)+"-"+std::to_string(layer);
         const ggml_tensor * match=nullptr;
         int named=0,eligible=0;
@@ -2383,7 +2397,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (!t || expected != t->name) continue;
             ++named;
             if ((t->flags & GGML_TENSOR_FLAG_OUTPUT)==0 ||
-                    qkv_live_snapshots.find(t)==qkv_live_snapshots.end() ||
+                    (require_capture && qkv_live_snapshots.find(t)==qkv_live_snapshots.end()) ||
                     (must_be_rope && t->op != GGML_OP_ROPE)) continue;
             ++eligible;
             if(match) throw std::invalid_argument("ambiguous captured model stage "+expected);
@@ -2392,8 +2406,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         std::fprintf(stderr,
                 "[GALAXY_CAUSAL_LIVE_NODE] name=%s candidates=%d"
                 " captured_eligible=%d selected_op=%s"
-                " selection=PRODUCER_CAPTURED_OUTPUT status=%s\n",
+                " selection=%s status=%s\n",
                 expected.c_str(),named,eligible,
+                require_capture?"PRODUCER_CAPTURED_OUTPUT":"PLANNED_PRODUCER_OUTPUT",
                 match?ggml_op_name(match->op):"NONE",match?"PASS":"FAIL");
         std::fflush(stderr);
         if(!match) throw std::invalid_argument("missing captured model stage "+expected);
@@ -2552,9 +2567,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         // Follow the real producer nodes, NOT cgraph->leafs. Backend-created
         // graphs can omit model weights from their leaf enumeration despite
         // their presence as MatMul src[0] and as live Meta static tensors.
-        const ggml_tensor * q=find_live_stage(layer,"Qcur",true);
-        const ggml_tensor * k=find_live_stage(layer,"Kcur",true);
-        const ggml_tensor * v=find_live_stage(layer,"Vcur",false);
+        const ggml_tensor * q=find_live_stage(layer,"Qcur",true,!no_tp_qkv_requested);
+        const ggml_tensor * k=find_live_stage(layer,"Kcur",true,!no_tp_qkv_requested);
+        const ggml_tensor * v=find_live_stage(layer,"Vcur",false,!no_tp_qkv_requested);
         const std::string prefix="blk."+std::to_string(layer)+".";
         const auto full_weight=[&](const ggml_tensor * producer,
                                    const char * suffix,
@@ -2668,12 +2683,122 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return src;
     };
 
+    // Build first-Prefill geometry from pinned *planned* TP output nodes.
+    // The Q/K/V producers have not run yet; this helper deliberately does
+    // not require their snapshots. The model graph remains unchanged.
+    const auto build_bypass_geometry = [&](int layer)
+            -> ggml_galaxy_causal_live::request {
+        const ggml_tensor * q=find_live_stage(layer,"Qcur",true,false);
+        const ggml_tensor * k=find_live_stage(layer,"Kcur",true,false);
+        const ggml_tensor * v=find_live_stage(layer,"Vcur",false,false);
+        ggml_galaxy_causal_live::request work;
+        if (q->type!=GGML_TYPE_F32 || k->type!=GGML_TYPE_F32 ||
+                v->type!=GGML_TYPE_F32 || q->ne[0]<=0 || q->ne[2]<8 ||
+                q->ne[2]>512 || q->ne[3]!=1 || k->ne[0]!=q->ne[0] ||
+                k->ne[2]!=q->ne[2] || v->ne[0]!=q->ne[0] ||
+                v->ne[2]!=q->ne[2] || v->ne[3]!=1 ||
+                ggml_backend_meta_get_split_state(q,false).axis!=GGML_BACKEND_SPLIT_AXIS_1 ||
+                ggml_backend_meta_get_split_state(k,false).axis!=GGML_BACKEND_SPLIT_AXIS_1 ||
+                ggml_backend_meta_get_split_state(v,false).axis!=GGML_BACKEND_SPLIT_AXIS_0) {
+            throw std::invalid_argument("unsupported early Q/K/V source layout for TP cache bypass");
+        }
+        work.tokens=q->ne[2];
+        work.head_dim=q->ne[0];
+        work.layer=layer;
+        for (int rank=0;rank<2;++rank) {
+            const ggml_tensor * qp=ggml_backend_meta_buffer_simple_tensor(q,rank);
+            const ggml_tensor * kp=ggml_backend_meta_buffer_simple_tensor(k,rank);
+            const ggml_tensor * vp=ggml_backend_meta_buffer_simple_tensor(v,rank);
+            if (!qp || !kp || !vp || !qp->buffer || !kp->buffer || !vp->buffer ||
+                    qp->ne[0]!=work.head_dim || kp->ne[0]!=work.head_dim ||
+                    qp->ne[2]!=work.tokens || kp->ne[2]!=work.tokens ||
+                    vp->ne[0]%work.head_dim!=0 || vp->ne[1]!=work.tokens ||
+                    qp->ne[1]<=0 || kp->ne[1]<=0 ||
+                    vp->ne[0]/work.head_dim!=kp->ne[1]) {
+                throw std::invalid_argument("physical TP QKV cache-producer rank shape mismatch");
+            }
+            work.q.heads[rank]=qp->ne[1];
+            work.k.heads[rank]=kp->ne[1];
+            work.v.heads[rank]=vp->ne[0]/work.head_dim;
+        }
+        // Check the ACTUAL model positions *before* skipping TP nodes.
+        // A continuation prefill must not be treated as positions 0..N-1.
+        const ggml_tensor * rope_pos=q->src[1];
+        if (!rope_pos || rope_pos->type!=GGML_TYPE_I32 ||
+                !ggml_is_contiguous(rope_pos) ||
+                ggml_nelements(rope_pos)!=work.tokens) {
+            throw std::invalid_argument("SP KV bridge missing original RoPE position tensor");
+        }
+        for (int rank=0;rank<2;++rank) {
+            const ggml_tensor * p=ggml_backend_buffer_is_meta(rope_pos->buffer) ?
+                    ggml_backend_meta_buffer_simple_tensor(rope_pos,rank) : rope_pos;
+            if (!p || p->type!=GGML_TYPE_I32 ||
+                    !ggml_is_contiguous(p) ||
+                    ggml_nbytes(p)!=size_t(work.tokens)*sizeof(int32_t)) {
+                throw std::invalid_argument("SP KV bridge lacks readable original positions");
+            }
+            std::vector<int32_t> values(size_t(work.tokens),-1);
+            if(p->buffer) {
+                ggml_backend_synchronize(backend_ctx->backend_configs[rank].backend);
+                ggml_backend_tensor_get(p,values.data(),0,ggml_nbytes(p));
+            } else if(p->data) {
+                std::memcpy(values.data(),p->data,ggml_nbytes(p));
+            } else {
+                throw std::invalid_argument("SP KV bridge position tensor has no backing data");
+            }
+            for(int64_t t=0;t<work.tokens;++t) {
+                if(values[size_t(t)]!=t)
+                    throw std::invalid_argument("SP KV cache bypass only supports zero-based fresh prefill");
+            }
+        }
+        return work;
+    };
+
+    // Ensure the cache writes are *actually* part of this original Llama
+    // graph before skipping its TP projection producers. We preserve the
+    // original GGML SET_ROWS nodes, their index tensors and KV allocation.
+    const auto verify_cache_stores = [&](int layer, size_t start, size_t stop) {
+        const ggml_tensor * k=find_live_stage(layer,"Kcur",true,false);
+        const ggml_tensor * v=find_live_stage(layer,"Vcur",false,false);
+        int k_stores=0, v_stores=0;
+        const auto follows_stage=[](const ggml_tensor * src,
+                                    const ggml_tensor * stage)->bool {
+            for(int depth=0;src && depth<12;++depth) {
+                if(src==stage) return true;
+                if(src->op!=GGML_OP_VIEW && src->op!=GGML_OP_RESHAPE &&
+                        src->op!=GGML_OP_CONT && src->op!=GGML_OP_PERMUTE)
+                    return false;
+                src=src->src[0];
+            }
+            return false;
+        };
+        for(size_t j=start;j<stop;++j) {
+            const ggml_tensor * op=cgraph->nodes[j];
+            if(op->op!=GGML_OP_SET_ROWS) continue;
+            if(follows_stage(op->src[1],k)) ++k_stores;
+            if(follows_stage(op->src[1],v)) ++v_stores;
+        }
+        if(k_stores!=1 || v_stores!=1)
+            throw std::invalid_argument("SP-to-TP K/V cache bridge requires one original K and one V SET_ROWS");
+        std::fprintf(stderr,
+                "[GALAXY_SP_QKV_CACHE_STORES] layer=%d"
+                " source=SP_KV_TO_TP_HEAD cache_k_stores=1 cache_v_stores=1"
+                " cache_indices=ORIGINAL_LLAMA phase=PREFLIGHT status=READY\n",layer);
+        std::fflush(stderr);
+    };
+
     if (trace) {
         GGML_LOG_INFO("[GALAXY_META_TRACE] event=GRAPH_BEGIN nodes=%d backends=%zu sp=%d uid=%" PRIu64 "\n",
                 cgraph->n_nodes, n_backends, int(has_galaxy_markers), cgraph->uid);
     }
     if (has_galaxy_markers && n_backends != 2) {
         GGML_LOG_ERROR("[GALAXY_SP] graph transitions need exactly two Meta backends\n");
+        return GGML_STATUS_FAILED;
+    }
+    if (no_tp_qkv_requested && (!resident_qkv_requested ||
+            !native_sp_qkv_requested || !live_replace_requested ||
+            !live_hybrid_ffn_requested || n_backends!=2)) {
+        GGML_LOG_ERROR("[GALAXY_SP_QKV_TP_BYPASS] requires two-rank resident native QKV, Hybrid REPLACE\n");
         return GGML_STATUS_FAILED;
     }
     if (resident_qkv_requested && !native_sp_qkv_requested) {
@@ -3164,6 +3289,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     std::set<int> hybrid_ffn_ag;
     std::set<int> hybrid_attn_ag;
     std::set<int> hybrid_ffn_rs;
+    size_t bypass_actual_tp_nodes_skipped=0;
+    size_t bypass_actual_kv_store_ops=0;
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         const size_t i_start = backend_ctx->backend_configs[0].cgraphs[i].offset;
         const size_t i_stop = i + 1 < backend_ctx->n_subgraphs
@@ -3174,6 +3301,20 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         const int raw_layer = live_replace_requested ?
                 selected_layer(original_last->name,"fattn_raw") : -1;
         const bool is_replace_raw_boundary = raw_layer >= 0 &&
+                original_last->ne[2]>=8;
+        const int q_bypass_layer = no_tp_qkv_requested ?
+                selected_layer(original_last->name,"Qcur") : -1;
+        const int k_bypass_layer = no_tp_qkv_requested ?
+                selected_layer(original_last->name,"Kcur") : -1;
+        const int v_bypass_layer = no_tp_qkv_requested ?
+                selected_layer(original_last->name,"Vcur") : -1;
+        const int producer_layer = q_bypass_layer>=0 ? q_bypass_layer :
+                                   k_bypass_layer>=0 ? k_bypass_layer :
+                                   v_bypass_layer;
+        const char producer_kind = q_bypass_layer>=0?'q':
+                                   k_bypass_layer>=0?'k':'v';
+        const bool is_bypass_producer = producer_layer>=0 &&
+                native_qkv_plan.contains(producer_layer) &&
                 original_last->ne[2]>=8;
         if (is_replace_raw_boundary) {
             const auto split=ggml_backend_meta_get_split_state(original_last,false);
@@ -3201,6 +3342,55 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             raw_layer,preceding);
                     return GGML_STATUS_FAILED;
                 }
+            }
+        }
+        if (is_bypass_producer) {
+            try {
+                const auto state=native_tp_cache_bridges.find(producer_layer);
+                const int expected_nodes=producer_kind=='v'?2:3;
+                const ggml_op terminal=producer_kind=='v' ?
+                        GGML_OP_RESHAPE : GGML_OP_ROPE;
+                if (state==native_tp_cache_bridges.end() ||
+                        !state->second.prepared ||
+                        state->second.tokens!=original_last->ne[2] ||
+                        state->second.injected_mask !=
+                            (producer_kind=='q'?0u:producer_kind=='v'?1u:3u) ||
+                        i_stop-i_start!=size_t(expected_nodes) ||
+                        original_last->op!=terminal ||
+                        cgraph->nodes[i_start]->op!=GGML_OP_MUL_MAT ||
+                        cgraph->nodes[i_start+1]->op!=GGML_OP_RESHAPE ||
+                        (expected_nodes==3 && cgraph->nodes[i_start+2]->op!=GGML_OP_ROPE)) {
+                    throw std::invalid_argument(
+                            "unexpected TP-QKV graph topology/order; refusing to skip any cache producer");
+                }
+                const ggml_tensor * expected=find_live_stage(producer_layer,
+                        producer_kind=='q'?"Qcur":producer_kind=='k'?"Kcur":"Vcur",
+                        producer_kind!='v',false);
+                if (expected!=original_last)
+                    throw std::invalid_argument("TP-QKV terminal identity mismatch");
+            } catch (const std::exception & e) {
+                std::fprintf(stderr,
+                        "[GALAXY_SP_QKV_TP_SKIP] layer=%d tensor=%s status=FAIL reason=%s\n",
+                        producer_layer,original_last->name,e.what());
+                return GGML_STATUS_FAILED;
+            }
+        }
+        if (no_tp_qkv_requested && is_replace_raw_boundary &&
+                native_qkv_plan.contains(raw_layer)) {
+            try {
+                const auto state=native_tp_cache_bridges.find(raw_layer);
+                if (state==native_tp_cache_bridges.end() ||
+                        !state->second.prepared ||
+                        state->second.injected_mask!=7u ||
+                        state->second.consumed) {
+                    throw std::invalid_argument("K/V cache not prepared by all three SP-QKV projections");
+                }
+                verify_cache_stores(raw_layer,i_start,i_stop);
+            } catch (const std::exception & e) {
+                std::fprintf(stderr,
+                        "[GALAXY_SP_QKV_CACHE_STORES] layer=%d status=FAIL reason=%s\n",
+                        raw_layer,e.what());
+                return GGML_STATUS_FAILED;
             }
         }
         std::vector<double> dispatch_ms(n_backends, 0);
@@ -3233,7 +3423,22 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             // cgraph. Force uid=0: RPC graph reuse MUST hash the actual
             // trimmed node sequence, not use the old complete graph UID.
             ggml_cgraph without_flash = *simple_graph;
+            ggml_cgraph without_tp = *simple_graph;
             ggml_cgraph * run_graph = simple_graph;
+            if (is_bypass_producer) {
+                // The exact MatMul, Reshape and optional RoPE were proven
+                // to be the *only* nodes in this producer subgraph. Their
+                // physical output is populated from native SP bytes below.
+                without_tp.n_nodes=0;
+                without_tp.uid=0;
+                run_graph=&without_tp;
+                std::fprintf(stderr,
+                        "[GALAXY_SP_QKV_TP_SKIP] layer=%d rank=%zu"
+                        " tensor=%s skipped_nodes=%d"
+                        " native_sp_projected=1 status=PASS\n",
+                        producer_layer,j,original_last->name,simple_graph->n_nodes);
+                std::fflush(stderr);
+            }
             if (is_replace_raw_boundary) {
                 ggml_tensor * source_last =
                         ggml_backend_meta_buffer_simple_tensor(original_last,j);
@@ -3298,6 +3503,70 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
+        if (is_bypass_producer) {
+            try {
+                auto & bridge=native_tp_cache_bridges.at(producer_layer);
+                const auto & local_sp=producer_kind=='q' ? bridge.sp.q :
+                                      producer_kind=='k' ? bridge.sp.k :
+                                                           bridge.sp.v;
+                const auto & heads=producer_kind=='q' ? bridge.geometry.q.heads :
+                                    bridge.geometry.k.heads;
+                const auto repacked=ggml_galaxy_qkv_sp::token_to_head_f32(
+                        local_sp,bridge.tokens,bridge.geometry.head_dim,heads);
+                for(int rank=0;rank<2;++rank) {
+                    ggml_tensor * output=ggml_backend_meta_buffer_simple_tensor(original_last,rank);
+                    if (!output || !output->buffer || output->type!=GGML_TYPE_F32 ||
+                            !ggml_is_contiguous(output) ||
+                            ggml_nbytes(output)!=repacked[rank].size()) {
+                        throw std::invalid_argument("SP-to-TP cache producer physical tensor differs in shape/type");
+                    }
+                    ggml_backend_tensor_set(output,repacked[rank].data(),0,repacked[rank].size());
+                    ggml_backend_synchronize(backend_ctx->backend_configs[rank].backend);
+                    // Verify the *actual backend* destination, not only
+                    // the host reshuffle result, before original cache
+                    // SET_ROWS consumes it in the next subgraph.
+                    uint32_t observed=0,expected=0;
+                    ggml_backend_tensor_get(output,&observed,0,sizeof(observed));
+                    std::memcpy(&expected,repacked[rank].data(),sizeof(expected));
+                    if(observed!=expected)
+                        throw std::invalid_argument("SP QKV TP-head output readback mismatch");
+                }
+                bridge.injected_mask|=producer_kind=='q'?1u:
+                                      producer_kind=='v'?2u:4u;
+                bypass_actual_tp_nodes_skipped+=i_stop-i_start;
+                std::fprintf(stderr,
+                        "[GALAXY_SP_QKV_TP_INJECT] layer=%d tensor=%s"
+                        " mode=SP_TOKEN_TO_TP_HEAD ranks=2"
+                        " cache_producer=ORIGINAL_LLAMA bytes_pc=%zu"
+                        " bytes_phone=%zu identity=F32_BIT_EXACT status=PASS\n",
+                        producer_layer,original_last->name,
+                        repacked[0].size(),repacked[1].size());
+                std::fflush(stderr);
+            } catch(const std::exception & e) {
+                std::fprintf(stderr,
+                        "[GALAXY_SP_QKV_TP_INJECT] layer=%d tensor=%s"
+                        " status=FAIL reason=%s\n",
+                        producer_layer,original_last->name,e.what());
+                return GGML_STATUS_FAILED;
+            }
+        }
+
+        if (no_tp_qkv_requested && is_replace_raw_boundary &&
+                native_qkv_plan.contains(raw_layer)) {
+            // Backend dispatch returned successfully for BOTH original
+            // SET_ROWS writers. Fence them before consuming any new
+            // Attention output or advancing to another Transformer layer.
+            for (int rank=0;rank<2;++rank)
+                ggml_backend_synchronize(backend_ctx->backend_configs[rank].backend);
+            bypass_actual_kv_store_ops+=2;
+            std::fprintf(stderr,
+                    "[GALAXY_SP_QKV_CACHE_STORES] layer=%d"
+                    " source=SP_KV_TO_TP_HEAD cache_k_stores=1 cache_v_stores=1"
+                    " cache_indices=ORIGINAL_LLAMA phase=EXECUTED status=PASS\n",
+                    raw_layer);
+            std::fflush(stderr);
+        }
+
         // In REPLACE, the original TP Flash node was intentionally
         // removed from the submitted graph. Its exact output tensor must
         // now be filled with the native SP result, *before* the next
@@ -3322,16 +3591,28 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 size_t native_qkv_weight_bytes=0;
                 const bool native_selected = native_qkv_plan.contains(raw_layer);
                 if (native_selected) {
-                    const auto started=ggml_galaxy_profile::clock::now();
-                    const auto sp_source=build_native_sp_qkv(raw_layer,work);
-                    native_qkv_weight_bytes=
-                            ggml_row_size(sp_source.wq.type,sp_source.wq.in)*size_t(sp_source.wq.out)+
-                            ggml_row_size(sp_source.wk.type,sp_source.wk.in)*size_t(sp_source.wk.out)+
-                            ggml_row_size(sp_source.wv.type,sp_source.wv.in)*size_t(sp_source.wv.out);
-                    local_sp=ggml_galaxy_qkv_sp::run(devs,sp_source);
-                    work.sp_qkv=&local_sp;
-                    sp_projection_ms=ggml_galaxy_profile::ms(started,
-                            ggml_galaxy_profile::clock::now());
+                    if (no_tp_qkv_requested) {
+                        auto & bridge=native_tp_cache_bridges.at(raw_layer);
+                        if (!bridge.prepared || bridge.consumed ||
+                                bridge.injected_mask!=7u || bridge.tokens!=work.tokens)
+                            throw std::invalid_argument("native SP early QKV not ready for cache/Attention");
+                        work.sp_qkv=&bridge.sp;
+                        sp_projection_ms=bridge.projection_wall_ms;
+                        // Measured at ATTN_NORM rather than at Flash boundary.
+                        // Full matrices are already model resident; weights
+                        // are not read back or uploaded during Prefill.
+                    } else {
+                        const auto started=ggml_galaxy_profile::clock::now();
+                        const auto sp_source=build_native_sp_qkv(raw_layer,work);
+                        native_qkv_weight_bytes=
+                                ggml_row_size(sp_source.wq.type,sp_source.wq.in)*size_t(sp_source.wq.out)+
+                                ggml_row_size(sp_source.wk.type,sp_source.wk.in)*size_t(sp_source.wk.out)+
+                                ggml_row_size(sp_source.wv.type,sp_source.wv.in)*size_t(sp_source.wv.out);
+                        local_sp=ggml_galaxy_qkv_sp::run(devs,sp_source);
+                        work.sp_qkv=&local_sp;
+                        sp_projection_ms=ggml_galaxy_profile::ms(started,
+                                ggml_galaxy_profile::clock::now());
+                    }
                 }
                 const auto measured=ggml_galaxy_causal_live::replace(devs,work,outputs);
                 if (native_selected) {
@@ -3343,11 +3624,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             "[GALAXY_SP_QKV] layer=%d mode=SP_NATIVE"
                             " producer=FULL_WEIGHT_LOCAL_TOKENS local_tokens=%" PRId64 "+%" PRId64
                             " projection_wall_ms=%.3f"
-                            " tp_projection_kept_for_kv=1 direct_native_flash=1"
+                            " tp_projection_kept_for_kv=%d direct_native_flash=1"
                             " resident_weights=%d runtime_weight_read_bytes=%zu"
                             " runtime_weight_upload_bytes=%zu status=PASS\n",
                             raw_layer,(work.tokens+1)/2,work.tokens/2,sp_projection_ms,
-                            int(resident_qkv_requested),
+                            int(!no_tp_qkv_requested),int(resident_qkv_requested),
                             resident_qkv_requested ? size_t(0) : native_qkv_weight_bytes,
                             resident_qkv_requested ? size_t(0) : 2*native_qkv_weight_bytes);
                     std::fflush(stderr);
@@ -3383,6 +3664,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 auto & state=live_states.at(raw_layer);
                 state.native_sp_qkv=native_selected;
+                if (no_tp_qkv_requested && native_selected)
+                    native_tp_cache_bridges.at(raw_layer).consumed=true;
                 state.tp_heads=std::move(outputs);
                 state.pending=true;
                 state.tokens=work.tokens;
@@ -3457,6 +3740,43 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         original_last->name);
                 return GGML_STATUS_FAILED;
             }
+
+            const int norm_layer = no_tp_qkv_requested ?
+                    selected_layer(original_last->name,"attn_norm") : -1;
+            if (norm_layer>=0 && original_last->ne[1]>=8 &&
+                    native_qkv_plan.contains(norm_layer)) {
+                try {
+                    const auto geometry=build_bypass_geometry(norm_layer);
+                    auto & bridge=native_tp_cache_bridges[norm_layer];
+                    if(bridge.prepared || bridge.tokens!=0)
+                        throw std::invalid_argument("duplicate native SP QKV projection at normalized producer");
+                    const ggml_galaxy_collectives::devices_t devices={
+                            backend_ctx->backend_configs[0].backend,
+                            backend_ctx->backend_configs[1].backend
+                    };
+                    const auto started=ggml_galaxy_profile::clock::now();
+                    const auto source=build_native_sp_qkv(norm_layer,geometry);
+                    bridge.sp=ggml_galaxy_qkv_sp::run(devices,source);
+                    bridge.projection_wall_ms=ggml_galaxy_profile::ms(started,
+                            ggml_galaxy_profile::clock::now());
+                    bridge.tokens=geometry.tokens;
+                    bridge.geometry=geometry;
+                    bridge.prepared=true;
+                    std::fprintf(stderr,
+                            "[GALAXY_SP_QKV_EARLY] layer=%d"
+                            " boundary=ATTN_NORM token_shards=%" PRId64 "+%" PRId64
+                            " full_qkv_weights=RESIDENT"
+                            " projection_wall_ms=%.3f status=PASS\n",
+                            norm_layer,(geometry.tokens+1)/2,geometry.tokens/2,
+                            bridge.projection_wall_ms);
+                    std::fflush(stderr);
+                } catch (const std::exception & e) {
+                    std::fprintf(stderr,
+                            "[GALAXY_SP_QKV_EARLY] layer=%d status=FAIL reason=%s\n",
+                            norm_layer,e.what());
+                    return GGML_STATUS_FAILED;
+                }
+            }
         }
 
         // Boundary names are non-unique inside llama-graph; only the
@@ -3507,6 +3827,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
             state.pending=false;
             state.verified=true;
+            if (no_tp_qkv_requested && state.native_sp_qkv) {
+                const auto b=native_tp_cache_bridges.find(kqv_layer);
+                if (b==native_tp_cache_bridges.end() || !b->second.consumed ||
+                        !b->second.prepared || b->second.injected_mask!=7u ||
+                        !bypass_tp_cache_completed.insert(kqv_layer).second) {
+                    GGML_LOG_ERROR("[GALAXY_SP_QKV_TP_BYPASS] layer=%d missing complete cache bridge\n",
+                            kqv_layer);
+                    return GGML_STATUS_FAILED;
+                }
+                // Release all host QKV F32 shards after the existing
+                // SP Attention output is verified at the real W_o input.
+                native_tp_cache_bridges.erase(b);
+            }
             if (state.native_sp_qkv) {
                 if (!native_qkv_plan.contains(kqv_layer) ||
                         !native_qkv_completed.insert(kqv_layer).second) {
@@ -4312,6 +4645,26 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     completed,live_plan.layers.size());
         }
         if(completed>0) std::fflush(stderr);
+    }
+    if (no_tp_qkv_requested && !bypass_tp_cache_completed.empty()) {
+        const std::set<int> expected(native_qkv_plan.layers.begin(),native_qkv_plan.layers.end());
+        if(bypass_tp_cache_completed!=expected ||
+                bypass_actual_tp_nodes_skipped!=8*expected.size() ||
+                bypass_actual_kv_store_ops!=2*expected.size()) {
+            GGML_LOG_ERROR("[GALAXY_SP_QKV_TP_BYPASS_SUM] completed=%zu expected=%zu"
+                    " status=FAIL reason=PRODUCER_OR_CACHE_COVERAGE\n",
+                    bypass_tp_cache_completed.size(),expected.size());
+            return GGML_STATUS_FAILED;
+        }
+        std::fprintf(stderr,
+                "[GALAXY_SP_QKV_TP_BYPASS_SUM] layers=%s"
+                " completed=%zu expected=%zu tp_qkv_nodes_skipped=%zu"
+                " cache_kv_store_ops=%zu kv_source=SP_TOKEN_TO_TP_HEAD"
+                " decode=TP_ORIGINAL status=PASS\n",
+                native_qkv_plan.description().c_str(),
+                expected.size(),expected.size(),
+                bypass_actual_tp_nodes_skipped,bypass_actual_kv_store_ops);
+        std::fflush(stderr);
     }
     if (native_sp_qkv_requested) {
         size_t attention_completed=0;

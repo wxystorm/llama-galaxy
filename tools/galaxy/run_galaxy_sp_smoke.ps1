@@ -32,6 +32,7 @@ param(
     [switch]$NativeSpQkvL0,
     [ValidateSet(0,1,2,4,8,16,28)][int]$NativeSpQkvPrefixLayers = 0,
     [switch]$NativeSpQkvResidentWeights,
+    [switch]$NativeSpQkvSkipTpPrefill,
     [switch]$Trace,
     [switch]$DisableRpcGraphReuse,
     [switch]$DumpLogits,
@@ -94,6 +95,11 @@ if ($NativeSpQkvResidentWeights -and $nativeSpQkvCount -eq 0) {
     throw "NativeSpQkvResidentWeights requires a native SP QKV prefix"
 }
 $residentExpected = if ($NativeSpQkvResidentWeights) { 1 } else { 0 }
+$bypassExpected = if ($NativeSpQkvSkipTpPrefill) { 1 } else { 0 }
+$tpKeptExpected = if ($NativeSpQkvSkipTpPrefill) { 0 } else { 1 }
+if ($NativeSpQkvSkipTpPrefill -and (-not $NativeSpQkvResidentWeights -or $nativeSpQkvCount -eq 0)) {
+    throw "NativeSpQkvSkipTpPrefill requires resident SP QKV weights"
+}
 if ($nativeSpQkvCount -gt 0 -and (-not $CausalHybridFfnSp -or -not $LiveCausalReplace -or
         $LiveCausalPrefixLayers -lt $nativeSpQkvCount -or $SeqWeights -ne "1,1")) {
     throw "Native SP QKV prefix requires Hybrid REPLACE with Attention prefix >= QKV prefix, and SeqWeights 1,1"
@@ -135,7 +141,7 @@ $keys = @("LLAMA_GALAXY_TP", "LLAMA_GALAXY_TP_HEADS", "LLAMA_GALAXY_TP_FFN", "LL
     "LLAMA_GALAXY_STAGE_DUMP", "LLAMA_GALAXY_STAGE_DUMP_DIR",
     "LLAMA_GALAXY_FFN_OP_DUMP", "LLAMA_GALAXY_FFN_OP_DUMP_DIR",
     "LLAMA_GALAXY_QKV_PROBE_LAYERS", "LLAMA_GALAXY_QKV_PROBE_DIR",
-    "LLAMA_GALAXY_CAUSAL_LIVE_LAYER", "LLAMA_GALAXY_CAUSAL_LIVE_PREFIX_LAYERS", "LLAMA_GALAXY_CAUSAL_LIVE_MODE", "LLAMA_GALAXY_CAUSAL_HYBRID_FFN", "LLAMA_GALAXY_NATIVE_SP_QKV_L0", "LLAMA_GALAXY_NATIVE_SP_QKV_PREFIX_LAYERS", "LLAMA_GALAXY_NATIVE_SP_QKV_RESIDENT_WEIGHTS",
+    "LLAMA_GALAXY_CAUSAL_LIVE_LAYER", "LLAMA_GALAXY_CAUSAL_LIVE_PREFIX_LAYERS", "LLAMA_GALAXY_CAUSAL_LIVE_MODE", "LLAMA_GALAXY_CAUSAL_HYBRID_FFN", "LLAMA_GALAXY_NATIVE_SP_QKV_L0", "LLAMA_GALAXY_NATIVE_SP_QKV_PREFIX_LAYERS", "LLAMA_GALAXY_NATIVE_SP_QKV_RESIDENT_WEIGHTS", "LLAMA_GALAXY_NATIVE_SP_QKV_SKIP_TP_PREFILL",
     "LLAMA_GALAXY_COLLECTIVE_TILE_TOKENS", "LLAMA_GALAXY_RS_FUSED_READ", "LLAMA_GALAXY_SP_SEQ_WEIGHTS",
     "LLAMA_GALAXY_SP_FINAL_LAYER", "LLAMA_GALAXY_RPC_DISABLE_GRAPH_REUSE")
 $old = @{}
@@ -199,6 +205,7 @@ try {
     $env:LLAMA_GALAXY_NATIVE_SP_QKV_RESIDENT_WEIGHTS = if ($NativeSpQkvResidentWeights) {
         "1"
     } else { $null }
+    $env:LLAMA_GALAXY_NATIVE_SP_QKV_SKIP_TP_PREFILL = if ($NativeSpQkvSkipTpPrefill) { "1" } else { $null }
     $env:LLAMA_GALAXY_QKV_PROBE_LAYERS = if ($ProbeQkvLayers) { $ProbeQkvLayers } else { $null }
     $env:LLAMA_GALAXY_QKV_PROBE_DIR = if ($ProbeQkvLayers) {
         $probeDir = Join-Path $dir "real-qkv"
@@ -218,7 +225,7 @@ try {
         "-ub", $UBatch.ToString(), "-t", $Threads.ToString(),
         "-n", $NPredict.ToString(), "--temp", "0", "-f", $promptArg
     )
-    Write-Host "[GALAXY_SP_SMOKE] mode=$mode devices=$Devices rpc=$Rpc profiling=$([bool]$Profile) tile_tokens=$CollectiveTileTokens rs_fused=$([bool]$RsFusedRead) seq_weights=$SeqWeights final_layer_sp=$([bool]$FinalLayerSP) rpc_graph_reuse_disabled=$([bool]$DisableRpcGraphReuse) causal_hybrid_ffn=$([bool]$CausalHybridFfnSp) native_sp_qkv_prefix=$nativeSpQkvCount resident_weights=$residentExpected"
+    Write-Host "[GALAXY_SP_SMOKE] mode=$mode devices=$Devices rpc=$Rpc profiling=$([bool]$Profile) tile_tokens=$CollectiveTileTokens rs_fused=$([bool]$RsFusedRead) seq_weights=$SeqWeights final_layer_sp=$([bool]$FinalLayerSP) rpc_graph_reuse_disabled=$([bool]$DisableRpcGraphReuse) causal_hybrid_ffn=$([bool]$CausalHybridFfnSp) native_sp_qkv_prefix=$nativeSpQkvCount resident_weights=$residentExpected skip_tp_prefill=$bypassExpected"
     if ($Galaxy2FfnSpLayerSet) {
         Write-Host "[GALAXY2] mode=explicit_layer_set schedule=$Galaxy2FfnSpLayerSet final_layer_sp=$([bool]$FinalLayerSP)"
     } elseif ($Galaxy2 -and $Galaxy2FfnSpLayers -ne "all") {
@@ -258,7 +265,7 @@ try {
     }
     if ($nativeSpQkvCount -gt 0) {
         $nativeWitnesses = @($hits | Where-Object {
-            $_.Line -match "^\[GALAXY_SP_QKV\] layer=([0-9]+) mode=SP_NATIVE .*local_tokens=[1-9][0-9]*\+[1-9][0-9]*.*tp_projection_kept_for_kv=1 direct_native_flash=1 resident_weights=$residentExpected runtime_weight_read_bytes=[0-9]+ runtime_weight_upload_bytes=[0-9]+ status=PASS$"
+            $_.Line -match "^\[GALAXY_SP_QKV\] layer=([0-9]+) mode=SP_NATIVE .*local_tokens=[1-9][0-9]*\+[1-9][0-9]*.*tp_projection_kept_for_kv=$tpKeptExpected direct_native_flash=1 resident_weights=$residentExpected runtime_weight_read_bytes=[0-9]+ runtime_weight_upload_bytes=[0-9]+ status=PASS$"
         })
         if ($nativeWitnesses.Count -ne $nativeSpQkvCount) {
             throw "Expected $nativeSpQkvCount native SP QKV layer witnesses; observed $($nativeWitnesses.Count). Inspect $stderr"
@@ -314,6 +321,24 @@ try {
                 throw "Resident SP QKV ready-weight coverage incomplete: expected $($nativeSpQkvCount*3), verified $($verifiedWeights.Count). Inspect $stderr"
             }
             Write-Host "[GALAXY_SP_QKV_RESIDENT_VERIFY] layers=$nativeSpQkvCount weights=$($verifiedWeights.Count) ready_on_both_ranks=1 runtime_weight_read_bytes=0 runtime_weight_upload_bytes=0 status=PASS"
+        }
+        if ($NativeSpQkvSkipTpPrefill) {
+            $prefix = [regex]::Escape($nativeSpQkvLayerList)
+            $expectedSkip = 8 * $nativeSpQkvCount
+            $expectedStore = 2 * $nativeSpQkvCount
+            $pattern = "^\[GALAXY_SP_QKV_TP_BYPASS_SUM\] layers=$prefix completed=$nativeSpQkvCount expected=$nativeSpQkvCount tp_qkv_nodes_skipped=$expectedSkip cache_kv_store_ops=$expectedStore kv_source=SP_TOKEN_TO_TP_HEAD decode=TP_ORIGINAL status=PASS$"
+            $bypass = @(Select-String -LiteralPath $stderr -Pattern $pattern)
+            $early = @($hits | Where-Object { $_.Line -match '\[GALAXY_SP_QKV_EARLY\] layer=[0-9]+ .*status=PASS$' })
+            $inject = @($hits | Where-Object { $_.Line -match '\[GALAXY_SP_QKV_TP_INJECT\] layer=[0-9]+ .*identity=F32_BIT_EXACT status=PASS$' })
+            $skip = @($hits | Where-Object { $_.Line -match '\[GALAXY_SP_QKV_TP_SKIP\] layer=[0-9]+ rank=[01] .*status=PASS$' })
+            $stores = @($hits | Where-Object { $_.Line -match '\[GALAXY_SP_QKV_CACHE_STORES\] layer=[0-9]+ .*status=PASS$' })
+            if ($bypass.Count -ne 1 -or $early.Count -ne $nativeSpQkvCount -or
+                    $inject.Count -ne (3*$nativeSpQkvCount) -or
+                    $skip.Count -ne (6*$nativeSpQkvCount) -or
+                    $stores.Count -ne $nativeSpQkvCount) {
+                throw "Native QKV cache bridge incomplete; inspect $stderr"
+            }
+            Write-Host $bypass[0].Line.Trim()
         }
         Write-Host $nativeSummary[0].Line.Trim()
     }

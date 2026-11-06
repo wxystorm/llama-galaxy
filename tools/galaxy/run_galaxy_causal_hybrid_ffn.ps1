@@ -12,6 +12,7 @@ param(
     [switch]$NativeSpQkvL0,
     [ValidateSet(0,1,2,4,8,16,28)][int]$NativeSpQkvPrefixLayers = 0,
     [switch]$NativeSpQkvResidentWeights,
+    [switch]$NativeSpQkvSkipTpPrefill,
     [switch]$Trace,
     [string]$OutputDir = ".\\galaxy-sp-results\\causal-hybrid-ffn"
 )
@@ -27,6 +28,9 @@ if ($NativeSpQkvL0 -and $NativeSpQkvPrefixLayers -gt 0) {
 $nativeCount = if ($NativeSpQkvL0) { 1 } else { $NativeSpQkvPrefixLayers }
 if ($NativeSpQkvResidentWeights -and $nativeCount -eq 0) {
     throw "NativeSpQkvResidentWeights requires selecting native SP QKV layers"
+}
+if ($NativeSpQkvSkipTpPrefill -and (-not $NativeSpQkvResidentWeights -or $nativeCount -eq 0)) {
+    throw "NativeSpQkvSkipTpPrefill requires resident SP QKV weights and a selected native prefix"
 }
 $residentExpected = if ($NativeSpQkvResidentWeights) { 1 } else { 0 }
 if ($nativeCount -gt $AttentionPrefix) {
@@ -73,7 +77,7 @@ $opts = @{}
 foreach ($key in $Common.Keys) { $opts[$key] = $Common[$key] }
 foreach ($name in @("PureTP","Galaxy2","Galaxy2FfnSpLayers","Galaxy2FfnSpLayerSet",
                     "LiveCausalLayer","LiveCausalPrefixLayers","LiveCausalReplace",
-                    "FinalLayerSP","DumpLogits","OutputDir","CausalHybridFfnSp","NativeSpQkvL0","NativeSpQkvPrefixLayers","NativeSpQkvResidentWeights","Trace")) {
+                    "FinalLayerSP","DumpLogits","OutputDir","CausalHybridFfnSp","NativeSpQkvL0","NativeSpQkvPrefixLayers","NativeSpQkvResidentWeights","NativeSpQkvSkipTpPrefill","Trace")) {
     [void]$opts.Remove($name)
 }
 $opts["Galaxy2"] = $true
@@ -85,11 +89,12 @@ $opts["CausalHybridFfnSp"] = $true
 $opts["NativeSpQkvL0"] = [bool]$NativeSpQkvL0
 $opts["NativeSpQkvPrefixLayers"] = $NativeSpQkvPrefixLayers
 $opts["NativeSpQkvResidentWeights"] = [bool]$NativeSpQkvResidentWeights
+$opts["NativeSpQkvSkipTpPrefill"] = [bool]$NativeSpQkvSkipTpPrefill
 $opts["FinalLayerSP"] = [bool]$FinalLayerSP
 $opts["DumpLogits"] = $false
 $opts["Trace"] = [bool]$Trace
 $opts["OutputDir"] = $runRoot
-Write-Host "[GALAXY_CAUSAL_HYBRID] event=START attention_prefix=$AttentionPrefix ffn_sp_layer_set=$resolvedSet final_layer_sp=$([bool]$FinalLayerSP) native_sp_qkv_prefix=$nativeCount resident_weights=$residentExpected"
+Write-Host "[GALAXY_CAUSAL_HYBRID] event=START attention_prefix=$AttentionPrefix ffn_sp_layer_set=$resolvedSet final_layer_sp=$([bool]$FinalLayerSP) native_sp_qkv_prefix=$nativeCount resident_weights=$residentExpected skip_tp_prefill=$([bool]$NativeSpQkvSkipTpPrefill)"
 & $smoke @opts
 $run = @(Get-ChildItem -LiteralPath $runRoot -Directory -Filter "hybrid-*" | Sort-Object LastWriteTime -Descending)
 if ($run.Count -ne 1) {
@@ -106,6 +111,16 @@ if ($nativeCount -gt 0) {
     $nativeSummary = @(Select-String -LiteralPath $stderr -Pattern "^\[GALAXY_SP_QKV_PREFIX_SUM\] mode=SP_NATIVE layers=$escapedNative completed=$nativeCount expected=$nativeCount all_layers_verified=1 tp_cache_preserved=1 resident_weights=$residentExpected status=PASS$")
     if ($nativeSummary.Count -ne 1) {
         throw "Missing Native SP QKV prefix verification in $stderr"
+    }
+}
+if ($NativeSpQkvSkipTpPrefill) {
+    $prefix = [regex]::Escape($nativeLayerList)
+    $skipped = 8 * $nativeCount
+    $stores = 2 * $nativeCount
+    $pattern = "^\[GALAXY_SP_QKV_TP_BYPASS_SUM\] layers=$prefix completed=$nativeCount expected=$nativeCount tp_qkv_nodes_skipped=$skipped cache_kv_store_ops=$stores kv_source=SP_TOKEN_TO_TP_HEAD decode=TP_ORIGINAL status=PASS$"
+    $bypass = @(Select-String -LiteralPath $stderr -Pattern $pattern)
+    if ($bypass.Count -ne 1) {
+        throw "Expected native SP K/V to original TP cache store completion; inspect $stderr"
     }
 }
 $expectedFinal = if ($FinalLayerSP) { 1 } else { 0 }
@@ -126,9 +141,12 @@ $manifest = [ordered]@{
     native_sp_qkv_layers = $nativeLayerList
     native_sp_qkv_verified = ($nativeCount -gt 0)
     native_sp_qkv_resident_weights = [bool]$NativeSpQkvResidentWeights
+    native_sp_qkv_skip_tp_prefill = [bool]$NativeSpQkvSkipTpPrefill
+    kv_cache_writes = "ORIGINAL_LLAMA_TP_SET_ROWS"
+    native_kv_cache_layout = if ($NativeSpQkvSkipTpPrefill) { "SP_TO_TP_HEAD" } else { "TP_PROJECTION" }
     qkv_prefill_weight_read_bytes = if ($NativeSpQkvResidentWeights) { 0 } else { $null }
     qkv_prefill_weight_upload_bytes = if ($NativeSpQkvResidentWeights) { 0 } else { $null }
-    tp_qkv_kept_for_kv_cache = ($nativeCount -gt 0)
+    tp_qkv_kept_for_kv_cache = ($nativeCount -gt 0 -and -not $NativeSpQkvSkipTpPrefill)
     final_layer_sp = [bool]$FinalLayerSP
     final_layer_ffn_sp = [bool]$FinalLayerSP
     deferred_output_select_verified = [bool]$FinalLayerSP
@@ -139,4 +157,4 @@ $manifest = [ordered]@{
 }
 $manifest | ConvertTo-Json -Depth 6 |
     Set-Content -LiteralPath (Join-Path $runRoot "manifest.json") -Encoding UTF8
-Write-Host "[GALAXY_CAUSAL_HYBRID] attention_replaced=$AttentionPrefix ffn_sp_layers=$($chosen.Count) final_layer_sp=$expectedFinal native_sp_qkv_prefix=$nativeCount resident_weights=$residentExpected status=EXECUTION_PASS_NUMERICAL_UNCHECKED logs=$($run[0].FullName)"
+Write-Host "[GALAXY_CAUSAL_HYBRID] attention_replaced=$AttentionPrefix ffn_sp_layers=$($chosen.Count) final_layer_sp=$expectedFinal native_sp_qkv_prefix=$nativeCount resident_weights=$residentExpected skip_tp_prefill=$([bool]$NativeSpQkvSkipTpPrefill) status=EXECUTION_PASS_NUMERICAL_UNCHECKED logs=$($run[0].FullName)"

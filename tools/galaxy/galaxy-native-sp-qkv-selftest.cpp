@@ -187,6 +187,53 @@ int main() {
             ggml_free(model_ctxs[rank]);
         }
 
+        // Verify a nonuniform 2+1 KV head layout and odd 9-token FIFO.
+        // Each SP rank sees all heads but owns only its token interval.
+        // The original TP cache rank must receive its head subset for
+        // ALL tokens, preserving exact F32 bytes without transposition.
+        const int64_t kv_tokens=9, kv_dim=64;
+        const std::array<int64_t,2> kv_heads={2,1};
+        const int64_t total_kv_heads=kv_heads[0]+kv_heads[1];
+        std::array<std::vector<uint8_t>,2> sp_kv_fixture;
+        std::vector<float> expected_kv(size_t(kv_tokens*kv_dim*total_kv_heads));
+        for(int64_t t=0;t<kv_tokens;++t) {
+            const int rank=t<(kv_tokens+1)/2?0:1;
+            const int64_t local_t=t-(rank==0?0:(kv_tokens+1)/2);
+            const size_t row_size=size_t(kv_dim*total_kv_heads*sizeof(float));
+            if (sp_kv_fixture[rank].size() < size_t(local_t+1)*row_size)
+                sp_kv_fixture[rank].resize(size_t(local_t+1)*row_size);
+            for(int64_t h=0;h<total_kv_heads;++h) {
+                for(int64_t d=0;d<kv_dim;++d) {
+                    const float value=float(t*10000+h*100+d)*0.000125f;
+                    const size_t src_idx=size_t((h*kv_dim+d)*sizeof(float));
+                    const size_t full_idx=size_t((t*total_kv_heads+h)*kv_dim+d);
+                    expected_kv[full_idx]=value;
+                    std::memcpy(sp_kv_fixture[rank].data()+size_t(local_t)*row_size+src_idx,
+                                &value,sizeof(float));
+                }
+            }
+        }
+        const auto tp_kv=token_to_head_f32(sp_kv_fixture,kv_tokens,kv_dim,kv_heads);
+        for (int rank=0;rank<2;++rank) {
+            expect(tp_kv[rank].size()==size_t(kv_tokens*kv_heads[rank]*kv_dim)*sizeof(float),
+                   "wrong TP KV cache head-shard byte length");
+            const int64_t head_start=rank==0?0:kv_heads[0];
+            for(int64_t t=0;t<kv_tokens;++t)
+                for(int64_t h=0;h<kv_heads[rank];++h)
+                    for(int64_t d=0;d<kv_dim;++d) {
+                        const float original=expected_kv[size_t((t*total_kv_heads+
+                                head_start+h)*kv_dim+d)];
+                        const float actual=from_bytes(tp_kv[rank],size_t((t*kv_heads[rank]+h)*kv_dim+d));
+                        expect(original==actual,"SP K/V to TP cache byte layout mismatch");
+                    }
+        }
+        bool invalid_kv_partition_rejected=false;
+        auto invalid_kv=sp_kv_fixture;
+        invalid_kv[1].pop_back();
+        try {(void)token_to_head_f32(invalid_kv,kv_tokens,kv_dim,kv_heads);}
+        catch (const std::invalid_argument &) {invalid_kv_partition_rejected=true;}
+        expect(invalid_kv_partition_rejected,"malformed SP K/V split must be rejected");
+
         source bad=s;
         bad.positions[4]=0;
         bool rejected=false;
@@ -197,7 +244,7 @@ int main() {
         ggml_backend_free(pc);
         std::cout << "GALAXY_NATIVE_SP_QKV_SELFTEST PASS full_weights=1 local_tokens=4+4"
                      " matmul=1 rope=1 direct_sp=1 resident_backend_weights=PASS"
-                     " unchanged_outputs=PASS" << std::endl;
+                     " unchanged_outputs=PASS kv_token_to_tp_head=PASS" << std::endl;
         return 0;
     } catch (const std::exception & e) {
         std::cerr << "GALAXY_NATIVE_SP_QKV_SELFTEST FAIL " << e.what() << std::endl;

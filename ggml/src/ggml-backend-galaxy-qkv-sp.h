@@ -116,6 +116,48 @@ inline void validate(const source & s) {
     }
 }
 
+// Materialize the F32 TP-head view expected by the existing Llama KV
+// cache writers. Native SP ranks own disjoint token ranges, but *each*
+ // native rank computes every K/V head. The original TP ranks instead own
+// disjoint head ranges and need the whole token interval on each rank.
+// This is a host bridge for the first-prefill experiment, not a new cache.
+inline std::array<std::vector<uint8_t>,2> token_to_head_f32(
+        const std::array<std::vector<uint8_t>,2> & token_shards,
+        int64_t tokens, int64_t head_dim,
+        const std::array<int64_t,2> & heads) {
+    check(tokens > 0 && head_dim > 0 && heads[0]>0 && heads[1]>0,
+          "invalid native-to-TP KV geometry");
+    const int64_t full_heads=heads[0]+heads[1];
+    const std::array<int64_t,2> counts={(tokens+1)/2,tokens/2};
+    check(counts[1]>0, "empty SP rank token partition");
+    const size_t bytes_per_head=size_t(head_dim)*sizeof(float);
+    const size_t full_token_bytes=size_t(full_heads)*bytes_per_head;
+    std::array<std::vector<uint8_t>,2> tp;
+    for (int rank=0;rank<2;++rank) {
+        check(token_shards[rank].size() == size_t(counts[rank])*full_token_bytes,
+              "SP local K/V tensor byte extent is incorrect");
+        tp[rank].resize(size_t(tokens)*size_t(heads[rank])*bytes_per_head);
+    }
+    int64_t token_begin=0;
+    for (int src_rank=0;src_rank<2;++src_rank) {
+        for (int64_t t=0;t<counts[src_rank];++t) {
+            const auto * source=token_shards[src_rank].data()+
+                    size_t(t)*full_token_bytes;
+            int64_t head_begin=0;
+            for (int dst_rank=0;dst_rank<2;++dst_rank) {
+                const size_t size=size_t(heads[dst_rank])*bytes_per_head;
+                auto * dest=tp[dst_rank].data()+
+                        size_t(token_begin+t)*size;
+                std::memcpy(dest,source+size_t(head_begin)*bytes_per_head,size);
+                head_begin+=heads[dst_rank];
+            }
+        }
+        token_begin+=counts[src_rank];
+    }
+    check(token_begin==tokens,"SP/TP K/V token reconstruction incomplete");
+    return tp;
+}
+
 // The live Meta graph does not promise to enumerate model-weight leaves.
 // Instead, follow each *actual* Q/K/V producer from the pinned stage back
 // through its known native reshape/RoPE path to GGML_OP_MUL_MAT. Guard both
