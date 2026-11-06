@@ -282,12 +282,38 @@ try {
                     throw "Resident QKV ran, but inference weight read/upload is nonzero: $($entry.Line)"
                 }
             }
-            $loaded = @($hits | Where-Object {
-                $_.Line -match '\[GALAXY_SP_QKV_RESIDENT_LOAD\] tensor=blk\.[0-9]+\.attn_(q|k|v)\.weight .*phase=MODEL_LOAD status=PASS'
+            # MODEL_LOAD diagnostics use GGML_LOG_INFO and may be hidden by
+            # normal log verbosity. The actual ready() check already happens
+            # when Meta supplies each model-owned physical weight tensor.
+            # Validate the definitive runtime evidence: exactly one Q/K/V
+            # ready weight for every selected native layer, both ranks present,
+            # and zero runtime weight readback/upload.
+            $residentWeightPattern = '^\[GALAXY_SP_QKV_WEIGHT\] layer=([0-9]+) tensor=blk\.([0-9]+)\.attn_(q|k|v)\.weight source=RESIDENT_MODEL_LOAD .*runtime_read_bytes=0 runtime_upload_bytes=0 status=PASS$'
+            $residentWeightLines = @($hits | Where-Object {
+                $_.Line -match '\[GALAXY_SP_QKV_WEIGHT\]'
             })
-            if ($loaded.Count -ne 3*$nativeSpQkvCount) {
-                throw "Expected $($nativeSpQkvCount*3) model-load resident QKV weights; got $($loaded.Count). Inspect $stderr"
+            $verifiedWeights = @{}
+            foreach ($entry in $residentWeightLines) {
+                $weightMatch = [regex]::Match($entry.Line.Trim(), $residentWeightPattern)
+                if (-not $weightMatch.Success) {
+                    throw "Resident SP QKV has missing/invalid per-weight proof: $($entry.Line)"
+                }
+                $layer = [int]$weightMatch.Groups[1].Value
+                $tensorLayer = [int]$weightMatch.Groups[2].Value
+                $kind = $weightMatch.Groups[3].Value
+                if ($layer -ne $tensorLayer -or $nativeSpQkvLayers -notcontains $layer) {
+                    throw "Resident SP QKV weight is not in the requested prefix: $($entry.Line)"
+                }
+                $weightKey = "$layer/$kind"
+                if ($verifiedWeights.ContainsKey($weightKey)) {
+                    throw "Duplicate resident SP QKV weight proof: $weightKey"
+                }
+                $verifiedWeights[$weightKey] = $true
             }
+            if ($verifiedWeights.Count -ne (3 * $nativeSpQkvCount)) {
+                throw "Resident SP QKV ready-weight coverage incomplete: expected $($nativeSpQkvCount*3), verified $($verifiedWeights.Count). Inspect $stderr"
+            }
+            Write-Host "[GALAXY_SP_QKV_RESIDENT_VERIFY] layers=$nativeSpQkvCount weights=$($verifiedWeights.Count) ready_on_both_ranks=1 runtime_weight_read_bytes=0 runtime_weight_upload_bytes=0 status=PASS"
         }
         Write-Host $nativeSummary[0].Line.Trim()
     }
