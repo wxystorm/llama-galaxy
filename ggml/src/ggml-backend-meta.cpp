@@ -2713,7 +2713,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 q->ne[3]==1 && k->ne[0]==q->ne[0] &&
                 k->ne[2]==q->ne[2] && k->ne[3]==1 &&
                 v->ne[0]==q->ne[0] && v->ne[2]==q->ne[2] &&
-                v->ne[3]==1;
+                v->ne[3]==1 &&
+                // Dense Llama Q/K/V are ALL split by attention Head axis 1.
+                // The original V producer is 3D [head_dim,kv_heads,tokens],
+                // not a flattened [kv_heads*head_dim,tokens] view.
+                q_axis==GGML_BACKEND_SPLIT_AXIS_1 &&
+                k_axis==GGML_BACKEND_SPLIT_AXIS_1 &&
+                v_axis==GGML_BACKEND_SPLIT_AXIS_1;
         std::fprintf(stderr,
                 "[GALAXY_SP_QKV_EARLY_LAYOUT] layer=%d phase=PRE_PRODUCER"
                 " Q=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 " type=%s"
@@ -2749,9 +2755,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     qp->ne[1]>0 && kp->ne[1]>0 &&
                     qp->ne[2]==work.tokens && kp->ne[2]==work.tokens &&
                     qp->ne[3]==1 && kp->ne[3]==1 &&
-                    vp->ne[0]>0 && vp->ne[0]%work.head_dim==0 &&
-                    vp->ne[1]==work.tokens && vp->ne[2]==1 && vp->ne[3]==1 &&
-                    vp->ne[0]/work.head_dim==kp->ne[1];
+                    vp->ne[0]==work.head_dim &&
+                    vp->ne[1]==kp->ne[1] &&
+                    vp->ne[2]==work.tokens && vp->ne[3]==1;
             std::fprintf(stderr,
                     "[GALAXY_SP_QKV_EARLY_RANK_LAYOUT] layer=%d rank=%d"
                     " Q=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64
@@ -2772,7 +2778,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 throw std::invalid_argument("physical TP QKV cache-producer rank shape/type mismatch");
             work.q.heads[rank]=qp->ne[1];
             work.k.heads[rank]=kp->ne[1];
-            work.v.heads[rank]=vp->ne[0]/work.head_dim;
+            work.v.heads[rank]=vp->ne[1];
         }
         // Check the ACTUAL model positions *before* skipping TP nodes.
         // A continuation prefill must not be treated as positions 0..N-1.
