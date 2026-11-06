@@ -252,6 +252,16 @@ try {
     $displayHits = if ($Trace) { @($hits | Select-Object -Last 80) } else { $hits }
     foreach ($hit in $displayHits) { Write-Host $hit.Line.Trim() }
 
+    # Some llama-cli server compute failures still exit with process code 0.
+    # Report the first explicit native bridge failure instead of emitting a
+    # misleading "0 of 28 PASS witnesses" downstream.
+    $nativeHardFailures = @($hits | Where-Object {
+        $_.Line -match '^\[GALAXY_(SP_QKV(_EARLY(_LAYOUT|_RANK_LAYOUT)?|_TP_SKIP|_TP_INJECT|_CACHE_STORES|_TP_BYPASS_SUM)?|CAUSAL_LIVE)\]' -and
+        $_.Line -match 'status=FAIL'
+    })
+    if ($nativeHardFailures.Count -gt 0) {
+        throw "Native SP QKV runtime failed: $($nativeHardFailures[0].Line.Trim()). Inspect $stderr"
+    }
     if ($exitCode -ne 0) { throw "Smoke run failed (exit=$exitCode); examine $stderr and $stdout" }
     if ($DumpLogits -and ((-not (Test-Path -LiteralPath $dumpPath)) -or
             (Get-Item -LiteralPath $dumpPath).Length -le 8)) {
