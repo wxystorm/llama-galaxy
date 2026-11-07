@@ -1,5 +1,5 @@
 <#
-Run the first TWO prompts from each 128/256/512/1024 group (8 cases total)
+Run ALL TEN prompts from each 128/256/512/1024 group (40 cases total)
 with the existing llama-galaxy PC+Phone smoke runner.
 
 PowerShell 5.1+; does not rely on $common or any persisted environment variable.
@@ -8,6 +8,7 @@ Example (from E:\llama\llama-galaxy):
   .\tools\galaxy\run_galaxy_14b_prompt2_sweep.ps1 -PromptDir 'D:\YOUR_PROMPT_FOLDER'
   .\tools\galaxy\run_galaxy_14b_prompt2_sweep.ps1 -PromptDir 'D:\YOUR_PROMPT_FOLDER' -Mode Galaxy2
   .\tools\galaxy\run_galaxy_14b_prompt2_sweep.ps1 -PromptDir 'D:\YOUR_PROMPT_FOLDER' -Transport HOST
+  .\tools\galaxy\run_galaxy_14b_prompt2_sweep.ps1 -PromptDir 'D:\YOUR_PROMPT_FOLDER' -ResumeDir '.\galaxy-sp-results\prompt-all-14b\run-YYYYMMDD-HHMMSS-fff'
 #>
 [CmdletBinding()]
 param(
@@ -29,7 +30,8 @@ param(
     [int]$UBatch = 256,
     [int]$Threads = 8,
     [int]$TimeoutSec = 900,
-    [string]$OutputRoot = '.\galaxy-sp-results\prompt2-14b',
+    [string]$OutputRoot = '.\galaxy-sp-results\prompt-all-14b',
+    [string]$ResumeDir = '',
     [switch]$FinalLayerSP,
     [switch]$DumpLogits,
     [switch]$Profile
@@ -53,11 +55,11 @@ if ($Ctx -le 0 -or $Batch -le 0 -or $UBatch -le 0 -or $UBatch -gt $Batch) {
     throw 'Require Ctx > 0 and 0 < UBatch <= Batch.'
 }
 
-# Fail before model loading if any of the 8 expected files are missing.
+# Fail before model loading if any of the 40 expected files are missing.
 $cases = @()
 $missing = @()
 foreach ($group in @(128, 256, 512, 1024)) {
-    foreach ($index in @(1, 2)) {
+    foreach ($index in 1..10) {
         $filename = 'prompt_{0}_{1:D2}.txt' -f $group, $index
         $path = Join-Path $prompts $filename
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
@@ -72,7 +74,7 @@ foreach ($group in @(128, 256, 512, 1024)) {
     }
 }
 if ($missing.Count -gt 0) {
-    throw "Expected 8 prompt files; missing:`n$($missing -join "`n")"
+    throw "Expected 40 prompt files; missing:`n$($missing -join "`n")"
 }
 
 $baseOutput = if ([System.IO.Path]::IsPathRooted($OutputRoot)) {
@@ -80,15 +82,60 @@ $baseOutput = if ([System.IO.Path]::IsPathRooted($OutputRoot)) {
 } else {
     Join-Path $repo $OutputRoot
 }
-$sessionDir = Join-Path $baseOutput ('run-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
-New-Item -ItemType Directory -Path $sessionDir -Force | Out-Null
-$sessionDir = (Resolve-Path -LiteralPath $sessionDir).Path
+# Resume only from a directory created by THIS version of the sweep script.
+# A saved config prevents mixing outputs from different models, routes, or flags.
+$runConfig = [ordered]@{
+    model = $modelPath
+    prompt_dir = $prompts
+    rpc = $Rpc
+    mode = $Mode
+    transport = $Transport
+    galaxy2_layers = $Galaxy2Layers
+    collective_tile_tokens = $CollectiveTileTokens
+    ctx = $Ctx
+    batch = $Batch
+    ubatch = $UBatch
+    threads = $Threads
+    timeout_sec = $TimeoutSec
+    final_layer_sp = [bool]$FinalLayerSP
+    dump_logits = [bool]$DumpLogits
+    profile = [bool]$Profile
+    prompt_groups = '128,256,512,1024'
+    prompt_indices = '01..10'
+}
+$configJson = ConvertTo-Json -InputObject $runConfig -Compress -Depth 4
+if ($ResumeDir) {
+    $sessionDir = (Resolve-Path -LiteralPath $ResumeDir).Path
+} else {
+    $sessionDir = Join-Path $baseOutput ('run-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
+    New-Item -ItemType Directory -Path $sessionDir -Force | Out-Null
+    $sessionDir = (Resolve-Path -LiteralPath $sessionDir).Path
+}
 $csv = Join-Path $sessionDir 'summary.csv'
+$manifest = Join-Path $sessionDir 'sweep-config.json'
 $results = New-Object 'System.Collections.Generic.List[object]'
+if ($ResumeDir) {
+    if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
+        throw "Cannot resume: missing sweep-config.json in $sessionDir"
+    }
+    $saved = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+    $savedJson = ConvertTo-Json -InputObject $saved -Compress -Depth 4
+    if ($savedJson -cne $configJson) {
+        throw 'Cannot resume: model / input directory / mode / transport / runtime parameters differ from sweep-config.json.'
+    }
+    if (Test-Path -LiteralPath $csv -PathType Leaf) {
+        foreach ($oldRow in @(Import-Csv -LiteralPath $csv)) {
+            $results.Add($oldRow)
+        }
+    }
+    Write-Host "[GALAXY_14B_SWEEP] RESUME previous_rows=$($results.Count) dir=$sessionDir"
+} else {
+    Set-Content -LiteralPath $manifest -Value $configJson -Encoding UTF8
+}
 $modes = if ($Mode -eq 'Both') { @('Galaxy', 'Galaxy2') } else { @($Mode) }
 
 Write-Host "[GALAXY_14B_SWEEP] cases=$($cases.Count) modes=$($modes -join ',') transport=$Transport output=$sessionDir"
-Write-Host '[GALAXY_14B_SWEEP] groups=128,256,512,1024 indices=01,02'
+Write-Host '[GALAXY_14B_SWEEP] groups=128,256,512,1024 indices=01..10'
 if ($Mode -ne 'Galaxy' -and $Galaxy2Layers -ge 20) {
     Write-Warning 'Many replicated Galaxy2 FFN layers may exceed 6 GB CUDA / Phone memory on Qwen3-14B.'
 }
@@ -96,6 +143,16 @@ if ($Mode -ne 'Galaxy' -and $Galaxy2Layers -ge 20) {
 foreach ($entry in $cases) {
     foreach ($caseMode in $modes) {
         $tag = ('{0}-{1}' -f $caseMode.ToLowerInvariant(), [System.IO.Path]::GetFileNameWithoutExtension($entry.FileName))
+        $priorComplete = @($results | Where-Object {
+            $_.Prompt -eq $entry.FileName -and $_.Mode -eq $caseMode -and
+            $_.Transport -eq $Transport -and $_.Status -eq 'PASS' -and
+            -not [string]::IsNullOrWhiteSpace($_.LogDir) -and
+            (Test-Path -LiteralPath $_.LogDir -PathType Container)
+        })
+        if ($priorComplete.Count -gt 0) {
+            Write-Host "[GALAXY_14B_SWEEP] SKIP $tag reason=ALREADY_PASS"
+            continue
+        }
         $caseRoot = Join-Path $sessionDir $tag
         New-Item -ItemType Directory -Path $caseRoot -Force | Out-Null
 
@@ -170,6 +227,14 @@ foreach ($entry in $cases) {
             $status = 'PASS_NO_TIMING'
         }
 
+        # Overwrite the previous record on retry; never duplicate a failed case.
+        for ($i = $results.Count - 1; $i -ge 0; $i--) {
+            if ($results[$i].Prompt -eq $entry.FileName -and
+                $results[$i].Mode -eq $caseMode -and
+                $results[$i].Transport -eq $Transport) {
+                $results.RemoveAt($i)
+            }
+        }
         $results.Add([pscustomobject]@{
             Group = $entry.Group
             Prompt = $entry.FileName
@@ -182,7 +247,8 @@ foreach ($entry in $cases) {
             LogDir = $logDir
             Error = $errorText
         })
-        # Save after every case, including failures: Ctrl+C will not lose all rows.
+        # Save after every case, including failures; Ctrl+C preserves completed cases.
+        # Resume with -ResumeDir to skip PASS cases and rerun failures.
         $results | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8
         Write-Host "[GALAXY_14B_SWEEP] END $tag status=$status tokens=$actualTokens prefill_ms=$prefillMs prefill_tps=$prefillTPS"
     }
