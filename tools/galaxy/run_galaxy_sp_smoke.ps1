@@ -21,6 +21,10 @@ param(
     [switch]$FinalLayerSP,
     [switch]$RsFusedRead,
     [switch]$RankLocalCollectives,
+    # Optional per-prompt metadata forwarded to the Phone via RPC HELLO extension.
+    [string]$ProfileRunId = "",
+    [string]$ProfilePrompt = "",
+    [int]$ProfileTokenGroup = 0,
     [switch]$Profile,
     [string]$DumpLayers = "",
     [string]$DumpStages = "",
@@ -132,6 +136,7 @@ if ($PureTP -and $FinalLayerSP) { throw "FinalLayerSP requires Galaxy or Galaxy2
 if ($SeqWeights -notmatch '^[1-9][0-9]*,[1-9][0-9]*$') {
     throw "SeqWeights must be two positive integers such as 20,12"
 }
+if ($ProfileTokenGroup -lt 0) { throw "ProfileTokenGroup must be nonnegative" }
 if ($CollectiveTileTokens -lt 1 -or $CollectiveTileTokens -gt 1024) {
     throw "CollectiveTileTokens must be 1..1024"
 }
@@ -150,7 +155,8 @@ $keys = @("LLAMA_GALAXY_TP", "LLAMA_GALAXY_TP_HEADS", "LLAMA_GALAXY_TP_FFN", "LL
     "LLAMA_GALAXY_QKV_PROBE_LAYERS", "LLAMA_GALAXY_QKV_PROBE_DIR",
     "LLAMA_GALAXY_CAUSAL_LIVE_LAYER", "LLAMA_GALAXY_CAUSAL_LIVE_PREFIX_LAYERS", "LLAMA_GALAXY_CAUSAL_LIVE_MODE", "LLAMA_GALAXY_CAUSAL_HYBRID_FFN", "LLAMA_GALAXY_NATIVE_SP_QKV_L0", "LLAMA_GALAXY_NATIVE_SP_QKV_PREFIX_LAYERS", "LLAMA_GALAXY_NATIVE_SP_QKV_RESIDENT_WEIGHTS", "LLAMA_GALAXY_NATIVE_SP_QKV_SKIP_TP_PREFILL",
     "LLAMA_GALAXY_COLLECTIVE_TILE_TOKENS", "LLAMA_GALAXY_RS_FUSED_READ", "LLAMA_GALAXY_SP_SEQ_WEIGHTS", "LLAMA_GALAXY_COLLECTIVE_TRANSPORT",
-    "LLAMA_GALAXY_SP_FINAL_LAYER", "LLAMA_GALAXY_RPC_DISABLE_GRAPH_REUSE")
+    "LLAMA_GALAXY_SP_FINAL_LAYER", "LLAMA_GALAXY_RPC_DISABLE_GRAPH_REUSE",
+    "LLAMA_GALAXY_PROFILE_RUN_ID", "LLAMA_GALAXY_PROFILE_PROMPT", "LLAMA_GALAXY_PROFILE_TOKEN_GROUP")
 $old = @{}
 foreach ($key in $keys) { $old[$key] = [Environment]::GetEnvironmentVariable($key, "Process") }
 
@@ -166,6 +172,9 @@ try {
     $env:LLAMA_GALAXY_COLLECTIVE_TILE_TOKENS = $CollectiveTileTokens.ToString()
     $env:LLAMA_GALAXY_RS_FUSED_READ = if ($RsFusedRead) { "1" } else { "0" }
     $env:LLAMA_GALAXY_COLLECTIVE_TRANSPORT = if ($RankLocalCollectives) { "RANK_LOCAL" } else { "HOST" }
+    $env:LLAMA_GALAXY_PROFILE_RUN_ID = if ($ProfileRunId) { $ProfileRunId } else { $null }
+    $env:LLAMA_GALAXY_PROFILE_PROMPT = if ($ProfileRunId) { $ProfilePrompt } else { $null }
+    $env:LLAMA_GALAXY_PROFILE_TOKEN_GROUP = if ($ProfileRunId) { [string]$ProfileTokenGroup } else { $null }
     $env:LLAMA_GALAXY2 = if ($Galaxy2) { "1" } else { "0" }
     $env:LLAMA_GALAXY2_FFN_SP_LAYERS = if ($Galaxy2 -and -not $Galaxy2FfnSpLayerSet) { $Galaxy2FfnSpLayers } else { $null }
     $env:LLAMA_GALAXY2_FFN_SP_LAYER_SET = if ($Galaxy2 -and $Galaxy2FfnSpLayerSet) { $Galaxy2FfnSpLayerSet } else { $null }
@@ -233,6 +242,9 @@ try {
         "-ub", $UBatch.ToString(), "-t", $Threads.ToString(),
         "-n", $NPredict.ToString(), "--temp", "0", "-f", $promptArg
     )
+    if ($ProfileRunId) {
+        Write-Host "[GALAXY_PHONE_PROFILE_RUN] id=$ProfileRunId prompt=$ProfilePrompt token_group=$ProfileTokenGroup phase=PC_LAUNCH"
+    }
     Write-Host "[GALAXY_COLLECTIVE_MODE] mode=$mode transport=$($env:LLAMA_GALAXY_COLLECTIVE_TRANSPORT) status=CONFIGURED"
     Write-Host "[GALAXY_SP_SMOKE] mode=$mode devices=$Devices rpc=$Rpc profiling=$([bool]$Profile) tile_tokens=$CollectiveTileTokens rs_fused=$([bool]$RsFusedRead) seq_weights=$SeqWeights final_layer_sp=$([bool]$FinalLayerSP) rpc_graph_reuse_disabled=$([bool]$DisableRpcGraphReuse) causal_hybrid_ffn=$([bool]$CausalHybridFfnSp) native_sp_qkv_prefix=$nativeSpQkvCount resident_weights=$residentExpected skip_tp_prefill=$bypassExpected"
     if ($Galaxy2FfnSpLayerSet) {
