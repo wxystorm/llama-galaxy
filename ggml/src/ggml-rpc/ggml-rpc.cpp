@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <iomanip>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
@@ -42,6 +43,73 @@ static void galaxy_phone_profile(
          << mode << ',' << device << ',' << uid << ',' << nodes << ','
          << prepare_ms << ',' << compute_ms << ','
          << prepare_ms + compute_ms << '\n';
+}
+
+// Per-RPC-connection metadata. Unlike the legacy graph-only CSV, the extended
+// event CSV can identify individual PC prompt runs without restarting Termux.
+struct galaxy_profile_run_context {
+    std::string run_id;
+    std::string prompt;
+    uint32_t token_group = 0; // target length bucket; actual token count is PC-side
+    bool graph_started = false;
+};
+
+static std::string galaxy_profile_safe_field(const char * value, size_t capacity) {
+    std::string result;
+    for (size_t i = 0; i < capacity && value[i] != '\0'; ++i) {
+        const unsigned char c = static_cast<unsigned char>(value[i]);
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.') {
+            result += static_cast<char>(c);
+        } else {
+            result += '_';
+        }
+    }
+    return result;
+}
+
+static double galaxy_profile_elapsed_ms(std::chrono::steady_clock::time_point a,
+                                        std::chrono::steady_clock::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+}
+
+// Sidecar CSV avoids mixing the new columns into an existing 7-column CSV.
+// RPC recv/send times include socket service and waiting, not isolated
+// one-way network time; backend_ms includes tensor copy/setup cost.
+static void galaxy_phone_profile_event(
+        const galaxy_profile_run_context & run, const char * event,
+        int device = -1, uint64_t uid = 0, uint32_t nodes = 0, uint64_t bytes = 0,
+        double prepare_ms = 0, double compute_ms = 0, double recv_ms = 0,
+        double backend_ms = 0, double send_ms = 0) {
+    const char * base = std::getenv("LLAMA_GALAXY_PHONE_PROFILE_FILE");
+    if (base == nullptr || base[0] == '\0') return;
+    std::string path(base);
+    const size_t suffix = path.rfind(".csv");
+    if (suffix != std::string::npos && suffix + 4 == path.size()) {
+        path.insert(suffix, ".events");
+    } else {
+        path += ".events.csv";
+    }
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    std::ofstream file(path, std::ios::app);
+    if (!file) return;
+    file.seekp(0, std::ios::end);
+    if (file.tellp() == 0) {
+        file << "timestamp_unix_ms,run_id,prompt,token_group,phase,event,device,"
+                "graph_uid,nodes,data_bytes,prepare_ms,compute_ms,recv_ms,"
+                "backend_ms,send_ms,wall_ms\n";
+    }
+    const auto now = std::chrono::system_clock::now().time_since_epoch();
+    const auto timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+    const double wall_ms = prepare_ms + compute_ms + recv_ms + backend_ms + send_ms;
+    file << timestamp_ms << ',' << run.run_id << ',' << run.prompt << ','
+         << run.token_group << ','
+         << (run.graph_started ? "AFTER_FIRST_GRAPH" : "BEFORE_FIRST_GRAPH")
+         << ',' << event << ',' << device << ',' << uid << ',' << nodes << ','
+         << bytes << ',' << std::fixed << std::setprecision(5) << prepare_ms
+         << ',' << compute_ms << ',' << recv_ms << ',' << backend_ms
+         << ',' << send_ms << ',' << wall_ms << '\n';
 }
 
 #define LOG_DBG(...) \
@@ -96,11 +164,13 @@ enum rpc_cmd {
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
     RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE, 
+    RPC_CMD_PROFILE_RUN, // appended: never renumber existing RPC commands
     RPC_CMD_COUNT,
 };
 
 static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 static_assert(RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE == 17, "RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_PROFILE_RUN == 18, "RPC profile command must be appended");
 
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
@@ -109,16 +179,24 @@ struct rpc_msg_hello_req {
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
 
+static constexpr uint8_t RPC_HELLO_FEATURE_PROFILE_RUN = 1; // reserved HELLO byte, unchanged wire size
+
 struct rpc_msg_hello_rsp {
     uint8_t major;
     uint8_t minor;
     uint8_t patch;
-    uint8_t padding;
+    uint8_t features;
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
 
 struct rpc_msg_device_count_rsp {
     uint32_t device_count;
+};
+
+struct rpc_msg_profile_run_req {
+    char run_id[96];
+    char prompt[96];
+    uint32_t token_group;
 };
 
 struct rpc_msg_get_alloc_size_req {
@@ -394,7 +472,7 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 // Performs HELLO handshake with transport auto-negotiation.
 // Advertises local capabilities via conn_caps; if the server responds with
 // matching capabilities, the socket is upgraded transparently.
-static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
+static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint8_t & features) {
     rpc_msg_hello_req request = {};
     rpc_msg_hello_rsp response = {};
 
@@ -410,6 +488,7 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     }
 
     sock->update_caps(response.conn_caps);
+    features = response.features;
     return true;
 }
 
@@ -438,8 +517,36 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     if (sock == nullptr) {
         return nullptr;
     }
-    if (!negotiate_hello(sock)) {
+    uint8_t hello_features = 0;
+    if (!negotiate_hello(sock, hello_features)) {
         return nullptr;
+    }
+    const char * run_id = std::getenv("LLAMA_GALAXY_PROFILE_RUN_ID");
+    if (run_id != nullptr && run_id[0] != '\0') {
+        if ((hello_features & RPC_HELLO_FEATURE_PROFILE_RUN) != 0) {
+            rpc_msg_profile_run_req req = {};
+            std::strncpy(req.run_id, run_id, sizeof(req.run_id) - 1);
+            const char * prompt = std::getenv("LLAMA_GALAXY_PROFILE_PROMPT");
+            if (prompt != nullptr) {
+                std::strncpy(req.prompt, prompt, sizeof(req.prompt) - 1);
+            }
+            const char * group = std::getenv("LLAMA_GALAXY_PROFILE_TOKEN_GROUP");
+            if (group != nullptr) {
+                char * end = nullptr;
+                const unsigned long parsed = std::strtoul(group, &end, 10);
+                if (end != group && *end == '\0' && parsed <= 1000000UL) {
+                    req.token_group = static_cast<uint32_t>(parsed);
+                }
+            }
+            if (!send_rpc_cmd(sock, RPC_CMD_PROFILE_RUN, &req, sizeof(req), nullptr, 0)) {
+                GGML_LOG_ERROR("Galaxy Phone profile metadata RPC failed for %s\n", endpoint.c_str());
+                return nullptr;
+            }
+            GGML_LOG_INFO("[GALAXY_PHONE_PROFILE_RUN] id=%s prompt=%s token_group=%u status=REGISTERED\n",
+                          req.run_id, req.prompt, req.token_group);
+        } else {
+            GGML_LOG_WARN("[GALAXY_PHONE_PROFILE_RUN] Phone RPC lacks profile metadata support; rebuild Phone server\n");
+        }
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
     sockets[endpoint] = sock;
@@ -1210,6 +1317,23 @@ public:
     ~rpc_server();
 
     void hello(rpc_msg_hello_rsp & response);
+    void set_profile_run(const rpc_msg_profile_run_req & req) {
+        profile_run.run_id = galaxy_profile_safe_field(req.run_id, sizeof(req.run_id));
+        profile_run.prompt = galaxy_profile_safe_field(req.prompt, sizeof(req.prompt));
+        profile_run.token_group = req.token_group;
+        profile_run.graph_started = false;
+        profile_event("RUN_START");
+    }
+    void profile_event(const char * event, int device = -1, uint64_t uid = 0,
+                       uint32_t nodes = 0, uint64_t bytes = 0,
+                       double prepare_ms = 0, double compute_ms = 0,
+                       double recv_ms = 0, double backend_ms = 0,
+                       double send_ms = 0) const {
+        galaxy_phone_profile_event(profile_run, event, device, uid, nodes,
+                                   bytes, prepare_ms, compute_ms, recv_ms,
+                                   backend_ms, send_ms);
+    }
+    void mark_graph_started() { profile_run.graph_started = true; }
     bool alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_alloc_buffer_rsp & response);
     bool get_alignment(const rpc_msg_get_alignment_req & request, rpc_msg_get_alignment_rsp & response);
     bool get_max_size(const rpc_msg_get_max_size_req & request, rpc_msg_get_max_size_rsp & response);
@@ -1244,6 +1368,7 @@ private:
 
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
+    galaxy_profile_run_context profile_run;
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // store computed graphs for each backend by graph uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
@@ -1255,6 +1380,7 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major = RPC_PROTO_MAJOR_VERSION;
     response.minor = RPC_PROTO_MINOR_VERSION;
     response.patch = RPC_PROTO_PATCH_VERSION;
+    response.features = RPC_HELLO_FEATURE_PROFILE_RUN;
     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
 }
 
@@ -1820,6 +1946,10 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     galaxy_phone_profile("GRAPH_COMPUTE", device, graph_uid, n_nodes,
             std::chrono::duration<double, std::milli>(compute_start - request_start).count(),
             std::chrono::duration<double, std::milli>(compute_end - compute_start).count());
+    mark_graph_started();
+    profile_event("GRAPH_COMPUTE", static_cast<int>(device), graph_uid, n_nodes, 0,
+                  galaxy_profile_elapsed_ms(request_start, compute_start),
+                  galaxy_profile_elapsed_ms(compute_start, compute_end));
     graph_entry.dependencies = std::move(dependencies);
     graph_entry.graph = graph;
     return true;
@@ -1842,6 +1972,9 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     galaxy_phone_profile("GRAPH_RECOMPUTE", device, request.graph_uid, graph->n_nodes, 0,
             std::chrono::duration<double, std::milli>(end - start).count());
+    mark_graph_started();
+    profile_event("GRAPH_RECOMPUTE", static_cast<int>(device), request.graph_uid,
+                  graph->n_nodes, 0, 0, galaxy_profile_elapsed_ms(start, end));
     return true;
 }
 
@@ -1860,6 +1993,9 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
+    if (!profile_run.run_id.empty()) {
+        profile_event("RUN_END");
+    }
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
     }
@@ -2483,6 +2619,13 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 // HELLO command is handled above
                 return;
             }
+            case RPC_CMD_PROFILE_RUN: {
+                rpc_msg_profile_run_req request = {};
+                if (!recv_msg(sock, &request, sizeof(request))) return;
+                server.set_profile_run(request);
+                if (!send_msg(sock, nullptr, 0)) return;
+                break;
+            }
             case RPC_CMD_DEVICE_COUNT: {
                 if (!recv_msg(sock, nullptr, 0)) {
                     return;
@@ -2591,27 +2734,34 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 break;
             }
             case RPC_CMD_SET_TENSOR: {
+                const auto begin = std::chrono::steady_clock::now();
                 std::vector<uint8_t> input;
-                if (!recv_msg(sock, input)) {
-                    return;
-                }
-                if (!server.set_tensor(input)) {
-                    return;
-                }
+                if (!recv_msg(sock, input)) return;
+                const auto received = std::chrono::steady_clock::now();
+                if (!server.set_tensor(input)) return;
+                const auto done = std::chrono::steady_clock::now();
+                const size_t header = sizeof(rpc_tensor) + sizeof(uint64_t);
+                const uint64_t bytes = input.size() >= header ? input.size() - header : 0;
+                server.profile_event("RPC_SET_TENSOR", -1, 0, 0, bytes,
+                                     0, 0, galaxy_profile_elapsed_ms(begin, received),
+                                     galaxy_profile_elapsed_ms(received, done));
                 break;
             }
             case RPC_CMD_SET_TENSOR_HASH: {
+                const auto begin = std::chrono::steady_clock::now();
                 rpc_msg_set_tensor_hash_req request;
-                if (!recv_msg(sock, &request, sizeof(request))) {
-                    return;
-                }
+                if (!recv_msg(sock, &request, sizeof(request))) return;
+                const auto received = std::chrono::steady_clock::now();
                 rpc_msg_set_tensor_hash_rsp response;
-                if (!server.set_tensor_hash(request, response)) {
-                    return;
-                }
-                if (!send_msg(sock, &response, sizeof(response))) {
-                    return;
-                }
+                if (!server.set_tensor_hash(request, response)) return;
+                const auto computed = std::chrono::steady_clock::now();
+                if (!send_msg(sock, &response, sizeof(response))) return;
+                const auto done = std::chrono::steady_clock::now();
+                server.profile_event(response.result ? "RPC_HASH_HIT" : "RPC_HASH_MISS",
+                                     -1, 0, 0, 0, 0, 0,
+                                     galaxy_profile_elapsed_ms(begin, received),
+                                     galaxy_profile_elapsed_ms(received, computed),
+                                     galaxy_profile_elapsed_ms(computed, done));
                 break;
             }
             case RPC_CMD_INIT_TENSOR: {
@@ -2628,41 +2778,45 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 break;
             }
             case RPC_CMD_GET_TENSOR: {
+                const auto begin = std::chrono::steady_clock::now();
                 rpc_msg_get_tensor_req request;
-                if (!recv_msg(sock, &request, sizeof(request))) {
-                    return;
-                }
+                if (!recv_msg(sock, &request, sizeof(request))) return;
+                const auto received = std::chrono::steady_clock::now();
                 std::vector<uint8_t> response;
-                if (!server.get_tensor(request, response)) {
-                    return;
-                }
-                if (!send_msg(sock, response.data(), response.size())) {
-                    return;
-                }
+                if (!server.get_tensor(request, response)) return;
+                const auto computed = std::chrono::steady_clock::now();
+                if (!send_msg(sock, response.data(), response.size())) return;
+                const auto done = std::chrono::steady_clock::now();
+                server.profile_event("RPC_GET_TENSOR", -1, 0, 0, response.size(), 0, 0,
+                                     galaxy_profile_elapsed_ms(begin, received),
+                                     galaxy_profile_elapsed_ms(received, computed),
+                                     galaxy_profile_elapsed_ms(computed, done));
                 break;
             }
             case RPC_CMD_COPY_TENSOR: {
+                const auto begin = std::chrono::steady_clock::now();
                 rpc_msg_copy_tensor_req request;
-                if (!recv_msg(sock, &request, sizeof(request))) {
-                    return;
-                }
+                if (!recv_msg(sock, &request, sizeof(request))) return;
+                const auto received = std::chrono::steady_clock::now();
                 rpc_msg_copy_tensor_rsp response;
-                if (!server.copy_tensor(request, response)) {
-                    return;
-                }
-                if (!send_msg(sock, &response, sizeof(response))) {
-                    return;
-                }
+                if (!server.copy_tensor(request, response)) return;
+                const auto computed = std::chrono::steady_clock::now();
+                if (!send_msg(sock, &response, sizeof(response))) return;
+                const auto done = std::chrono::steady_clock::now();
+                server.profile_event("RPC_COPY_TENSOR", -1, 0, 0, 0, 0, 0,
+                                     galaxy_profile_elapsed_ms(begin, received),
+                                     galaxy_profile_elapsed_ms(received, computed),
+                                     galaxy_profile_elapsed_ms(computed, done));
                 break;
             }
             case RPC_CMD_GRAPH_COMPUTE: {
+                const auto begin = std::chrono::steady_clock::now();
                 std::vector<uint8_t> input;
-                if (!recv_msg(sock, input)) {
-                    return;
-                }
-                if (!server.graph_compute(input)) {
-                    return;
-                }
+                if (!recv_msg(sock, input)) return;
+                const auto received = std::chrono::steady_clock::now();
+                server.profile_event("RPC_GRAPH_RECEIVE", -1, 0, 0, input.size(),
+                                     0, 0, galaxy_profile_elapsed_ms(begin, received));
+                if (!server.graph_compute(input)) return;
                 break;
             }
             case RPC_CMD_GRAPH_RECOMPUTE: {
@@ -2690,6 +2844,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 break;
             }
             case RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE: {
+                const auto begin = std::chrono::steady_clock::now();
                 rpc_msg_set_tensor_from_local_file_req request {};
 
                 if (!recv_msg(
@@ -2698,6 +2853,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                         sizeof(request))) {
                     return;
                 }
+                const auto received = std::chrono::steady_clock::now();
 
                 rpc_msg_set_tensor_from_local_file_rsp response {};
 
@@ -2707,13 +2863,19 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
 
+                const auto computed = std::chrono::steady_clock::now();
                 if (!send_msg(
                         sock,
                         &response,
                         sizeof(response))) {
                     return;
                 }
-
+                const auto done = std::chrono::steady_clock::now();
+                // Local model file bytes are not network payload bytes.
+                server.profile_event("RPC_LOCAL_FILE_SET", -1, 0, 0, 0, 0, 0,
+                                     galaxy_profile_elapsed_ms(begin, received),
+                                     galaxy_profile_elapsed_ms(received, computed),
+                                     galaxy_profile_elapsed_ms(computed, done));
                 break;
             }
             default: {
