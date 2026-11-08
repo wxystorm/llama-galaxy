@@ -2441,3 +2441,60 @@ reference or enabling it to exercise the new path:
 ```
 The runner requires real [GALAXY_COLLECTIVE_ROUTE] RS/AG/residual witnesses
 when this switch is enabled. It does not claim TP numerical parity or speedup.
+
+
+## Phone per-prompt profiling for the 14B 40-prompt sweep (2026-11-08)
+
+Rebuild both PC **llama-cli** and Phone **ggml-rpc-server** from this branch.
+The legacy graph-only profile and all existing RPC command IDs remain unchanged.
+An opt-in profile metadata command is advertised in the reserved HELLO feature
+byte. A new PC client silently skips metadata when the Phone is too old
+(warning logged); inference should remain compatible. Look for
+[GALAXY_PHONE_PROFILE_RUN] status=REGISTERED in PC stderr logs.
+
+Termux, before starting the Phone RPC server:
+
+~~~bash
+cd ~/llama-galaxy
+export LLAMA_GALAXY_PHONE_PROFILE_FILE="$HOME/galaxy-phone-profile.csv"
+./build-galaxy/bin/ggml-rpc-server -H 0.0.0.0 -p 50052 \
+    -m "$HOME/models/Qwen3-14B-Q4_K_M.gguf" -t 8
+~~~
+
+PC PowerShell, after pulling the updated branch and rebuilding llama-cli:
+
+~~~powershell
+.\tools\galaxy\run_galaxy_14b_prompt2_sweep.ps1 -PromptDir "D:\your-40-prompt-folder" -Mode Galaxy -Transport RANK_LOCAL
+~~~
+
+The batch runner sends a stable per-case RunId, Prompt basename and length
+bucket (128, 256, 512 or 1024) when it connects to Phone RPC. PC summary.csv
+includes the same RunId AND the actual prompt token count parsed from llama-cli.
+The Phone cannot infer exact prompt tokens from arbitrary graph calls, so the
+Phone file explicitly calls this column token_group, not actual_tokens.
+Join the two files with Phone run_id = PC RunId. Older already completed cases
+cannot retroactively acquire Phone metadata.
+
+Two append-only files are produced on the Phone whenever
+LLAMA_GALAXY_PHONE_PROFILE_FILE is set:
+
+- ~/galaxy-phone-profile.csv -- original
+  mode,device,graph_uid,nodes,prepare_ms,compute_ms,wall_ms format, unchanged.
+- ~/galaxy-phone-profile.events.csv -- extended per-event log containing
+  timestamp_unix_ms,run_id,prompt,token_group,phase,event,device,graph_uid,
+  nodes,data_bytes,prepare_ms,compute_ms,recv_ms,backend_ms,send_ms,wall_ms.
+
+Events include RUN_START, RUN_END, GRAPH_COMPUTE, GRAPH_RECOMPUTE,
+RPC_GRAPH_RECEIVE, RPC_GET_TENSOR, RPC_SET_TENSOR, RPC_COPY_TENSOR,
+RPC_HASH_HIT/MISS and RPC_LOCAL_FILE_SET. BEFORE_FIRST_GRAPH vs
+AFTER_FIRST_GRAPH separates early setup from later work but is NOT
+a definitive Prefill/Decode split. Timestamp uses Unix milliseconds UTC.
+
+Recv/send durations reflect server-side socket handling and waiting, NOT pure
+network latency; backend_ms includes tensor-copy overhead. Graph compute_ms is
+the backend graph-call time, not GPU-only kernel time. Use PC collective
+profiling for end-to-end transport costs. Extra event logging adds file I/O
+overhead, so keep it enabled consistently for A/B comparisons.
+
+Both files append continuously across prompts and Phone server restarts.
+The original CSV schema has not been mixed with the new events columns.
