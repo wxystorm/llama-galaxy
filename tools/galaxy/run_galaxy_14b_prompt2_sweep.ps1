@@ -126,6 +126,12 @@ if ($ResumeDir) {
     if (Test-Path -LiteralPath $csv -PathType Leaf) {
         foreach ($oldRow in @(Import-Csv -LiteralPath $csv)) {
             # Upgrade old summary rows in place so a resumed run keeps the RunId column.
+            if ($null -eq $oldRow.PSObject.Properties['StartedUtc']) {
+                $oldRow | Add-Member -NotePropertyName StartedUtc -NotePropertyValue ''
+            }
+            if ($null -eq $oldRow.PSObject.Properties['FinishedUtc']) {
+                $oldRow | Add-Member -NotePropertyName FinishedUtc -NotePropertyValue ''
+            }
             if ($null -eq $oldRow.PSObject.Properties['RunId']) {
                 $priorTag = ('{0}-{1}' -f $oldRow.Mode.ToLowerInvariant(),
                     [System.IO.Path]::GetFileNameWithoutExtension($oldRow.Prompt))
@@ -150,7 +156,6 @@ if ($Mode -ne 'Galaxy' -and $Galaxy2Layers -ge 20) {
 foreach ($entry in $cases) {
     foreach ($caseMode in $modes) {
         $tag = ('{0}-{1}' -f $caseMode.ToLowerInvariant(), [System.IO.Path]::GetFileNameWithoutExtension($entry.FileName))
-        $runId = ('{0}-{1}' -f (Split-Path -Leaf $sessionDir), $tag)
         $priorComplete = @($results | Where-Object {
             $_.Prompt -eq $entry.FileName -and $_.Mode -eq $caseMode -and
             $_.Transport -eq $Transport -and $_.Status -eq 'PASS' -and
@@ -163,6 +168,22 @@ foreach ($entry in $cases) {
         }
         $caseRoot = Join-Path $sessionDir $tag
         New-Item -ItemType Directory -Path $caseRoot -Force | Out-Null
+
+        # A retry gets a NEW RunId; old failed Phone events cannot contaminate
+        # the new attempt when joining Phone data back to this summary.
+        $startUtc = (Get-Date).ToUniversalTime()
+        $runId = ('{0}-{1}-{2}' -f (Split-Path -Leaf $sessionDir), $tag,
+            $startUtc.ToString('yyyyMMddTHHmmssfffZ'))
+        $profileManifest = [ordered]@{
+            RunId = $runId
+            Prompt = $entry.FileName
+            Group = $entry.Group
+            Mode = $caseMode
+            Transport = $Transport
+            StartedUtc = $startUtc.ToString('o')
+        }
+        $profileJson = ConvertTo-Json -InputObject $profileManifest -Compress
+        Set-Content -LiteralPath (Join-Path $caseRoot 'profile-run.json') -Value $profileJson -Encoding UTF8
 
         # Explicit hashtable: no @common, no duplicate PowerShell switches.
         $opts = @{
@@ -248,6 +269,8 @@ foreach ($entry in $cases) {
         }
         $results.Add([pscustomobject]@{
             RunId = $runId
+            StartedUtc = $startUtc.ToString('o')
+            FinishedUtc = (Get-Date).ToUniversalTime().ToString('o')
             Group = $entry.Group
             Prompt = $entry.FileName
             Mode = $caseMode
