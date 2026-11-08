@@ -2467,9 +2467,11 @@ PC PowerShell, after pulling the updated branch and rebuilding llama-cli:
 .\tools\galaxy\run_galaxy_14b_prompt2_sweep.ps1 -PromptDir "D:\your-40-prompt-folder" -Mode Galaxy -Transport RANK_LOCAL
 ~~~
 
-The batch runner sends a stable per-case RunId, Prompt basename and length
+The batch runner sends a unique per-execution-attempt RunId, Prompt basename and length
 bucket (128, 256, 512 or 1024) when it connects to Phone RPC. PC summary.csv
 includes the same RunId AND the actual prompt token count parsed from llama-cli.
+Each per-prompt case directory also writes profile-run.json (RunId and UTC start).
+Retries get a new RunId, so old failed attempts do not mix with new ones.
 The Phone cannot infer exact prompt tokens from arbitrary graph calls, so the
 Phone file explicitly calls this column token_group, not actual_tokens.
 Join the two files with Phone run_id = PC RunId. Older already completed cases
