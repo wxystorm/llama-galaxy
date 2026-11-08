@@ -125,6 +125,13 @@ if ($ResumeDir) {
     }
     if (Test-Path -LiteralPath $csv -PathType Leaf) {
         foreach ($oldRow in @(Import-Csv -LiteralPath $csv)) {
+            # Upgrade old summary rows in place so a resumed run keeps the RunId column.
+            if ($null -eq $oldRow.PSObject.Properties['RunId']) {
+                $priorTag = ('{0}-{1}' -f $oldRow.Mode.ToLowerInvariant(),
+                    [System.IO.Path]::GetFileNameWithoutExtension($oldRow.Prompt))
+                $oldRow | Add-Member -NotePropertyName RunId -NotePropertyValue (
+                    '{0}-{1}' -f (Split-Path -Leaf $sessionDir), $priorTag)
+            }
             $results.Add($oldRow)
         }
     }
@@ -143,6 +150,7 @@ if ($Mode -ne 'Galaxy' -and $Galaxy2Layers -ge 20) {
 foreach ($entry in $cases) {
     foreach ($caseMode in $modes) {
         $tag = ('{0}-{1}' -f $caseMode.ToLowerInvariant(), [System.IO.Path]::GetFileNameWithoutExtension($entry.FileName))
+        $runId = ('{0}-{1}' -f (Split-Path -Leaf $sessionDir), $tag)
         $priorComplete = @($results | Where-Object {
             $_.Prompt -eq $entry.FileName -and $_.Mode -eq $caseMode -and
             $_.Transport -eq $Transport -and $_.Status -eq 'PASS' -and
@@ -173,6 +181,9 @@ foreach ($entry in $cases) {
             UBatch = $UBatch
             Threads = $Threads
             TimeoutSec = $TimeoutSec
+            ProfileRunId = $runId
+            ProfilePrompt = $entry.FileName
+            ProfileTokenGroup = $entry.Group
         }
         if ($Transport -eq 'RANK_LOCAL') { $opts['RankLocalCollectives'] = $true }
         if ($caseMode -eq 'Galaxy2') {
@@ -236,6 +247,7 @@ foreach ($entry in $cases) {
             }
         }
         $results.Add([pscustomobject]@{
+            RunId = $runId
             Group = $entry.Group
             Prompt = $entry.FileName
             Mode = $caseMode
@@ -255,7 +267,7 @@ foreach ($entry in $cases) {
 }
 
 Write-Host "`n[GALAXY_14B_SWEEP] SUMMARY: $csv"
-$results | Format-Table Group, Prompt, Mode, Transport, Status, ActualTokens, PrefillMs, PrefillTPS -AutoSize
+$results | Format-Table RunId, Group, Prompt, Mode, Transport, Status, ActualTokens, PrefillMs, PrefillTPS -AutoSize
 $failed = @($results | Where-Object { $_.Status -eq 'FAIL' })
 if ($failed.Count -gt 0) {
     throw "$($failed.Count) cases failed. See summary.csv and per-case stderr.log under $sessionDir"
