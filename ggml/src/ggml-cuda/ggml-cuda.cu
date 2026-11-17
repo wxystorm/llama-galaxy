@@ -4,6 +4,7 @@
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/galaxy-device-trace.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -715,16 +716,24 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    const auto trace = ggml_galaxy_cuda_trace::begin(ctx->device, cudaStreamPerThread,
+            "PCIe Copy", "H2D_SYNC", size);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    ggml_galaxy_cuda_trace::end(trace, cudaStreamPerThread);
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_galaxy_cuda_trace::flush(ctx->device);
 }
 
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    const auto trace = ggml_galaxy_cuda_trace::begin(ctx->device, cudaStreamPerThread,
+            "PCIe Copy", "D2H_SYNC", size);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    ggml_galaxy_cuda_trace::end(trace, cudaStreamPerThread);
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_galaxy_cuda_trace::flush(ctx->device);
 }
 
 static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
@@ -732,9 +741,13 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    const auto trace = ggml_galaxy_cuda_trace::begin(ctx->device, cudaStreamPerThread,
+            "PCIe Copy", "H2D_2D_SYNC", size * n_copies);
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    ggml_galaxy_cuda_trace::end(trace, cudaStreamPerThread);
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_galaxy_cuda_trace::flush(ctx->device);
 }
 
 static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data,
@@ -742,9 +755,13 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    const auto trace = ggml_galaxy_cuda_trace::begin(ctx->device, cudaStreamPerThread,
+            "PCIe Copy", "D2H_2D_SYNC", size * n_copies);
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    ggml_galaxy_cuda_trace::end(trace, cudaStreamPerThread);
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_galaxy_cuda_trace::flush(ctx->device);
 }
 
 static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
@@ -2283,6 +2300,11 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    if (ggml_galaxy_device_profile::enabled()) {
+        ggml_cuda_set_device(cuda_ctx->device);
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        ggml_galaxy_cuda_trace::flush(cuda_ctx->device);
+    }
     delete cuda_ctx;
     delete backend;
 }
@@ -2293,7 +2315,10 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    const auto trace = ggml_galaxy_cuda_trace::begin(cuda_ctx->device, cuda_ctx->stream(),
+            "PCIe Copy", "H2D_ASYNC", size);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    ggml_galaxy_cuda_trace::end(trace, cuda_ctx->stream());
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -2302,7 +2327,10 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    const auto trace = ggml_galaxy_cuda_trace::begin(cuda_ctx->device, cuda_ctx->stream(),
+            "PCIe Copy", "D2H_ASYNC", size);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+    ggml_galaxy_cuda_trace::end(trace, cuda_ctx->stream());
 }
 
 static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
@@ -2312,8 +2340,11 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    const auto trace = ggml_galaxy_cuda_trace::begin(cuda_ctx->device, cuda_ctx->stream(),
+            "PCIe Copy", "H2D_2D_ASYNC", size * n_copies);
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    ggml_galaxy_cuda_trace::end(trace, cuda_ctx->stream());
 }
 
 static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data,
@@ -2323,8 +2354,11 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    const auto trace = ggml_galaxy_cuda_trace::begin(cuda_ctx->device, cuda_ctx->stream(),
+            "PCIe Copy", "D2H_2D_ASYNC", size * n_copies);
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+    ggml_galaxy_cuda_trace::end(trace, cuda_ctx->stream());
 }
 
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
@@ -2386,6 +2420,7 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    ggml_galaxy_cuda_trace::flush(cuda_ctx->device);
 
     GGML_UNUSED(backend);
 }
@@ -4040,7 +4075,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
+    const auto trace = ggml_galaxy_cuda_trace::begin(cuda_ctx->device, cuda_ctx->stream(),
+            "GPU Compute", "CUDA_BACKEND_GRAPH", 0);
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    ggml_galaxy_cuda_trace::end(trace, cuda_ctx->stream());
 
     return GGML_STATUS_SUCCESS;
 }
