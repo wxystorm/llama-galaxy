@@ -50,6 +50,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# Legacy smoke logic uses optional/scalar .Count; a strict parent PowerShell
+# scope must not change the semantics of this independently reusable runner.
+Set-StrictMode -Off
 . (Join-Path $PSScriptRoot "galaxy-process.ps1")
 if (-not (Test-Path -LiteralPath $Exe)) { throw "Missing executable: $Exe" }
 if (-not (Test-Path -LiteralPath $Model)) { throw "Missing model: $Model" }
