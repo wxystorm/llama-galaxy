@@ -110,11 +110,19 @@ try {
     if (-not (Test-Path -LiteralPath $PhoneTimeline)) { throw "PhoneTimeline absent: $PhoneTimeline" }
     Copy-Item -LiteralPath $PhoneTimeline -Destination $destPhone -Force
   } else {
-    Write-Host "[FIG3_FULL] Downloading Phone timeline over SSH..."
-    $remote = $PhoneUser + "@" + $PhoneHost + ":" + $PhoneProfilePath
-    & scp -P $PhoneSshPort $remote $destPhone
-    if ($LASTEXITCODE -ne 0) {
-      throw "SCP failed. All PC logs are saved at $dir. Copy the Phone timeline manually and run only the analyzer; do not rerun inference."
+    Write-Host "[FIG3_FULL] Archiving all three Phone telemetry CSVs over SSH..."
+    $remote = $PhoneUser + "@" + $PhoneHost + ":"
+    $nativePath = $PhoneProfilePath.Replace(".timeline.csv", ".csv")
+    $phoneFiles = @(
+      @{ Path=$PhoneProfilePath; Local=$destPhone }
+      @{ Path=$nativePath; Local=(Join-Path $root "phone.native.csv") }
+      @{ Path=$nativePath.Replace(".csv", ".events.csv"); Local=(Join-Path $root "phone.events.csv") }
+    )
+    foreach ($item in $phoneFiles) {
+      & scp -P $PhoneSshPort ($remote + $item.Path) $item.Local
+      if ($LASTEXITCODE -ne 0) {
+        throw "Phone SCP failed for $($item.Path). PC logs are saved at $dir. Copy Phone CSVs manually and rerun only the analyzer, not inference."
+      }
     }
   }
 
