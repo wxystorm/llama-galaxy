@@ -26,6 +26,7 @@ param(
     [string]$ProfilePrompt = "",
     [int]$ProfileTokenGroup = 0,
     [switch]$Profile,
+    [switch]$DryRun,
     [string]$DumpLayers = "",
     [string]$DumpStages = "",
     [string]$DumpFfnOps = "",
@@ -254,6 +255,10 @@ try {
         Write-Host "[GALAXY2] mode=explicit_layer_set schedule=$Galaxy2FfnSpLayerSet final_layer_sp=$([bool]$FinalLayerSP)"
     } elseif ($Galaxy2 -and $Galaxy2FfnSpLayers -ne "all") {
         Write-Host "[GALAXY2] hybrid_layer_cap=$Galaxy2FfnSpLayers (not full Galaxy2)"
+    }
+    if ($DryRun) {
+        Write-Host "[GALAXY_SP_SMOKE] DRY_RUN_PASS mode=$mode status=VALIDATED_NO_INFERENCE"
+        return
     }
     $result = Invoke-GalaxyProcess `
         -Executable (Resolve-Path -LiteralPath $Exe).Path `
