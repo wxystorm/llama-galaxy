@@ -73,6 +73,50 @@ static double galaxy_profile_elapsed_ms(std::chrono::steady_clock::time_point a,
     return std::chrono::duration<double, std::milli>(b - a).count();
 }
 
+static int64_t galaxy_rpc_steady_ns(std::chrono::steady_clock::time_point t);
+
+// Fine-grained Phone graph intervals, written in the Phone's steady-clock
+// domain. The PC converts them with clock_sync.csv; this file never claims
+// that phone device 0 is necessarily CPU, GPU or HTP.
+static void galaxy_phone_profile_interval(
+        const galaxy_profile_run_context & run, const char * mode,
+        uint32_t device, uint64_t uid, uint32_t nodes,
+        std::chrono::steady_clock::time_point prepare_start,
+        std::chrono::steady_clock::time_point compute_start,
+        std::chrono::steady_clock::time_point compute_end) {
+    const char * raw = std::getenv("LLAMA_GALAXY_PHONE_PROFILE_FILE");
+    if (!raw || !*raw) return;
+    std::string path(raw);
+    const size_t suffix = path.rfind(".csv");
+    if (suffix != std::string::npos && suffix + 4 == path.size()) {
+        path.insert(suffix, ".timeline");
+    } else {
+        path += ".timeline.csv";
+    }
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    try {
+        std::ofstream out(path, std::ios::app);
+        if (!out) return;
+        out.seekp(0, std::ios::end);
+        if (out.tellp() == 0) {
+            out << "run_id,prompt,token_group,mode,device,graph_uid,nodes,"
+                   "prepare_start_phone_ns,compute_start_phone_ns,compute_end_phone_ns,"
+                   "prepare_ms,compute_ms\n";
+        }
+        out << run.run_id << ',' << run.prompt << ',' << run.token_group << ','
+            << mode << ',' << device << ',' << uid << ',' << nodes << ','
+            << galaxy_rpc_steady_ns(prepare_start) << ','
+            << galaxy_rpc_steady_ns(compute_start) << ','
+            << galaxy_rpc_steady_ns(compute_end) << ','
+            << std::fixed << std::setprecision(5)
+            << galaxy_profile_elapsed_ms(prepare_start, compute_start) << ','
+            << galaxy_profile_elapsed_ms(compute_start, compute_end) << '\n';
+    } catch (...) {
+        // Opt-in profiler only.
+    }
+}
+
 // Sidecar CSV avoids mixing the new columns into an existing 7-column CSV.
 // RPC recv/send times include socket service and waiting, not isolated
 // one-way network time; backend_ms includes tensor copy/setup cost.
@@ -165,12 +209,14 @@ enum rpc_cmd {
     RPC_CMD_GRAPH_RECOMPUTE,
     RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE, 
     RPC_CMD_PROFILE_RUN, // appended: never renumber existing RPC commands
+    RPC_CMD_CLOCK_SYNC,  // optional PC/Phone monotonic clock calibration
     RPC_CMD_COUNT,
 };
 
 static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 static_assert(RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE == 17, "RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_PROFILE_RUN == 18, "RPC profile command must be appended");
+static_assert(RPC_CMD_CLOCK_SYNC == 19, "Clock sync must preserve earlier RPC command IDs");
 
 // PC-side RPC socket service diagnostics for Galaxy Fig. 3.
 // These are HOST intervals only. recv_wait_ms includes server processing and
@@ -248,6 +294,7 @@ struct rpc_msg_hello_req {
 };
 
 static constexpr uint8_t RPC_HELLO_FEATURE_PROFILE_RUN = 1; // reserved HELLO byte, unchanged wire size
+static constexpr uint8_t RPC_HELLO_FEATURE_CLOCK_SYNC = 2; // optional, no effect on legacy server
 
 struct rpc_msg_hello_rsp {
     uint8_t major;
@@ -259,6 +306,13 @@ struct rpc_msg_hello_rsp {
 
 struct rpc_msg_device_count_rsp {
     uint32_t device_count;
+};
+
+// The clock response is available only if the server advertises feature bit 2.
+// Steady-clock epochs are independent: use the four-timestamp calibration.
+struct rpc_msg_clock_sync_rsp {
+    int64_t recv_phone_steady_ns;
+    int64_t send_phone_steady_ns;
 };
 
 struct rpc_msg_profile_run_req {
@@ -569,6 +623,51 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint8_t & fe
     return true;
 }
 
+// Calibrate the two independent steady-clock epochs over the existing RPC
+// connection. Each sample is bounded by network RTT and server handling.
+// Select the minimum-uncertainty sample offline; do not subtract raw Phone
+// timestamps from PC timestamps without this calibration.
+static void galaxy_rpc_clock_sync(socket_ptr sock, const std::string & endpoint) {
+    const char * dir = std::getenv("LLAMA_GALAXY_PROFILE_DIR");
+    if (dir == nullptr || *dir == '\0') return;
+    static std::mutex mutex;
+    for (int sample = 0; sample < 12; ++sample) {
+        rpc_msg_clock_sync_rsp rsp = {};
+        const auto a = std::chrono::steady_clock::now();
+        const bool ok = send_rpc_cmd(sock, RPC_CMD_CLOCK_SYNC, nullptr, 0, &rsp, sizeof(rsp));
+        const auto d = std::chrono::steady_clock::now();
+        if (!ok || rsp.send_phone_steady_ns < rsp.recv_phone_steady_ns) {
+            GGML_LOG_WARN("[GALAXY_CLOCK_SYNC] calibration RPC failed\n");
+            return;
+        }
+        const int64_t pc_a = galaxy_rpc_steady_ns(a);
+        const int64_t pc_d = galaxy_rpc_steady_ns(d);
+        const int64_t phone_b = rsp.recv_phone_steady_ns;
+        const int64_t phone_c = rsp.send_phone_steady_ns;
+        const int64_t offset_ns = ((phone_b - pc_a) + (phone_c - pc_d)) / 2;
+        const int64_t uncertainty_ns = std::max<int64_t>(0, ((pc_d - pc_a) - (phone_c - phone_b)) / 2);
+        std::lock_guard<std::mutex> lock(mutex);
+        try {
+            const auto file = std::filesystem::path(dir) / "clock_sync.csv";
+            std::error_code ec;
+            const bool header = !std::filesystem::exists(file, ec) ||
+                    std::filesystem::file_size(file, ec) == 0;
+            std::ofstream out(file, std::ios::app);
+            if (!out) continue;
+            if (header) {
+                out << "endpoint,sample,pc_send_ns,phone_recv_ns,phone_send_ns,"
+                       "pc_recv_ns,offset_phone_minus_pc_ns,uncertainty_ms,rtt_ms\n";
+            }
+            out << endpoint << ',' << sample << ',' << pc_a << ',' << phone_b << ','
+                << phone_c << ',' << pc_d << ',' << offset_ns << ','
+                << std::fixed << std::setprecision(6)
+                << uncertainty_ns / 1.0e6 << ',' << (pc_d - pc_a) / 1.0e6 << '\n';
+        } catch (...) {
+            // Diagnostics must never disrupt inference.
+        }
+    }
+}
+
 static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
@@ -597,6 +696,13 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     uint8_t hello_features = 0;
     if (!negotiate_hello(sock, hello_features)) {
         return nullptr;
+    }
+    if (std::getenv("LLAMA_GALAXY_PROFILE_DIR") != nullptr) {
+        if ((hello_features & RPC_HELLO_FEATURE_CLOCK_SYNC) != 0) {
+            galaxy_rpc_clock_sync(sock, endpoint);
+        } else {
+            GGML_LOG_WARN("[GALAXY_CLOCK_SYNC] Phone RPC server lacks clock-sync support; rebuild Phone for a verified unified timeline\n");
+        }
     }
     const char * run_id = std::getenv("LLAMA_GALAXY_PROFILE_RUN_ID");
     if (run_id != nullptr && run_id[0] != '\0') {
@@ -1457,7 +1563,7 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major = RPC_PROTO_MAJOR_VERSION;
     response.minor = RPC_PROTO_MINOR_VERSION;
     response.patch = RPC_PROTO_PATCH_VERSION;
-    response.features = RPC_HELLO_FEATURE_PROFILE_RUN;
+    response.features = RPC_HELLO_FEATURE_PROFILE_RUN | RPC_HELLO_FEATURE_CLOCK_SYNC;
     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
 }
 
@@ -2023,6 +2129,8 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     galaxy_phone_profile("GRAPH_COMPUTE", device, graph_uid, n_nodes,
             std::chrono::duration<double, std::milli>(compute_start - request_start).count(),
             std::chrono::duration<double, std::milli>(compute_end - compute_start).count());
+    galaxy_phone_profile_interval(profile_run, "GRAPH_COMPUTE", device, graph_uid,
+                                  n_nodes, request_start, compute_start, compute_end);
     mark_graph_started();
     profile_event("GRAPH_COMPUTE", static_cast<int>(device), graph_uid, n_nodes, 0,
                   galaxy_profile_elapsed_ms(request_start, compute_start),
@@ -2049,6 +2157,8 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     galaxy_phone_profile("GRAPH_RECOMPUTE", device, request.graph_uid, graph->n_nodes, 0,
             std::chrono::duration<double, std::milli>(end - start).count());
+    galaxy_phone_profile_interval(profile_run, "GRAPH_RECOMPUTE", device, request.graph_uid,
+                                  graph->n_nodes, start, start, end);
     mark_graph_started();
     profile_event("GRAPH_RECOMPUTE", static_cast<int>(device), request.graph_uid,
                   graph->n_nodes, 0, 0, galaxy_profile_elapsed_ms(start, end));
@@ -2701,6 +2811,14 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!recv_msg(sock, &request, sizeof(request))) return;
                 server.set_profile_run(request);
                 if (!send_msg(sock, nullptr, 0)) return;
+                break;
+            }
+            case RPC_CMD_CLOCK_SYNC: {
+                if (!recv_msg(sock, nullptr, 0)) return;
+                rpc_msg_clock_sync_rsp response = {};
+                response.recv_phone_steady_ns = galaxy_rpc_steady_ns(std::chrono::steady_clock::now());
+                response.send_phone_steady_ns = galaxy_rpc_steady_ns(std::chrono::steady_clock::now());
+                if (!send_msg(sock, &response, sizeof(response))) return;
                 break;
             }
             case RPC_CMD_DEVICE_COUNT: {
