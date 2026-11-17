@@ -23,7 +23,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-Set-StrictMode -Version Latest
+# Do not enable StrictMode here: the legacy smoke runner uses scalar/optional
+# PowerShell .Count accesses and must run in its original non-strict semantics.
 Push-Location (Join-Path $PSScriptRoot "..\..")
 try {
   if ($NormalRepeats -lt 1) { throw "NormalRepeats must be >= 1" }
