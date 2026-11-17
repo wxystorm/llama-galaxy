@@ -4252,6 +4252,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         const char * galaxy2_limit = std::getenv("LLAMA_GALAXY2_FFN_SP_LAYERS");
         const bool partial_galaxy2 = galaxy2 && galaxy2_limit != nullptr &&
                 std::strcmp(galaxy2_limit, "all") != 0;
+        const auto graph_end = ggml_galaxy_profile::clock::now();
         ggml_galaxy_profile::summary(graph_id,
                 has_galaxy_markers
                     ? (galaxy2 ? (partial_galaxy2 ? "GALAXY2_PARTIAL" : "GALAXY2_FULL") : "GALAXY")
@@ -4259,7 +4260,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 cgraph->n_nodes, backend_ctx->n_subgraphs,
                 galaxy_rs_count, galaxy_scatter_count, galaxy_ag_count,
                 galaxy_ar_count,
-                ggml_galaxy_profile::ms(graph_start, ggml_galaxy_profile::clock::now()));
+                ggml_galaxy_profile::ms(graph_start, graph_end));
+        ggml_galaxy_profile::graph_interval(graph_id, graph_start, graph_end);
     }
     // Optional per-layer activation snapshots (selected output tensors only).
     // Read rank 0 after the full Meta graph has finished: TP PARTIAL
