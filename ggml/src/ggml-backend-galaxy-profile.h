@@ -110,6 +110,52 @@ inline void compute(
             row.str());
 }
 
+
+// Diagnostics for the executed TP AllReduce path. Copy-call time can include
+// RPC/network + backend staging; add-dispatch time can include Phone RPC
+// execution. Neither is a pure wire-time or pure CPU compute measurement.
+// Completion fences are intentionally enabled only for -Profile runs.
+struct allreduce_breakdown {
+    double native_call_ms = 0.0;
+    double copy_call_ms = 0.0;
+    double add_dispatch_ms = 0.0;
+    double completion_wait_ms = 0.0;
+    uint64_t copy_bytes = 0;
+    size_t copy_calls = 0;
+    size_t add_dispatches = 0;
+    bool used_fallback = false;
+};
+
+inline int64_t steady_ns(instant t) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
+}
+
+inline void allreduce_detail(
+        uint64_t graph, size_t subgraph, const char * tensor,
+        int64_t begin_ns, int64_t end_ns, double wall_ms,
+        const allreduce_breakdown & d) {
+    if (!enabled()) return;
+    double accounted_ms = d.native_call_ms + d.copy_call_ms +
+                          d.add_dispatch_ms + d.completion_wait_ms;
+    double remainder_ms = wall_ms - accounted_ms;
+    // Includes backend enqueue/fence gaps and local bookkeeping.
+    // Never attribute this remainder to Wi-Fi or CPU computation.
+    if (remainder_ms < 0.0) remainder_ms = 0.0;
+    std::ostringstream row;
+    row << std::fixed << std::setprecision(5)
+        << graph << ',' << subgraph << ',' << quote(tensor) << ','
+        << int(d.used_fallback) << ',' << d.copy_calls << ',' << d.copy_bytes << ','
+        << d.add_dispatches << ',' << d.native_call_ms << ','
+        << d.copy_call_ms << ',' << d.add_dispatch_ms << ','
+        << d.completion_wait_ms << ',' << remainder_ms << ','
+        << wall_ms << ',' << begin_ns << ',' << end_ns;
+    append("allreduce_breakdown.csv",
+           "graph,subgraph,tensor,used_fallback,copy_calls,copy_bytes,add_dispatches,"
+           "native_call_ms,copy_call_ms,add_dispatch_ms,completion_wait_ms,"
+           "other_ms,wall_ms,start_steady_ns,end_steady_ns",
+           row.str());
+}
+
 inline void summary(
         uint64_t graph, const char * mode, int nodes, size_t subgraphs,
         size_t reduce_scatter, size_t residual_scatter, size_t all_gather,
