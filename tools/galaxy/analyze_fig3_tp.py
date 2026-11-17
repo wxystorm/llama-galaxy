@@ -111,6 +111,15 @@ def main() -> int:
         "allreduce_wall_ms": round(ar_ms, 3),
         "allreduce_avg_ms": round(ar_ms / len(selected_ar), 3),
         "allreduce_graph_share_pct": round(100 * ar_ms / graph_ms, 3) if graph_ms > 0 else 0,
+        # The following are mutually exclusive PC HOST intervals under this
+        # diagnostic implementation; they do NOT separate pure network from
+        # remote compute. RPC nested intervals are intentionally excluded.
+        "copy_call_graph_share_pct": round(100 * copy_ms / graph_ms, 3) if graph_ms > 0 else 0,
+        "add_dispatch_graph_share_pct": round(100 * add_ms / graph_ms, 3) if graph_ms > 0 else 0,
+        "completion_wait_graph_share_pct": round(100 * fence_ms / graph_ms, 3) if graph_ms > 0 else 0,
+        "native_call_graph_share_pct": round(100 * native_ms / graph_ms, 3) if graph_ms > 0 else 0,
+        "ar_other_graph_share_pct": round(100 * other_ms / graph_ms, 3) if graph_ms > 0 else 0,
+        "non_allreduce_graph_share_pct": round(100 * other_graph_ms / graph_ms, 3) if graph_ms > 0 else 0,
         "native_collective_call_ms": round(native_ms, 3),
         "copy_call_ms": round(copy_ms, 3),
         "copy_calls": int(numeric_sum(selected_ar, "copy_calls")),
