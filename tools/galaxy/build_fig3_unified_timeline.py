@@ -267,6 +267,7 @@ def main():
     # absence of CUDA events as "GPU Compute = 0%".
     missing = []
     gpu_events = 0
+    pcie_events = 0
     for filename, allow_empty in (("pc_cuda_events.csv", False), ("pc_cpu_events.csv", True)):
         path = profile/filename
         if not path.is_file():
@@ -282,9 +283,16 @@ def main():
                 continue
             if cat == "GPU Compute" and a < t1 and b > t0:
                 gpu_events += 1
+            if cat == "PCIe Copy" and a < t1 and b > t0:
+                pcie_events += 1
             activity.append(itv(a,b,cat,filename,r.get("source",cat)))
     if gpu_events == 0:
         missing.append("GPU Compute intervals within selected Prefill span")
+    # This Galaxy PC-GPU + Phone RPC pure-TP experiment necessarily moves
+    # intermediate tensors through host/GPU buffers. A complete profile
+    # should observe at least one transfer in the Prefill time window.
+    if pcie_events == 0:
+        missing.append("PCIe H2D/D2H device event within selected Prefill span")
     if missing and not args.allow_incomplete:
         raise ValueError("INCOMPLETE FIG3 PROFILE: "+", ".join(missing)+
                          ". Rebuild the modified PC CUDA/CPU backends BEFORE the next run.")
