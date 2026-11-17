@@ -60,6 +60,14 @@ try {
     Threads=8; TimeoutSec=$TimeoutSec
   }
 
+  # Run the ACTUAL Galaxy PowerShell smoke script through its argument
+  # validation and setup, without starting any model inference. This catches
+  # inherited StrictMode and parameter binding failures that synthetic CSV
+  # tests alone cannot detect.
+  Write-Host "[FIG3_FULL] PowerShell smoke preflight (no inference)"
+  & $runner @common -DryRun -OutputDir (Join-Path $root "preflight")
+  Write-Host "[FIG3_FULL] PowerShell smoke preflight passed"
+
   $measured = @()
   for ($i=1; $i -le $NormalRepeats; ++$i) {
     Write-Host "[FIG3_FULL] normal run $i / $NormalRepeats"
