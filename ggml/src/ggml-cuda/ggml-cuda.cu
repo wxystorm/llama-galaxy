@@ -4065,6 +4065,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    const auto trace = ggml_galaxy_cuda_trace::begin(cuda_ctx->device, cuda_ctx->stream(),
+            "GPU Compute", "CUDA_BACKEND_GRAPH", 0);
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -4075,8 +4077,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
-    const auto trace = ggml_galaxy_cuda_trace::begin(cuda_ctx->device, cuda_ctx->stream(),
-            "GPU Compute", "CUDA_BACKEND_GRAPH", 0);
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
     ggml_galaxy_cuda_trace::end(trace, cuda_ctx->stream());
 
