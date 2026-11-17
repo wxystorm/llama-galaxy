@@ -42,6 +42,11 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "PC build failed" }
   }
 
+  # Catch parser/schema bugs using synthetic clocks, graphs and events BEFORE
+  # spending minutes on the real normal+Profile inference passes.
+  & python (Join-Path $PSScriptRoot "test_fig3_unified_timeline.py")
+  if ($LASTEXITCODE -ne 0) { throw "Fig.3 analyzer synthetic preflight failed; model run not started" }
+
   $runId = "fig3-full-" + (Get-Date -Format "yyyyMMddHHmmss")
   New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
   $root = (Resolve-Path -LiteralPath $OutputRoot).Path
