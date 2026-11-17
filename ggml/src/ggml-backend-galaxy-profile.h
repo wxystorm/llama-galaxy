@@ -156,6 +156,17 @@ inline void allreduce_detail(
            row.str());
 }
 
+// True PC-clock graph boundaries. Existing summary.csv has durations only,
+// which cannot place phone activity on one shared temporal axis.
+inline void graph_interval(uint64_t graph, instant start, instant end) {
+    if (!enabled()) return;
+    std::ostringstream row;
+    row << graph << ',' << steady_ns(start) << ',' << steady_ns(end) << ','
+        << std::fixed << std::setprecision(5) << ms(start, end);
+    append("graph_timeline.csv",
+            "graph,start_steady_ns,end_steady_ns,wall_ms", row.str());
+}
+
 inline void summary(
         uint64_t graph, const char * mode, int nodes, size_t subgraphs,
         size_t reduce_scatter, size_t residual_scatter, size_t all_gather,
