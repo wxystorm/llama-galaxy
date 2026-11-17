@@ -1,6 +1,9 @@
 <#
-Run ALL TEN prompts from each 128/256/512/1024 group (40 cases total)
-with the existing llama-galaxy PC+Phone smoke runner.
+Run ten prompts per selected length group with the PC+Phone smoke runner.
+By default, run the original 128/256/512/1024 groups (40 cases).
+Use -Groups 0 to run only the new 0-128 group, or select all five groups
+for ShareGPT50. Existing 40-prompt sessions can be extended with -ResumeDir
+and -Groups 0,128,256,512,1024 (other runtime settings must match).
 
 PowerShell 5.1+; does not rely on $common or any persisted environment variable.
 
@@ -8,12 +11,15 @@ Example (from E:\llama\llama-galaxy):
   .\tools\galaxy\run_galaxy_14b_prompt2_sweep.ps1 -PromptDir 'D:\YOUR_PROMPT_FOLDER'
   .\tools\galaxy\run_galaxy_14b_prompt2_sweep.ps1 -PromptDir 'D:\YOUR_PROMPT_FOLDER' -Mode Galaxy2
   .\tools\galaxy\run_galaxy_14b_prompt2_sweep.ps1 -PromptDir 'D:\YOUR_PROMPT_FOLDER' -Transport HOST
-  .\tools\galaxy\run_galaxy_14b_prompt2_sweep.ps1 -PromptDir 'D:\YOUR_PROMPT_FOLDER' -ResumeDir '.\galaxy-sp-results\prompt-all-14b\run-YYYYMMDD-HHMMSS-fff'
+  .\tools\galaxy\run_galaxy_14b_prompt2_sweep.ps1 -PromptDir 'D:\YOUR_PROMPT_FOLDER' -Groups 0
+  .\tools\galaxy\run_galaxy_14b_prompt2_sweep.ps1 -PromptDir 'D:\YOUR_PROMPT_FOLDER' -Groups 0,128,256,512,1024
+  .\tools\galaxy\run_galaxy_14b_prompt2_sweep.ps1 -PromptDir 'D:\YOUR_PROMPT_FOLDER' -Groups 0,128,256,512,1024 -ResumeDir '.\galaxy-sp-results\prompt-all-14b\run-YYYYMMDD-HHMMSS-fff'
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
     [string]$PromptDir,
+    [int[]]$Groups = @(128, 256, 512, 1024),
     [string]$RepoRoot = 'E:\llama\llama-galaxy',
     [string]$Model = 'E:\llama\models\Qwen3-14B-Q4_K_M.gguf',
     [string]$Rpc = '10.39.52.114:50052',
@@ -54,14 +60,37 @@ if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
 if ($Ctx -le 0 -or $Batch -le 0 -or $UBatch -le 0 -or $UBatch -gt $Batch) {
     throw 'Require Ctx > 0 and 0 < UBatch <= Batch.'
 }
+if ($null -eq $Groups -or $Groups.Count -eq 0) {
+    throw 'Select at least one prompt group with -Groups.'
+}
+$selectedGroups = @($Groups | Sort-Object -Unique)
+if ($selectedGroups.Count -ne $Groups.Count) {
+    throw 'Duplicate prompt groups are not allowed.'
+}
+foreach ($group in $selectedGroups) {
+    if ($group -notin @(0, 128, 256, 512, 1024)) {
+        throw "Unsupported prompt group: $group. Choose from 0,128,256,512,1024."
+    }
+}
+$selectedGroupsCsv = $selectedGroups -join ','
+$expectedCases = 10 * $selectedGroups.Count
 
-# Fail before model loading if any of the 40 expected files are missing.
+# Fail before model loading if any selected prompt files are missing.
 $cases = @()
 $missing = @()
-foreach ($group in @(128, 256, 512, 1024)) {
+foreach ($group in $selectedGroups) {
     foreach ($index in 1..10) {
         $filename = 'prompt_{0}_{1:D2}.txt' -f $group, $index
         $path = Join-Path $prompts $filename
+        # Accept both prompt_0_01.txt and prompt_0-128_01.txt for the short group.
+        if ($group -eq 0 -and -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            $alternateName = 'prompt_0-128_{0:D2}.txt' -f $index
+            $alternatePath = Join-Path $prompts $alternateName
+            if (Test-Path -LiteralPath $alternatePath -PathType Leaf) {
+                $filename = $alternateName
+                $path = $alternatePath
+            }
+        }
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
             $missing += $path
         }
@@ -74,7 +103,7 @@ foreach ($group in @(128, 256, 512, 1024)) {
     }
 }
 if ($missing.Count -gt 0) {
-    throw "Expected 40 prompt files; missing:`n$($missing -join "`n")"
+    throw "Expected $expectedCases prompt files (groups=$selectedGroupsCsv); missing:`n$($missing -join "`n")"
 }
 
 $baseOutput = if ([System.IO.Path]::IsPathRooted($OutputRoot)) {
@@ -100,7 +129,7 @@ $runConfig = [ordered]@{
     final_layer_sp = [bool]$FinalLayerSP
     dump_logits = [bool]$DumpLogits
     profile = [bool]$Profile
-    prompt_groups = '128,256,512,1024'
+    prompt_groups = $selectedGroupsCsv
     prompt_indices = '01..10'
 }
 $configJson = ConvertTo-Json -InputObject $runConfig -Compress -Depth 4
@@ -119,6 +148,15 @@ if ($ResumeDir) {
         throw "Cannot resume: missing sweep-config.json in $sessionDir"
     }
     $saved = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+    $savedGroupsCsv = [string]$saved.prompt_groups
+    $savedGroups = @($savedGroupsCsv -split ',' | ForEach-Object { [int]$_.Trim() })
+    if ($savedGroups.Count -eq 0 -or @($savedGroups | Where-Object {
+        $_ -notin $selectedGroups
+    }).Count -gt 0) {
+        throw 'Cannot resume: -Groups cannot remove groups from the existing sweep session.'
+    }
+    # Only allow an additive group extension; all other settings stay identical.
+    $saved.prompt_groups = $selectedGroupsCsv
     $savedJson = ConvertTo-Json -InputObject $saved -Compress -Depth 4
     if ($savedJson -cne $configJson) {
         throw 'Cannot resume: model / input directory / mode / transport / runtime parameters differ from sweep-config.json.'
@@ -141,6 +179,10 @@ if ($ResumeDir) {
             $results.Add($oldRow)
         }
     }
+    if ($savedGroupsCsv -cne $selectedGroupsCsv) {
+        Set-Content -LiteralPath $manifest -Value $configJson -Encoding UTF8
+        Write-Host "[GALAXY_14B_SWEEP] EXTEND_GROUPS from=$savedGroupsCsv to=$selectedGroupsCsv"
+    }
     Write-Host "[GALAXY_14B_SWEEP] RESUME previous_rows=$($results.Count) dir=$sessionDir"
 } else {
     Set-Content -LiteralPath $manifest -Value $configJson -Encoding UTF8
@@ -148,7 +190,7 @@ if ($ResumeDir) {
 $modes = if ($Mode -eq 'Both') { @('Galaxy', 'Galaxy2') } else { @($Mode) }
 
 Write-Host "[GALAXY_14B_SWEEP] cases=$($cases.Count) modes=$($modes -join ',') transport=$Transport output=$sessionDir"
-Write-Host '[GALAXY_14B_SWEEP] groups=128,256,512,1024 indices=01..10'
+Write-Host "[GALAXY_14B_SWEEP] groups=$selectedGroupsCsv indices=01..10"
 if ($Mode -ne 'Galaxy' -and $Galaxy2Layers -ge 20) {
     Write-Warning 'Many replicated Galaxy2 FFN layers may exceed 6 GB CUDA / Phone memory on Qwen3-14B.'
 }
