@@ -3820,6 +3820,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
     };
 
+    // Do not include CUDA Graph capture/instantiate time in measured GPU
+    // execution. Direct mode traces the native stream evaluation; captured
+    // mode traces only the actual cudaGraphLaunch below.
+    const auto direct_trace = !use_cuda_graph
+        ? ggml_galaxy_cuda_trace::begin(cuda_ctx->device, cuda_ctx->stream(),
+                                       "GPU Compute", "CUDA_DIRECT_GRAPH")
+        : ggml_galaxy_cuda_trace::ticket{};
+
     while (!graph_evaluated_or_captured) {
         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
@@ -3987,6 +3995,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
     }
 
+    if (!use_cuda_graph) {
+        ggml_galaxy_cuda_trace::end(direct_trace, cuda_ctx->stream());
+    }
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
@@ -3995,8 +4006,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
-        // Launch graph
+        // Measure the actual device stream execution, not CPU graph
+        // instantiation or capture time.
+        const auto launch_trace = ggml_galaxy_cuda_trace::begin(
+            cuda_ctx->device, cuda_ctx->stream(), "GPU Compute", "CUDA_GRAPH_LAUNCH");
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        ggml_galaxy_cuda_trace::end(launch_trace, cuda_ctx->stream());
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
@@ -4065,8 +4080,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
-    const auto trace = ggml_galaxy_cuda_trace::begin(cuda_ctx->device, cuda_ctx->stream(),
-            "GPU Compute", "CUDA_BACKEND_GRAPH", 0);
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -4078,7 +4091,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
-    ggml_galaxy_cuda_trace::end(trace, cuda_ctx->stream());
 
     return GGML_STATUS_SUCCESS;
 }
