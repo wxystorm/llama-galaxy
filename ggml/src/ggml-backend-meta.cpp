@@ -3239,7 +3239,29 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
     // Preferentially use backend-specific allreduce_tensor_async (e.g. NCCL for CUDA), use a generic fallback if unavailable:
-    auto allreduce_fallback = [&](size_t i) -> ggml_status {
+    auto allreduce_fallback = [&](size_t i, ggml_galaxy_profile::allreduce_breakdown * detail) -> ggml_status {
+        // The Host/RPC fallback performs backend-to-backend tensor transfers
+        // and device-side ADD graphs. It does NOT necessarily reduce on CPU.
+        // These timers capture API-call walls; async work may finish later.
+        auto traced_copy = [&](ggml_backend_t src_backend, ggml_backend_t dst_backend,
+                               const ggml_tensor * src, ggml_tensor * dst) {
+            const auto start = ggml_galaxy_profile::clock::now();
+            ggml_backend_tensor_copy_async(src_backend, dst_backend, src, dst);
+            if (detail) {
+                detail->copy_call_ms += ggml_galaxy_profile::ms(start, ggml_galaxy_profile::clock::now());
+                detail->copy_bytes += ggml_nbytes(src);
+                ++detail->copy_calls;
+            }
+        };
+        auto traced_add_dispatch = [&](ggml_backend_t target, ggml_cgraph * graph) {
+            const auto start = ggml_galaxy_profile::clock::now();
+            const ggml_status result = ggml_backend_graph_compute_async(target, graph);
+            if (detail) {
+                detail->add_dispatch_ms += ggml_galaxy_profile::ms(start, ggml_galaxy_profile::clock::now());
+                ++detail->add_dispatches;
+            }
+            return result;
+        };
         std::vector<ggml_cgraph *> step_cgraphs(n_backends, nullptr);
 
         // Zero out nodes that were disabled due to having a zero-sized slice:
@@ -3260,7 +3282,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             step_cgraphs[j] = get_cgraph_aux();
             step_cgraphs[j]->nodes[0] = node_zero;
             step_cgraphs[j]->n_nodes = 1;
-            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[j]);
+            const ggml_status status = traced_add_dispatch(bcj.backend, step_cgraphs[j]);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
@@ -3280,7 +3302,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             ggml_tensor * node_tmp = get_node_aux(node_dst);
             set_tmp_data(node_tmp, j_dst, i_buf);
 
-            ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_tmp);
+            traced_copy(bcj_src.backend, bcj_dst.backend, node_src, node_tmp);
 
             ggml_tensor * node_red = get_node_aux(node_dst);
             node_red->view_src = node_dst->view_src == nullptr ? node_dst : node_dst->view_src;
@@ -3308,7 +3330,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         for (size_t j_src = 2*offset_j_max; j_src < n_backends; j_src++) {
             const size_t j_dst = j_src - 2*offset_j_max;
             push_data(j_src, j_dst, i_buf);
-            const ggml_status status = ggml_backend_graph_compute_async(backend_ctx->backend_configs[j_dst].backend, step_cgraphs[j_dst]);
+            const ggml_status status = traced_add_dispatch(backend_ctx->backend_configs[j_dst].backend, step_cgraphs[j_dst]);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
@@ -3332,7 +3354,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     continue;
                 }
                 auto & bcj = backend_ctx->backend_configs[j];
-                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[j]);
+                const ggml_status status = traced_add_dispatch(bcj.backend, step_cgraphs[j]);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
@@ -3348,7 +3370,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
             ggml_tensor * node_src = bcj_src.cgraphs[i].cgraph_main->nodes[bcj_src.cgraphs[i].cgraph_main->n_nodes - 1];
             ggml_tensor * node_dst = bcj_dst.cgraphs[i].cgraph_main->nodes[bcj_dst.cgraphs[i].cgraph_main->n_nodes - 1];
-            ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_dst);
+            traced_copy(bcj_src.backend, bcj_dst.backend, node_src, node_dst);
         }
 
         return GGML_STATUS_SUCCESS;
@@ -4168,6 +4190,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         i, original_last->name);
             }
             const auto reduce_start = ggml_galaxy_profile::clock::now();
+            ggml_galaxy_profile::allreduce_breakdown ar;
             bool backend_allreduce_success = false;
             if (backend_ctx->comm_ctx) {
                 std::vector<ggml_tensor *> nodes;
@@ -4177,25 +4200,41 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
                     nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
                 }
+                const auto native_start = ggml_galaxy_profile::clock::now();
                 backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
+                if (profiling) {
+                    ar.native_call_ms = ggml_galaxy_profile::ms(
+                            native_start, ggml_galaxy_profile::clock::now());
+                }
             }
 
             if (!backend_allreduce_success) {
-                const ggml_status status = allreduce_fallback(i);
+                ar.used_fallback = true;
+                const ggml_status status = allreduce_fallback(i, profiling ? &ar : nullptr);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
             }
             galaxy_ar_count++;
             if (profiling) {
-                // The fallback may queue asynchronous copies/ADD operations.
-                // Wait for both ranks before recording the end-to-end time.
+                // This fence is diagnostic/invasive. For asynchronous
+                // fallback operations it measures the remaining completion
+                // wait, but may also include RPC backend/server work.
+                const auto sync_start = ggml_galaxy_profile::clock::now();
                 for (size_t j = 0; j < n_backends; ++j) {
                     ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
                 }
+                const auto sync_end = ggml_galaxy_profile::clock::now();
+                ar.completion_wait_ms = ggml_galaxy_profile::ms(sync_start, sync_end);
+                const double wall_ms = ggml_galaxy_profile::ms(reduce_start, sync_end);
+                ggml_galaxy_profile::allreduce_detail(graph_id, i, original_last->name,
+                        ggml_galaxy_profile::steady_ns(reduce_start),
+                        ggml_galaxy_profile::steady_ns(sync_end), wall_ms, ar);
+                // Preserve legacy CSV columns; the detailed phases are in
+                // allreduce_breakdown.csv and RPC call intervals in
+                // rpc_transfer_timeline.csv. Do not label them pure Wi-Fi.
                 ggml_galaxy_profile::communication("ALLREDUCE", original_last->name,
-                        original_last->ne[1], 0, 0, 0, 0, 0, 0,
-                        ggml_galaxy_profile::ms(reduce_start, ggml_galaxy_profile::clock::now()));
+                        original_last->ne[1], 0, 0, 0, 0, 0, 0, wall_ms);
             }
             if (trace) {
                 GGML_LOG_INFO("[GALAXY_META_TRACE] event=ALLREDUCE_END idx=%zu tensor=%s native=%d\n",
