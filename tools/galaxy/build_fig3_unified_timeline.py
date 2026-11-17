@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Build one aligned Galaxy TP Prefill timeline with a single Phone Compute class.
+"""Galaxy TP Fig.3: validated PC CUDA/CPU/PCIe + unified Phone event timeline.
 
-The Phone backend (CPU/GPU/HTP) is deliberately NOT inferred. All Phone
-native graph compute intervals have category 'Phone Compute'.
+Required SAME-run files:
+ PC: summary.csv, graph_timeline.csv, clock_sync.csv,
+     allreduce_breakdown.csv, rpc_transfer_timeline.csv,
+     pc_cuda_events.csv, pc_cpu_events.csv (may contain just the header)
+ Phone: fig3-galaxy-phone-v3.timeline.csv with the selected run_id.
 
-This requires the new, opt-in Phone monotonic graph intervals and the PC
-clock_sync.csv from the SAME run. A legacy phone events.csv with only
-timestamp_unix_ms is intentionally not accepted for an aligned timeline.
-
-This is a measured diagnostic occupancy projection, NOT proof of a unique
-critical path or of actual hardware idle time. PC GPU/CPU/PCIe requires
-separate PC device activity traces (optional --pc-events).
+The output has TWO presentations:
+ (1) raw concurrent device/synchronization intervals and device lanes;
+ (2) one fully covered, exclusive 100%-stacked PROJECTION of the time axis.
+Projection priority is an explicitly chosen accounting policy, not a proof of
+the causal critical path. Device stream intervals are not per-kernel active
+utilization; Wi-Fi Sync is RPC/AllReduce synchronization, not pure wire time.
+Phone CPU/GPU/HTP are deliberately unified as Phone Compute.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -21,318 +23,353 @@ import html
 from collections import Counter, defaultdict
 from pathlib import Path
 
-ACTIVITIES = (
+CATEGORIES = (
     "Phone Compute",
+    "PCIe Copy",
     "GPU Compute",
     "CPU Compute",
-    "PCIe Copy",
     "Wi-Fi Sync",
     "Waiting/Other",
 )
-# A deterministic EXCLUSIVE projection, not proof of causality. In
-# particular, Phone Compute overrides the containing AllReduce/RPC wait.
-PRIORITY = ACTIVITIES[:-1]
+PRIORITY = CATEGORIES[:-1]
 COLORS = {
-    "Phone Compute": "#3978AB",
-    "GPU Compute": "#7E5AA7",
-    "CPU Compute": "#B18B45",
-    "PCIe Copy": "#46A38C",
-    "Wi-Fi Sync": "#DC8858",
-    "Waiting/Other": "#A6AFBD",
+    "Phone Compute": "#317BB3",
+    "PCIe Copy": "#31A98D",
+    "GPU Compute": "#8F62B6",
+    "CPU Compute": "#C3A34D",
+    "Wi-Fi Sync": "#E17E55",
+    "Waiting/Other": "#A9B1BD",
 }
-PC_EVENT_CATEGORIES = {"GPU Compute", "CPU Compute", "PCIe Copy"}
+PC_CATEGORIES = {"GPU Compute", "CPU Compute", "PCIe Copy"}
 
 
-def load(path: Path) -> list[dict[str, str]]:
+def read_rows(path: Path, allow_header_only: bool = False):
     if not path.is_file():
-        raise FileNotFoundError(f"Required input absent: {path}")
-    with path.open("r", encoding="utf-8-sig", newline="") as f:
-        result = list(csv.DictReader(f))
-    if not result:
-        raise ValueError(f"Empty CSV: {path}")
-    return result
+        raise FileNotFoundError(f"Missing required telemetry: {path}")
+    with path.open("r", encoding="utf-8-sig", newline="") as source:
+        reader = csv.DictReader(source)
+        if not reader.fieldnames:
+            raise ValueError(f"No CSV header: {path}")
+        data = list(reader)
+    if not data and not allow_header_only:
+        raise ValueError(f"Missing data rows: {path}")
+    return data
 
 
-def write_csv(path: Path, records: list[dict], fields: list[str]) -> None:
-    with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+def write_rows(path: Path, rows: list[dict], cols: list[str]):
+    with path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=cols, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(records)
+        writer.writerows(rows)
 
 
-def interval(start: int, end: int, category: str, source: str, label: str) -> dict:
-    if end <= start:
-        raise ValueError(f"Non-positive interval: {label} ({start}..{end})")
-    return {
-        "start_ns": start,
-        "end_ns": end,
-        "category": category,
-        "source": source,
-        "label": label,
-    }
+def itv(start: int, end: int, category: str, source: str, label: str):
+    if start >= end:
+        raise ValueError(f"Invalid {source} interval {start}..{end}")
+    return dict(start=start, end=end, category=category, source=source, label=label)
 
 
-def choose_clock_sync(rows: list[dict[str, str]], endpoint: str) -> tuple[int, float, str]:
-    candidates = [r for r in rows if not endpoint or r["endpoint"] == endpoint]
-    if not candidates:
-        raise ValueError(f"No clock calibration for endpoint {endpoint!r}")
-    # Minimum uncertainty bounds offset error under symmetric-delay
-    # assumption; do not claim perfect one-way network clock correction.
-    best = min(candidates, key=lambda r: (float(r["uncertainty_ms"]), float(r["rtt_ms"])))
-    return int(best["offset_phone_minus_pc_ns"]), float(best["uncertainty_ms"]), best["endpoint"]
-
-
-def graph_selection(folder: Path, last_graphs: int, ids: str):
-    summary = load(folder / "summary.csv")
-    graph_intervals = load(folder / "graph_timeline.csv")
-    by_graph = {int(r["graph"]): r for r in graph_intervals}
-    available = sorted({int(r["graph"]) for r in summary})
+def select_graphs(profile: Path, ids: str, last_graphs: int):
+    summ = read_rows(profile / "summary.csv")
+    raw = read_rows(profile / "graph_timeline.csv")
+    by_id = {int(r["graph"]): r for r in raw}
+    available = sorted({int(r["graph"]) for r in summ})
     if ids:
-        chosen = sorted({int(x.strip()) for x in ids.split(",") if x.strip()})
-        if not set(chosen) <= set(available):
-            raise ValueError(f"Unknown graph ID; available={available}")
+        selected = sorted(set(int(i.strip()) for i in ids.split(",") if i.strip()))
     else:
         if last_graphs < 1 or last_graphs > len(available):
-            raise ValueError(f"--last-graphs must be 1..{len(available)}")
-        chosen = available[-last_graphs:]
-    if any(g not in by_graph for g in chosen):
-        raise ValueError("graph_timeline.csv does not contain each selected graph")
+            raise ValueError(f"last_graphs must be 1..{len(available)}")
+        selected = available[-last_graphs:]
+    if not selected or any(i not in available or i not in by_id for i in selected):
+        raise ValueError(f"Graph IDs absent in summary or graph timeline. Available: {available}")
     spans = []
-    for g in chosen:
-        r = by_graph[g]
-        start, end = int(r["start_steady_ns"]), int(r["end_steady_ns"])
-        expected_ms = float(r["wall_ms"])
-        if abs((end - start) / 1e6 - expected_ms) > 0.5:
-            raise ValueError(f"Graph {g} has inconsistent monotonic boundaries")
-        spans.append((g, start, end))
-    selected_summary = [r for r in summary if int(r["graph"]) in chosen]
-    expected_calls = sum(int(r["all_reduce"]) for r in selected_summary)
-    return chosen, sorted(spans), expected_calls
+    for graph in selected:
+        r = by_id[graph]
+        a, b = int(r["start_steady_ns"]), int(r["end_steady_ns"])
+        if not a < b or abs((b - a) / 1e6 - float(r["wall_ms"])) > 0.5:
+            raise ValueError(f"Graph {graph} has invalid timing bounds")
+        spans.append((graph, a, b))
+    spans.sort(key=lambda z: z[1])
+    if any(spans[i-1][2] > spans[i][1] for i in range(1, len(spans))):
+        raise ValueError("Selected PC Graph spans overlap; cannot use graph-gap semantics")
+    expected_ar = sum(int(r["all_reduce"]) for r in summ
+                      if int(r["graph"]) in selected)
+    return selected, spans, expected_ar
 
 
-def project(spans: list[tuple[int, int, int]], activity: list[dict]):
-    """Segment graph coverage into a single, exhaustive exclusive timeline."""
-    events: list[tuple[int, str, int]] = []
-    for _, start, end in spans:
-        events += [(start, "graph", 1), (end, "graph", -1)]
-    for item in activity:
-        events += [(item["start_ns"], item["category"], 1),
-                   (item["end_ns"], item["category"], -1)]
-    events.sort(key=lambda e: e[0])
+def calibration(profile: Path, endpoint: str, limit_ms: float):
+    candidates = read_rows(profile / "clock_sync.csv")
+    if endpoint:
+        candidates = [r for r in candidates if r["endpoint"] == endpoint]
+    if not candidates:
+        raise ValueError("No Phone clock calibration for selected endpoint")
+    row = min(candidates, key=lambda r: (float(r["uncertainty_ms"]), float(r["rtt_ms"])))
+    error = float(row["uncertainty_ms"])
+    if error > limit_ms:
+        raise ValueError(f"Phone clock uncertainty {error:.3f}ms exceeds {limit_ms}ms")
+    return int(row["offset_phone_minus_pc_ns"]), error, row["endpoint"]
+
+
+def clip(item: dict, a: int, b: int):
+    start = max(item["start"], a)
+    end = min(item["end"], b)
+    if start >= end:
+        return None
+    return dict(item, start=start, end=end)
+
+
+def exclusive_projection(events: list[dict], t0: int, t1: int):
+    ticks = [(t0, "", 0), (t1, "", 0)]
+    for r in events:
+        ticks.append((r["start"], r["category"], 1))
+        ticks.append((r["end"], r["category"], -1))
+    ticks.sort(key=lambda z: z[0])
     active = Counter()
-    out = []
-    previous = None
+    segments = []
+    overlap_ns = 0
     i = 0
-    overlap_ms = 0.
-    while i < len(events):
-        t = events[i][0]
-        if previous is not None and t > previous and active["graph"] > 0:
-            category = next((cat for cat in PRIORITY if active[cat] > 0),
-                            "Waiting/Other")
-            enabled = [cat for cat in PRIORITY if active[cat] > 0]
-            if len(enabled) > 1:
-                overlap_ms += (t - previous) / 1e6
-            if out and out[-1]["category"] == category and out[-1]["end_ns"] == previous:
-                out[-1]["end_ns"] = t
+    old = t0
+    while i < len(ticks):
+        now = ticks[i][0]
+        if now > old and old >= t0 and now <= t1:
+            present = [name for name in PRIORITY if active[name] > 0]
+            category = present[0] if present else "Waiting/Other"
+            if len(present) > 1:
+                overlap_ns += now - old
+            if segments and segments[-1]["category"] == category and segments[-1]["end"] == old:
+                segments[-1]["end"] = now
             else:
-                out.append({"start_ns": previous, "end_ns": t, "category": category})
-        while i < len(events) and events[i][0] == t:
-            _, key, delta = events[i]
-            active[key] += delta
-            if active[key] < 0:
-                raise ValueError(f"Invalid sweep count for {key}")
+                segments.append({"start": old, "end": now, "category": category})
+        while i < len(ticks) and ticks[i][0] == now:
+            _, name, delta = ticks[i]
+            if name:
+                active[name] += delta
+                if active[name] < 0:
+                    raise ValueError(f"Negative active interval count: {name}")
             i += 1
-        previous = t
-    return out, overlap_ms
+        old = now
+    expected = t1 - t0
+    actual = sum(r["end"] - r["start"] for r in segments)
+    if actual != expected or not segments or segments[0]["start"] != t0 or segments[-1]["end"] != t1:
+        raise ValueError(f"Timeline coverage mismatch: {actual} != {expected}")
+    return segments, overlap_ns
 
 
-def render_svg(path: Path, spans: list[tuple[int, int, int]], segments: list[dict],
-               total_ms: float, info: str) -> None:
-    t0 = min(s for _, s, _ in spans)
-    t1 = max(e for _, _, e in spans)
-    width, left, right, top = 1120, 105, 35, 80
-    chart = width - left - right
+def svg_preview(path: Path, activity: list[dict], timeline: list[dict],
+                t0: int, t1: int, graph_spans, values):
+    width, left, right = 1200, 170, 25
+    usable = width-left-right
+    row_y = {
+        "Exclusive projection": 85, "GPU Compute": 133,
+        "Phone Compute": 172, "CPU Compute": 211,
+        "PCIe Copy": 250, "Wi-Fi Sync": 289
+    }
     def x(ns):
-        return left + (ns - t0) / max(1, t1 - t0) * chart
-    total_s = (t1 - t0) / 1e9
+        return left + (ns-t0) / (t1-t0) * usable
     lines = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} 225">',
-        '<rect width="1120" height="225" fill="white"/>',
-        '<text x="105" y="27" font-size="18" font-weight="bold" fill="#1C2735">'
-        'Galaxy 14B: unified prefill timeline (diagnostic)</text>',
-        f'<text x="105" y="47" font-size="12" fill="#53606F">{html.escape(info)}</text>',
-        '<text x="18" y="99" font-size="13" fill="#263748">Activity</text>',
-        f'<rect x="{left}" y="{top}" width="{chart}" height="32" fill="#EEF0F3"/>',
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} 410">',
+        f'<rect width="{width}" height="410" fill="white"/>',
+        '<text x="170" y="28" font-size="19" fill="#1D2938" font-weight="bold">'
+        'Galaxy 14B: PC/Phone aligned raw lanes and exclusive projection</text>',
+        '<text x="170" y="49" font-size="12" fill="#627083">'
+        + html.escape("Total %.3f s, clock bound +/- %.3f ms. Overlap is counted once in the projection." %
+                      (values["profile_envelope_ms"]/1000, values["clock_uncertainty_ms"])) + '</text>',
     ]
-    for item in segments:
-        a, b = x(item["start_ns"]), x(item["end_ns"])
-        lines.append(f'<rect x="{a:.3f}" y="{top}" width="{max(0.001,b-a):.3f}" '
-                     f'height="32" fill="{COLORS[item["category"]]}"/>')
-    for tick in range(6):
-        s = total_s * tick / 5
-        xx = left + chart * tick / 5
-        lines.append(f'<line x1="{xx:.2f}" x2="{xx:.2f}" y1="116" y2="123" '
-                     'stroke="#647386" stroke-width="1"/>')
-        lines.append(f'<text x="{xx:.2f}" y="140" fill="#415166" '
-                     f'text-anchor="middle" font-size="11">{s:.1f} s</text>')
-    for i, (name, color) in enumerate(COLORS.items()):
-        col, row = i % 3, i // 3
-        xx, yy = left + col * 312, 167 + row * 23
-        lines.append(f'<rect x="{xx}" y="{yy - 10}" width="12" height="12" fill="{color}"/>')
-        lines.append(f'<text x="{xx+20}" y="{yy}" font-size="12" fill="#263748">'
-                     f'{html.escape(name)}</text>')
-    lines.append(f'<text x="{left}" y="219" font-size="10" fill="#657282">'
-                 f'Profile-covered graph time: {total_ms / 1000:.2f} s; '
-                 'overlapping activities are projected by priority, not added.</text>')
-    lines.append("</svg>")
+    for name, y in row_y.items():
+        lines.append(f'<text x="{left-12}" y="{y+15}" text-anchor="end" fill="#344256" font-size="12">'
+                     + html.escape(name) + '</text>')
+        lines.append(f'<rect x="{left}" y="{y}" width="{usable}" height="23" fill="#EFF2F6"/>')
+    for graph, a, b in graph_spans:
+        gx = x(a)
+        lines.append(f'<line x1="{gx:.3f}" x2="{gx:.3f}" y1="79" y2="315" stroke="#8CA0B2" opacity=".35" stroke-dasharray="2 2"/>')
+        lines.append(f'<text x="{gx+3:.3f}" y="74" font-size="10" fill="#728092">G{graph}</text>')
+    for seg in timeline:
+        w = x(seg["end"])-x(seg["start"])
+        lines.append(f'<rect x="{x(seg["start"]):.3f}" y="85" width="{max(.08,w):.3f}" height="23" fill="{COLORS[seg["category"]]}"/>')
+    for item in activity:
+        name = item["category"]
+        if name not in row_y:
+            continue
+        w = x(item["end"])-x(item["start"])
+        lines.append(f'<rect x="{x(item["start"]):.3f}" y="{row_y[name]}" width="{max(.06,w):.3f}" height="23" fill="{COLORS[name]}"/>')
+    tspan = (t1-t0)/1e9
+    for j in range(6):
+        xx = left + usable*j/5
+        lines.append(f'<text x="{xx:.2f}" y="336" font-size="11" text-anchor="middle" fill="#596777">{tspan*j/5:.1f}s</text>')
+    # Visible, readable summary complements the granular native timeline.
+    xx = left
+    for name in CATEGORIES:
+        pct = values[name.lower().replace(" ","_").replace("/","_").replace("-","_")+"_pct"]
+        w = usable*pct/100.0
+        if w > 0:
+            lines.append(f'<rect x="{xx:.3f}" y="356" width="{w:.3f}" height="21" fill="{COLORS[name]}"/>')
+            if w > 65:
+                lines.append(f'<text x="{xx+w/2:.3f}" y="370" text-anchor="middle" fill="white" font-size="10">{pct:.1f}%</text>')
+        xx += w
+    lines.append('<text x="170" y="398" font-size="10" fill="#66788D">'
+                 'Device lanes may overlap. Wi-Fi Sync is collective/RPC path, not isolated RF transmission. Waiting/Other is a residual.</text>')
+    lines.append('</svg>')
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--profile-dir", type=Path, required=True,
-                    help="PC profile folder containing summary, graph_timeline, AllReduce, RPC and clock_sync CSVs")
-    ap.add_argument("--phone-timeline", type=Path, required=True,
-                    help="Phone fig3-galaxy-phone.timeline.csv copied from Termux")
-    ap.add_argument("--run-id", default="", help="Optional unique profile run ID in phone timeline")
-    ap.add_argument("--endpoint", default="", help="Select PC clock calibration for this Phone endpoint")
-    ap.add_argument("--last-graphs", type=int, default=5)
-    ap.add_argument("--graph-ids", default="")
-    ap.add_argument("--pc-events", type=Path, default=None,
-                    help="Optional PC events CSV: category,start_steady_ns,end_steady_ns")
-    ap.add_argument("--out-dir", type=Path, default=None)
-    ap.add_argument("--max-clock-uncertainty-ms", type=float, default=20.0)
-    ap.add_argument("--normal-prefill-ms", type=float, default=None,
-                    help="Separate unprofiled Prefill timing for the label; never changes Profile proportions")
-    args = ap.parse_args()
-
-    profile_dir = args.profile_dir.resolve()
-    out = (args.out_dir or profile_dir).resolve()
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--profile-dir", type=Path, required=True)
+    parser.add_argument("--phone-timeline", type=Path, required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--endpoint", default="")
+    parser.add_argument("--graph-ids", default="")
+    parser.add_argument("--last-graphs", type=int, default=5)
+    parser.add_argument("--out-dir", type=Path, default=None)
+    parser.add_argument("--max-clock-uncertainty-ms", type=float, default=20)
+    parser.add_argument("--normal-prefill-ms", type=float, default=None)
+    parser.add_argument("--allow-incomplete", action="store_true",
+                        help="Diagnostic fallback only; cannot certify Fig.3 bar")
+    args = parser.parse_args()
+    profile = args.profile_dir.resolve()
+    out = (args.out_dir or profile).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    chosen, graph_spans, expected_ar = graph_selection(profile_dir, args.last_graphs, args.graph_ids)
-    clock_offset_ns, uncertainty_ms, endpoint = choose_clock_sync(
-        load(profile_dir / "clock_sync.csv"), args.endpoint)
-    if uncertainty_ms > args.max_clock_uncertainty_ms:
-        raise ValueError(
-            f"Clock calibration uncertainty {uncertainty_ms:.2f} ms exceeds "
-            f"{args.max_clock_uncertainty_ms:.2f} ms. Check PC/Phone Wi-Fi.")
-    ar_rows = [r for r in load(profile_dir / "allreduce_breakdown.csv")
-               if int(r["graph"]) in chosen]
-    if len(ar_rows) != expected_ar:
-        raise ValueError(f"AllReduce count mismatch: {len(ar_rows)} != {expected_ar}")
+    chosen, graph_spans, expected_ar = select_graphs(profile, args.graph_ids, args.last_graphs)
+    t0, t1 = graph_spans[0][1], graph_spans[-1][2]
+    envelope_ms = (t1-t0)/1e6
+    graph_ms = sum((b-a)/1e6 for _, a, b in graph_spans)
+    gap_ms = envelope_ms - graph_ms
+    if gap_ms < -.01:
+        raise ValueError("Selected graph coverage exceeds Prefill envelope")
 
-    activity: list[dict] = []
-    for r in ar_rows:
-        activity.append(interval(int(r["start_steady_ns"]), int(r["end_steady_ns"]),
-                                 "Wi-Fi Sync", "PC_ALLREDUCE", r["tensor"]))
-    rpc_rows = load(profile_dir / "rpc_transfer_timeline.csv")
-    for r in rpc_rows:
-        if r["command"] not in ("GET_TENSOR", "SET_TENSOR", "SET_TENSOR_HASH", "COPY_TENSOR"):
+    offset, clock_error_ms, endpoint = calibration(profile, args.endpoint, args.max_clock_uncertainty_ms)
+    allreduce = [r for r in read_rows(profile/"allreduce_breakdown.csv") if int(r["graph"]) in chosen]
+    if len(allreduce) != expected_ar:
+        raise ValueError(f"AllReduce mismatch: {len(allreduce)} != {expected_ar}")
+    activity = []
+    for r in allreduce:
+        activity.append(itv(int(r["start_steady_ns"]), int(r["end_steady_ns"]),
+                            "Wi-Fi Sync", "ALLREDUCE", r["tensor"]))
+    rpc = read_rows(profile/"rpc_transfer_timeline.csv")
+    for r in rpc:
+        if r["command"] not in ("GET_TENSOR","SET_TENSOR","SET_TENSOR_HASH","COPY_TENSOR"):
             continue
-        if int(r.get("ok", "1")) != 1:
+        if int(r.get("ok","1")) != 1:
             continue
-        start, end = int(r["start_steady_ns"]), int(r["end_steady_ns"])
-        activity.append(interval(start, end, "Wi-Fi Sync", "PC_RPC", r["command"]))
+        activity.append(itv(int(r["start_steady_ns"]), int(r["end_steady_ns"]),
+                            "Wi-Fi Sync", "PC_RPC", r["command"]))
 
-    all_phone = load(args.phone_timeline)
-    phone_rows = [r for r in all_phone if not args.run_id or r["run_id"] == args.run_id]
-    if not phone_rows:
-        raise ValueError("No Phone graph intervals matching the selected run-id")
-    for r in phone_rows:
-        start = int(r["compute_start_phone_ns"]) - clock_offset_ns
-        end = int(r["compute_end_phone_ns"]) - clock_offset_ns
-        if end <= start:
-            continue
-        activity.append(interval(start, end, "Phone Compute", "PHONE_NATIVE",
-                                 f'{r["mode"]}:{r["graph_uid"]}'))
+    phone = read_rows(args.phone_timeline)
+    phone = [r for r in phone if r["run_id"] == args.run_id]
+    if not phone:
+        raise ValueError("Phone timeline does not contain this --run-id; check the RPC Server profile env")
+    for r in phone:
+        a, b = int(r["compute_start_phone_ns"])-offset, int(r["compute_end_phone_ns"])-offset
+        if b > a:
+            activity.append(itv(a,b,"Phone Compute","PHONE_NATIVE",r["mode"]))
 
-    pc_events_present = args.pc_events is not None
-    if args.pc_events:
-        for r in load(args.pc_events):
+    # Both backend sidecars are required: never silently interpret the
+    # absence of CUDA events as "GPU Compute = 0%".
+    missing = []
+    gpu_events = 0
+    for filename, allow_empty in (("pc_cuda_events.csv", False), ("pc_cpu_events.csv", True)):
+        path = profile/filename
+        if not path.is_file():
+            missing.append(filename)
+            continue
+        rows = read_rows(path, allow_header_only=allow_empty)
+        for r in rows:
             cat = r["category"]
-            if cat not in PC_EVENT_CATEGORIES:
-                raise ValueError(f"Invalid PC event category {cat!r}; use {sorted(PC_EVENT_CATEGORIES)}")
-            activity.append(interval(int(r["start_steady_ns"]), int(r["end_steady_ns"]),
-                                     cat, "PC_DEVICE", cat))
+            if cat not in PC_CATEGORIES:
+                raise ValueError(f"Bad device event category: {cat}")
+            a, b = int(r["start_steady_ns"]), int(r["end_steady_ns"])
+            if b <= a:
+                continue
+            if cat == "GPU Compute" and a < t1 and b > t0:
+                gpu_events += 1
+            activity.append(itv(a,b,cat,filename,r.get("source",cat)))
+    if gpu_events == 0:
+        missing.append("GPU Compute intervals within selected Prefill span")
+    if missing and not args.allow_incomplete:
+        raise ValueError("INCOMPLETE FIG3 PROFILE: "+", ".join(missing)+
+                         ". Rebuild the modified PC CUDA/CPU backends BEFORE the next run.")
+    activity = [r2 for r in activity if (r2:=clip(r,t0,t1)) is not None]
+    if not any(r["category"]=="Phone Compute" for r in activity):
+        raise ValueError("No Phone Compute overlaps the selected PC Prefill window; verify Run ID / clock calibration")
 
-    # Keep raw events only when they intersect selected graph windows; no
-    # phone preload / startup graph work is included in Fig. 3 Prefill.
-    def touches_graph(a):
-        return any(a["start_ns"] < end and a["end_ns"] > start
-                   for _, start, end in graph_spans)
+    segments, overlap_ns = exclusive_projection(activity,t0,t1)
+    totals_ns = defaultdict(int)
+    raw_ns = defaultdict(int)
+    for seg in segments:
+        totals_ns[seg["category"]] += seg["end"]-seg["start"]
+    for r in activity:
+        raw_ns[r["category"]] += r["end"]-r["start"]
+    if sum(totals_ns.values()) != t1-t0:
+        raise ValueError("Six-way percentages would not sum to 100%")
 
-    activity = [a for a in activity if touches_graph(a)]
-    segments, overlapping_ms = project(graph_spans, activity)
-    if not segments:
-        raise ValueError("No covered Prefill graph intervals")
-    origin = min(s for _, s, _ in graph_spans)
-    total_ms = sum((end - start) / 1e6 for _, start, end in graph_spans)
-    if abs(sum((s["end_ns"]-s["start_ns"])/1e6 for s in segments) - total_ms) > .02:
-        raise ValueError("Projected segments do not sum to measured PC graph time")
-    by_category = defaultdict(float)
-    for s in segments:
-        by_category[s["category"]] += (s["end_ns"] - s["start_ns"]) / 1e6
-
-    source_rows = [{
-        "start_ms": round((a["start_ns"] - origin) / 1e6, 4),
-        "end_ms": round((a["end_ns"] - origin) / 1e6, 4),
-        "duration_ms": round((a["end_ns"] - a["start_ns"]) / 1e6, 4),
-        "source": a["source"], "category": a["category"], "label": a["label"]
-    } for a in sorted(activity, key=lambda x: (x["start_ns"], x["end_ns"]))]
-    write_csv(out / "fig3_source_events.csv", source_rows,
-              ["start_ms", "end_ms", "duration_ms", "source", "category", "label"])
-
-    line_rows = [{
-        "start_ms": round((r["start_ns"] - origin) / 1e6, 4),
-        "end_ms": round((r["end_ns"] - origin) / 1e6, 4),
-        "duration_ms": round((r["end_ns"] - r["start_ns"]) / 1e6, 4),
-        "category": r["category"]
-    } for r in segments]
-    write_csv(out / "fig3_unified_timeline.csv", line_rows,
-              ["start_ms", "end_ms", "duration_ms", "category"])
-
-    formal = "" if args.normal_prefill_ms is None else round(args.normal_prefill_ms, 3)
     values = {
         "baseline": "Galaxy",
-        "graphs": ",".join(str(x) for x in chosen),
-        "profile_total_graph_ms": round(total_ms, 3),
-        "normal_prefill_ms": formal,
-        "phone_backend": "UNIFIED (CPU/GPU/HTP NOT DISTINGUISHED)",
-        "pc_device_events_included": int(pc_events_present),
-        "clock_endpoint": endpoint,
-        "clock_offset_phone_minus_pc_ns": clock_offset_ns,
-        "clock_uncertainty_ms": round(uncertainty_ms, 4),
-        "overlapping_activity_wall_ms": round(overlapping_ms, 3),
+        "graphs": ",".join(map(str,chosen)),
         "allreduce_count": expected_ar,
-        "method": "exclusive_priority_projection; NOT causal critical path; Waiting/Other includes unattributed PC work",
+        "profile_graph_sum_ms": round(graph_ms,3),
+        "graph_gap_ms": round(gap_ms,3),
+        "profile_envelope_ms": round(envelope_ms,3),
+        "normal_prefill_ms": round(args.normal_prefill_ms,3) if args.normal_prefill_ms is not None else "",
+        "phone_backend": "Phone Compute (unified CPU/GPU/HTP)",
+        "clock_endpoint": endpoint,
+        "clock_offset_phone_minus_pc_ns": offset,
+        "clock_uncertainty_ms": round(clock_error_ms,4),
+        "pc_cuda_activity_count": sum(r["source"]=="pc_cuda_events.csv" for r in activity),
+        "pc_cpu_activity_count": sum(r["source"]=="pc_cpu_events.csv" for r in activity),
+        "phone_activity_count": sum(r["source"]=="PHONE_NATIVE" for r in activity),
+        "overlap_ms": round(overlap_ns/1e6,3),
+        "full_coverage": 1,
+        "complete_inputs": int(not missing),
+        "accounting_method": "exclusive_priority_projection_not_causal_critical_path",
+        "wi_fi_definition": "ALLREDUCE_AND_RPC_SYNC_NOT_WIRE_TIME",
+        "gpu_definition": "CUDA_STREAM_INTERVAL_NOT_KERNEL_UTILIZATION",
+        "waiting_definition": "RESIDUAL_INCLUDING_UNINSTRUMENTED_HOST_WORK",
     }
-    for name in ACTIVITIES:
-        key = name.lower().replace(" ", "_").replace("/", "_").replace("-", "_")
-        values[key + "_ms"] = round(by_category[name], 3)
-        values[key + "_pct"] = round(100*by_category[name] / total_ms, 4)
-    write_csv(out / "fig3_unified_breakdown.csv", [values], list(values))
+    for cat in CATEGORIES:
+        key = cat.lower().replace(" ","_").replace("/","_").replace("-","_")
+        values[key+"_ms"] = round(totals_ns[cat]/1e6,3)
+        values[key+"_pct"] = round(100*totals_ns[cat]/(t1-t0),4)
+        values[key+"_raw_aggregate_ms"] = round(raw_ns[cat]/1e6,3)
+    write_rows(out/"fig3_unified_breakdown.csv",[values],list(values))
 
-    render_svg(out / "fig3_unified_timeline.svg", graph_spans, segments, total_ms,
-               f'Graphs {values["graphs"]}; PC/Phone clock uncertainty '
-               f'{uncertainty_ms:.2f} ms; Phone backend unified')
-    print(f"[FIG3_TIMELINE] graphs={values['graphs']} AllReduce={expected_ar} "
-          f"profile_graph_wall={total_ms:.2f} ms")
-    print(f"[FIG3_TIMELINE] endpoint={endpoint} offset={clock_offset_ns} ns "
-          f"uncertainty={uncertainty_ms:.3f} ms")
-    for name in ACTIVITIES:
-        print(f"  {name:>16s}  {by_category[name]:10.2f} ms  "
-              f"{100*by_category[name]/total_ms:6.2f}%")
-    print(f"[FIG3_TIMELINE] projected source overlaps={overlapping_ms:.2f} ms "
-          "(not added to percentages)")
-    if not pc_events_present:
-        print("WARNING: PC GPU/CPU/PCIe event telemetry absent. Waiting/Other is "
-              "a residual; NOT hardware idle. Do not publish as a verified six-category bar.")
-    print("NOTE: -Profile is invasive; use normal Prefill time separately above the bar.")
-    for name in ("fig3_unified_timeline.csv", "fig3_unified_breakdown.csv",
-                 "fig3_source_events.csv", "fig3_unified_timeline.svg"):
-        print(f"[FIG3_TIMELINE] output={out / name}")
+    source_rows = []
+    for r in sorted(activity,key=lambda z:(z["start"],z["end"])):
+        source_rows.append({
+            "start_ms":round((r["start"]-t0)/1e6,4),
+            "end_ms":round((r["end"]-t0)/1e6,4),
+            "duration_ms":round((r["end"]-r["start"])/1e6,4),
+            "category":r["category"],"source":r["source"],"label":r["label"]})
+    write_rows(out/"fig3_source_events.csv",source_rows,
+               ["start_ms","end_ms","duration_ms","category","source","label"])
+    line_rows = [{"start_ms":round((s["start"]-t0)/1e6,4),
+                  "end_ms":round((s["end"]-t0)/1e6,4),
+                  "duration_ms":round((s["end"]-s["start"])/1e6,4),
+                  "category":s["category"]} for s in segments]
+    write_rows(out/"fig3_unified_timeline.csv",line_rows,
+               ["start_ms","end_ms","duration_ms","category"])
+    graphs = [{"graph":g,"start_ms":round((a-t0)/1e6,4),
+               "end_ms":round((b-t0)/1e6,4),
+               "wall_ms":round((b-a)/1e6,4)} for g,a,b in graph_spans]
+    write_rows(out/"fig3_graph_coverage.csv",graphs,["graph","start_ms","end_ms","wall_ms"])
+    svg_preview(out/"fig3_unified_timeline.svg",activity,segments,t0,t1,graph_spans,values)
+
+    print("[FIG3_COMPLETE] Graphs=%s AR=%d envelope=%.3fms graph_sum=%.3fms gaps=%.3fms" %
+          (values["graphs"], expected_ar,envelope_ms,graph_ms,gap_ms))
+    print("[FIG3_COMPLETE] PC/Phone clock bound=%.3f ms, Phone event count=%d; complete=%s" %
+          (clock_error_ms,values["phone_activity_count"],bool(not missing)))
+    for cat in CATEGORIES:
+        key=cat.lower().replace(" ","_").replace("/","_").replace("-","_")
+        print("  %-18s %10.2f ms (%6.2f%%) | raw-device-aggregate %.2f ms" %
+              (cat,values[key+"_ms"],values[key+"_pct"],values[key+"_raw_aggregate_ms"]))
+    print("[FIG3_COMPLETE] simultaneous-activity-overlap=%.3f ms" % (overlap_ns/1e6))
+    print("[FIG3_COMPLETE] results=%s" % out)
+    if missing:
+        print("WARNING: INCOMPLETE device sources:",", ".join(missing))
+    if args.normal_prefill_ms is None:
+        print("WARNING: No unprofiled Prefill total supplied; profile wall is not the normal baseline latency.")
+    print("CAUTION: exclusive accounting is an explicit priority projection, not hardware utilization or pure Wi-Fi wire time.")
     return 0
 
 
-if __name__ == "__main__":
+if __name__=="__main__":
     raise SystemExit(main())
