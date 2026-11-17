@@ -172,6 +172,74 @@ static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 static_assert(RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE == 17, "RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_PROFILE_RUN == 18, "RPC profile command must be appended");
 
+// PC-side RPC socket service diagnostics for Galaxy Fig. 3.
+// These are HOST intervals only. recv_wait_ms includes server processing and
+// blocked socket reads, so it is NOT an isolated one-way Wi-Fi measurement.
+// steady_clock timestamps allow matching RPC calls to TP AllReduce windows.
+static bool galaxy_rpc_transfer_profiled(enum rpc_cmd cmd) {
+    if (std::getenv("LLAMA_GALAXY_PROFILE_DIR") == nullptr) return false;
+    switch (cmd) {
+        case RPC_CMD_GET_TENSOR:
+        case RPC_CMD_SET_TENSOR:
+        case RPC_CMD_SET_TENSOR_HASH:
+        case RPC_CMD_COPY_TENSOR:
+        case RPC_CMD_GRAPH_COMPUTE:
+        case RPC_CMD_GRAPH_RECOMPUTE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static const char * galaxy_rpc_cmd_name(enum rpc_cmd cmd) {
+    switch (cmd) {
+        case RPC_CMD_GET_TENSOR:       return "GET_TENSOR";
+        case RPC_CMD_SET_TENSOR:       return "SET_TENSOR";
+        case RPC_CMD_SET_TENSOR_HASH:  return "SET_TENSOR_HASH";
+        case RPC_CMD_COPY_TENSOR:      return "COPY_TENSOR";
+        case RPC_CMD_GRAPH_COMPUTE:    return "GRAPH_COMPUTE";
+        case RPC_CMD_GRAPH_RECOMPUTE:  return "GRAPH_RECOMPUTE";
+        default:                       return "OTHER";
+    }
+}
+
+static int64_t galaxy_rpc_steady_ns(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
+}
+
+static void galaxy_rpc_client_transfer(
+        enum rpc_cmd cmd, size_t input_size, size_t output_size,
+        std::chrono::steady_clock::time_point started,
+        std::chrono::steady_clock::time_point sent,
+        std::chrono::steady_clock::time_point ended, bool ok) {
+    const char * base = std::getenv("LLAMA_GALAXY_PROFILE_DIR");
+    if (!base || !*base) return;
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    try {
+        const auto path = std::filesystem::path(base) / "rpc_transfer_timeline.csv";
+        std::error_code ec;
+        const bool header = !std::filesystem::exists(path, ec) ||
+                std::filesystem::file_size(path, ec) == 0;
+        std::ofstream f(path, std::ios::app);
+        if (!f) return;
+        if (header) {
+            f << "command,input_bytes,output_bytes,send_ms,recv_wait_ms,"
+                 "wall_ms,start_steady_ns,end_steady_ns,ok\n";
+        }
+        const double send_ms = galaxy_profile_elapsed_ms(started, sent);
+        const double recv_ms = galaxy_profile_elapsed_ms(sent, ended);
+        const double wall_ms = galaxy_profile_elapsed_ms(started, ended);
+        f << galaxy_rpc_cmd_name(cmd) << ',' << input_size << ',' << output_size
+          << ',' << std::fixed << std::setprecision(5) << send_ms << ','
+          << recv_ms << ',' << wall_ms << ','
+          << galaxy_rpc_steady_ns(started) << ',' << galaxy_rpc_steady_ns(ended)
+          << ',' << int(ok) << '\n';
+    } catch (...) {
+        // Profiling is opt-in and must not turn a successful RPC call into an error.
+    }
+}
+
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -432,39 +500,48 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
     return true;
 }
 
-// RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
-// No response
-static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+// The raw request is shared by both RPC overloads. Keep profiling only
+// in the outer wrappers, otherwise requests with responses are logged twice.
+static bool send_rpc_request_raw(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
     uint8_t cmd_byte = cmd;
-    if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
-        return false;
-    }
-    if (!sock->send_data(&input_size, sizeof(input_size))) {
-        return false;
-    }
-    if (!sock->send_data(input, input_size)) {
-        return false;
-    }
+    if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) return false;
+    if (!sock->send_data(&input_size, sizeof(input_size))) return false;
+    if (!sock->send_data(input, input_size)) return false;
     return true;
 }
 
-// RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
-// RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
+// No-response RPC request. send_ms includes socket backpressure, but does
+// not prove that remote processing has finished.
+static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+    const bool trace = galaxy_rpc_transfer_profiled(cmd);
+    const auto start = trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const bool status = send_rpc_request_raw(sock, cmd, input, input_size);
+    if (trace) {
+        const auto end = std::chrono::steady_clock::now();
+        galaxy_rpc_client_transfer(cmd, input_size, 0, start, end, end, status);
+    }
+    return status;
+}
+
+// RPC request with response. recv_wait_ms includes server processing and
+// blocked socket reads; it cannot be attributed solely to network latency.
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
-    if (!send_rpc_cmd(sock, cmd, input, input_size)) {
-        return false;
+    const bool trace = galaxy_rpc_transfer_profiled(cmd);
+    const auto start = trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const bool sent_ok = send_rpc_request_raw(sock, cmd, input, input_size);
+    const auto sent = trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    bool ok = sent_ok;
+    if (ok) {
+        uint64_t out_size = 0;
+        ok = sock->recv_data(&out_size, sizeof(out_size));
+        if (ok) ok = out_size == output_size;
+        if (ok) ok = sock->recv_data(output, output_size);
     }
-    uint64_t out_size;
-    if (!sock->recv_data(&out_size, sizeof(out_size))) {
-        return false;
+    if (trace) {
+        galaxy_rpc_client_transfer(cmd, input_size, output_size, start, sent,
+                std::chrono::steady_clock::now(), ok);
     }
-    if (out_size != output_size) {
-        return false;
-    }
-    if (!sock->recv_data(output, output_size)) {
-        return false;
-    }
-    return true;
+    return ok;
 }
 
 // RPC client-side implementation
